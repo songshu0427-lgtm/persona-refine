@@ -102,6 +102,27 @@ describe("the providers of an Agent's chat", () => {
     expect(own.models![1].fast).toBeUndefined();
     expect(providers.find((p) => p.id === "gateway")!.unavailable).toBe(t("chat-modelpanel.other_engine", { from: "Codex", to: "Claude Code" }));
   });
+
+  it("switches models and efforts in-place on a Codex thread whose node advertises model capability", () => {
+    const multiCodex: LauncherModels = {
+      agent: "codex",
+      models: [
+        { id: "acme/gpt-5-pro", name: "Acme gpt-5-pro", efforts: ["low", "medium"], default_effort: "medium" },
+        { id: "beta/gpt-5-pro", name: "Beta gpt-5-pro", efforts: ["low", "high", "xhigh"], default_effort: "high" },
+      ],
+    };
+    const s = codex({ status: "working", state: "working", capabilities: { send: true, model: true }, model: "acme/gpt-5-pro", effort: "medium", efforts: ["low", "medium"] });
+    const { providers, state } = sessionPanel(s, launchers, lists({ cx: { list: multiCodex } }));
+    const own = providers.find((p) => p.id === "cx")!;
+    expect(own.unavailable).toBeUndefined();
+    expect(own.typable).toBe(true);
+    expect(state.recommended).toEqual(["cx"]);
+    expect(state.busy).toBeUndefined();
+    expect(pickPlan(s, { provider: "cx", model: "beta/gpt-5-pro", effort: "xhigh" }, () => multiCodex)).toEqual([
+      { model: "beta/gpt-5-pro" },
+      { effort: "xhigh" },
+    ]);
+  });
 });
 
 describe("what a pick sends", () => {
@@ -180,6 +201,10 @@ describe("what the pill says", () => {
     expect(modelLabel("claude-opus-5-5-20260101")).toBe("opus 5.5");
     expect(modelLabel("claude-haiku-5-5")).toBe("haiku 5.5");
     expect(modelLabel("gpt-5.5-codex")).toBe("5.5 Codex");
+    expect(modelLabel("openai/gpt-5-pro")).toBe("5 Pro");
+    expect(modelLabel("acme/gpt-5-pro")).toBe("acme/5 Pro");
+    expect(modelLabel("beta/gpt-5-pro")).toBe("beta/5 Pro");
+    expect(modelLabel("gamma/gpt-5-pro")).toBe("gamma/5 Pro");
     expect(modelLabel("vendor/model-x")).toBe("model-x");
     expect(currentModelRow(claudeList.models, "CLAUDE-HAIKU-5-5")?.id).toBe("haiku");
     expect(currentModelRow(claudeList.models, "nothing")).toBeUndefined();

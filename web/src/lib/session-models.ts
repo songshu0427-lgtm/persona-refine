@@ -308,12 +308,19 @@ export function currentModelRow(models: AgentModel[], model: string | undefined)
   return hits.find((m) => !m.default) ?? hits[0];
 }
 
-/** A model ID said briefly where no list names it: Claude's as "opus 5.5", GPT's as their list would, a gateway's path
- *  without its vendor. */
+/** A model ID said briefly where no list names it: Claude's as "opus 5.5", GPT's as their list would (preserving
+ *  non-OpenAI gateway prefixes such as acme/gpt-5-codex vs beta/gpt-5-codex), a gateway's path without its vendor. */
 export function modelLabel(id: string): string {
-  const short = id.split("/").pop() || id;
+  const slash = id.lastIndexOf("/");
+  const prefix = slash > 0 ? id.slice(0, slash) : "";
+  const short = slash >= 0 ? id.slice(slash + 1) || id : id;
   const claude = modelShort(short);
-  return claude !== short ? claude : modelName({ id: short });
+  if (claude !== short) return claude;
+  const formatted = modelName({ id: short });
+  if (prefix && prefix.toLowerCase() !== "openai" && /^gpt-/i.test(short)) {
+    return `${prefix}/${formatted}`;
+  }
+  return formatted;
 }
 
 /** One setup as the pill draws it. */
