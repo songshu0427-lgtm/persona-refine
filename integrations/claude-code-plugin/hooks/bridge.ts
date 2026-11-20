@@ -6,7 +6,10 @@
 export const BASE = 'http://persona/claude-plugin/v1'
 
 /** Optional protocol capabilities this plugin version serves on /poll. */
-export const CAPABILITIES = ['settings'] as const
+export const CAPABILITIES = ['settings', 'busy_input', 'interrupt'] as const
+
+/** How long deliver waits for $.prompt.submit to reject or drop before treating a mid-turn call as queued. */
+export const SUBMIT_QUEUE_SETTLE_MS = 250
 
 /** How long the node may hold a poll: under the 30 s after which Claude Code's fetch gives up. */
 export const POLL_WAIT_MS = 25_000
@@ -64,6 +67,12 @@ export type Message = { id: string; text: unknown; deadlineMs: number }
 /** A session-only model / effort switch handed over by the node. */
 export type SettingsUpdate = { id: string; model?: string; effort?: EffortChoice }
 
+/** An owner Stop handed over by the node to cancel the running main-loop turn via $.turn.abort. */
+export type InterruptRequest = { id: string; deadlineMs: number }
+
+/** The running main-loop turn tracked from turn.start / turn.step until turn.complete. */
+export type ActiveTurn = { session: string; turnId: string }
+
 /** In-memory session-only model / effort override applied on main-loop `turn.step` calls. */
 export type SessionOverride = {
   session: string
@@ -74,7 +83,7 @@ export type SessionOverride = {
 
 /** What a poll came to. */
 export type PollAnswer =
-  | { kind: 'messages'; messages: Message[]; settings?: SettingsUpdate; retryMs: number }
+  | { kind: 'messages'; messages: Message[]; settings?: SettingsUpdate; interrupt?: InterruptRequest; retryMs: number }
   | { kind: 'refused'; retryMs: number } // the node does not take this process for this session
   | { kind: 'unavailable' } // no node, an old node, or no answer
 
@@ -88,6 +97,13 @@ function readSettings(raw: unknown): SettingsUpdate | undefined {
   const ef = isEffortChoice(effort) ? effort : undefined
   if (m === undefined && ef === undefined) return undefined
   return { id, ...(m !== undefined ? { model: m } : {}), ...(ef !== undefined ? { effort: ef } : {}) }
+}
+
+function readInterrupt(raw: unknown): InterruptRequest | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const { id, deadline_ms: deadline } = raw as Record<string, unknown>
+  if (typeof id !== 'string' || !ID.test(id) || typeof deadline !== 'number') return undefined
+  return { id, deadlineMs: deadline }
 }
 
 /** Reads a poll's answer: status and body as `$.http.fetch` resolved them. */
@@ -105,10 +121,12 @@ export function readPoll(status: number, body: string): PollAnswer {
     messages.push({ id, text, deadlineMs: deadline })
   }
   const settings = readSettings(answer.settings)
+  const interrupt = readInterrupt(answer.interrupt)
   return {
     kind: 'messages',
     messages,
     ...(settings !== undefined ? { settings } : {}),
+    ...(interrupt !== undefined ? { interrupt } : {}),
     retryMs: retryOf(answer, 0),
   }
 }

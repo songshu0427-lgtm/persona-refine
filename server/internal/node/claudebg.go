@@ -179,11 +179,14 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 		}
 		s.Capabilities, s.ReadOnlyReason = outsideCapabilities(c)
 		if s.Capabilities != nil && s.Capabilities.Send && n.ccPluginInput(id, c.pid) {
-			s.Capabilities.PluginInput = true // the owner's messages go in as their input while it rests (ccplugin.go)
+			s.Capabilities.PluginInput = true // the owner's messages go in as their input (ccplugin.go)
 			if n.ccPluginSettingsCapable(id, c.pid) {
 				s.Capabilities.Model = proto.Bool(true)
 				s.Efforts = slices.Clone(proto.EffortLevels)
 			}
+		}
+		if s.Capabilities != nil && c.Status == "busy" && n.ccPlugins.interruptCapable(id, c.pid) {
+			s.Capabilities.Interrupt = true
 		}
 		// A claude in a tmux pane says where it runs ("tmux":"orc:@11.%11") and no hooks of Persona's run there: the
 		// pane's screen is what its approval shows on, so it gets that screen and the keys into it (#2562).
@@ -364,11 +367,14 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 			}
 		}
 	}
-	// The owner's own message to a session at rest goes in as their input through Persona's plugin when the session has
-	// it (ccplugin.go); otherwise, and when the plugin does not take it, through the inbox, which the answer says.
+	// The owner's own message goes in as their input through Persona's plugin when the session has it (ccplugin.go),
+	// whether idle or queued behind a running turn; otherwise, and when the plugin does not take it, through the inbox.
 	if owner := ownerDeliveryOf(ctx); owner != nil && forced == "" && priority == peerNext {
 		if ok, why := n.ccPluginSend(ctx, c, id, text); ok {
 			log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
+			if c.Status == "busy" {
+				markSendQueued(ctx)
+			}
 			owner.as, owner.reason = deliveredUserInput, ""
 			return true, nil
 		} else {
@@ -439,12 +445,25 @@ func peerSessionClass(n *Node, c claudeProc, id string) string {
 			path, newest = m, st
 		}
 	}
-	if newest == nil {
-		return ""
+	var m quickMeta
+	if newest != nil {
+		m = n.metaNow(path, newest)
 	}
-	switch n.metaNow(path, newest).mode {
+	mode := m.mode
+	if c.pid > 0 && c.StartedAt > 0 && (mode == "" || (!m.modeAt.IsZero() && m.modeAt.UnixMilli() < c.StartedAt)) {
+		if args, err := processArgv(c.pid); err == nil {
+			if argMode := argsPermissionMode(args); argMode != "" {
+				mode = argMode
+			}
+		}
+	}
+	switch mode {
 	case "bypassPermissions":
 		return peerModeBypass
+	case "plan":
+		if claudeCanBypass(c.pid) {
+			return peerModeBypass
+		}
 	case "default", "acceptEdits", "auto", "dontAsk":
 		return peerModePrompting
 	}
@@ -477,6 +496,9 @@ func (n *Node) interruptOutside(ctx context.Context, id string) (handled bool, e
 	c, ok := n.outsideClaude(id)
 	if !ok || outsidePane(c) != "" {
 		return false, nil
+	}
+	if ownerDeliveryOf(ctx) != nil && c.Status == "busy" && n.ccPluginInterrupt(ctx, c, id) {
+		return true, nil
 	}
 	p, has := peerOf(c)
 	if !has {
