@@ -1,29 +1,82 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
-import { applyStepOverride, homeDir, mergeOverride, nextBackoff, readPoll, socketPath, verdict } from '../hooks/bridge'
+import {
+  applyStepOverride,
+  buildPreviewShellCommand,
+  homeDir,
+  mergeOverride,
+  nextBackoff,
+  parsePreviewLaunchConfig,
+  previewTaskDescription,
+  readPermissionPoll,
+  readPoll,
+  socketPath,
+  verdict,
+} from '../hooks/bridge'
 
 const SESSION = '11111111-2222-3333-4444-555555555555'
 
 type Answer = { status: number; body: unknown } | { fail: true }
 
 // The engine beneath the plugin: a session, its manifest, and a node that answers polls in the order given (then
-// none: a node that went away), recording every request and every prompt the plugin submits.
-function world(on: On, polls: Answer[], env: Record<string, string> = { HOME: '/home/me' }) {
-  const requests: { url: string; socketPath?: string; body: Record<string, unknown> }[] = []
+// none: a node that went away), recording every request, prompt, background shell pre-start, and permission poll.
+function world(
+  on: On,
+  polls: Answer[],
+  env: Record<string, string> = { HOME: '/home/me' },
+  extra: {
+    permissionPolls?: Answer[]
+    files?: Record<string, string>
+    listeningPorts?: Set<number>
+    cwd?: string
+  } = {},
+) {
+  const requests: { url: string; method?: string; socketPath?: string; body: Record<string, unknown> }[] = []
   const submitted: { text: string; origin: unknown }[] = []
   const aborted: string[] = []
   const steps: { model: string; effort?: string | number; agentId?: string }[] = []
+  const toolCalls: Record<string, unknown>[] = []
+  const permissionPolls = [...(extra.permissionPolls ?? [])]
+  const listeningPorts = extra.listeningPorts ?? new Set<number>()
+  const workDir = extra.cwd ?? '/work'
   let sessionModel = 'claude-sonnet-5-5'
   let holdSubmit = false
   let abortError: string | undefined
+  let onBashLaunch: (() => void) | undefined
+
   mock.env(on, env)
   const clock = mock.clock(on, { now: 1_000 })
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: SESSION }))
+  on('session.cwd', () => ({ value: workDir }))
+  on('session.root', () => ({ value: workDir }))
   on('session.model', () => ({ value: sessionModel }))
   on('session.version', () => ({ value: { version: '2.1.326', base: '2.1.326' } }))
-  on('fs.read', () => ({ value: '{"name":"persona","version":"0.3.0"}' }))
+  on('fs.read', (_$, e) => {
+    if (extra.files !== undefined && e.path in extra.files) {
+      return { value: extra.files[e.path]! }
+    }
+    if (e.path.endsWith('/.claude-plugin/plugin.json')) {
+      return { value: '{"name":"persona","version":"0.4.0"}' }
+    }
+    throw new Error(`ENOENT: ${e.path}`)
+  })
   on('ui.log', () => ({ value: undefined }))
+  on('classic.SessionStart', () => ({}))
+  on('classic.UserPromptSubmit', () => ({}))
+  on('classic.PostToolUse', () => ({}))
+  on('classic.PostToolUseFailure', () => ({}))
+  on('classic.ConfigChange', () => ({}))
+  on('classic.PermissionRequest', () => ({}))
+  on('tool.call', (_$, e) => {
+    const { tool_use_id: _id, ...rec } = e as unknown as Record<string, unknown>
+    toolCalls.push(rec)
+    if (rec.tool === 'Bash') {
+      onBashLaunch?.()
+      return { result: 'started in background' }
+    }
+    return { result: 'ok' }
+  })
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: 'done' }))
   on('turn.abort', (_$, e) => {
@@ -37,13 +90,30 @@ function world(on: On, polls: Answer[], env: Record<string, string> = { HOME: '/
     return { text: e.text }
   })
   on('turn.step', async function* (_$, e) {
-    steps.push({ model: e.model, ...(e.effort !== undefined ? { effort: e.effort } : {}), ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) })
+    steps.push({
+      model: e.model,
+      ...(e.effort !== undefined ? { effort: e.effort } : {}),
+      ...(e.agentId !== undefined ? { agentId: e.agentId } : {}),
+    })
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn' as const, usage: null }
   })
   on('http.fetch', (_$, e) => {
+    const m = /^http:\/\/127\.0\.0\.1:(\d+)\/$/.exec(e.url)
+    if (m !== null) {
+      const port = Number(m[1])
+      if (!listeningPorts.has(port)) throw new Error('ECONNREFUSED')
+      return { value: { status: 200, ok: true, headers: {}, text: '' } }
+    }
     const rawBody = typeof e.init?.body === 'string' ? e.init.body : '{}'
-    requests.push({ url: e.url, socketPath: e.init?.socketPath, body: JSON.parse(rawBody) })
+    const parsed = JSON.parse(rawBody) as Record<string, unknown>
+    requests.push({ url: e.url, method: e.init?.method, socketPath: e.init?.socketPath, body: parsed })
     if (e.url.endsWith('/ack')) return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+    if (e.url.endsWith('/permission')) {
+      if (parsed.cancel === true) return { value: { status: 200, ok: true, headers: {}, text: '{"ok":true}' } }
+      const next = permissionPolls.shift() ?? { fail: true }
+      if ('fail' in next) throw new Error('connection refused')
+      return { value: { status: next.status, ok: next.status === 200, headers: {}, text: JSON.stringify(next.body) } }
+    }
     const next = polls.shift() ?? { fail: true }
     if ('fail' in next) throw new Error('connection refused')
     return { value: { status: next.status, ok: next.status === 200, headers: {}, text: JSON.stringify(next.body) } }
@@ -53,6 +123,8 @@ function world(on: On, polls: Answer[], env: Record<string, string> = { HOME: '/
     submitted,
     aborted,
     steps,
+    toolCalls,
+    listeningPorts,
     clock,
     setSessionModel(m: string) {
       sessionModel = m
@@ -62,6 +134,9 @@ function world(on: On, polls: Answer[], env: Record<string, string> = { HOME: '/
     },
     setAbortError(err: string | undefined) {
       abortError = err
+    },
+    setOnBashLaunch(fn: (() => void) | undefined) {
+      onBashLaunch = fn
     },
   }
 }
@@ -80,9 +155,9 @@ describe('persona plugin', () => {
     expect(poll?.socketPath).toBe('/home/me/.persona/node.sock')
     expect(poll?.body).toEqual({
       session_id: SESSION,
-      plugin_version: '0.3.0',
+      plugin_version: '0.4.0',
       engine_version: '2.1.326',
-      capabilities: ['settings', 'busy_input', 'interrupt'],
+      capabilities: ['settings', 'busy_input', 'interrupt', 'permission_bridge'],
       wait_ms: 25_000,
     })
     expect(ack?.url).toBe('http://persona/claude-plugin/v1/ack')
@@ -144,6 +219,125 @@ describe('persona plugin', () => {
     w.setSessionModel('claude-opus-5-5')
     await runStep({ turnId: 't2', index: 0, model: 'claude-opus-5-5', effort: 'high', messageCount: 2 })
     expect(w.steps.at(-1)).toEqual({ model: 'claude-opus-5-5', effort: 'high' })
+  })
+
+  test('pre-starts .claude/launch.json dev server before preview_start only under bypassPermissions', async ($, on) => {
+    const launchJson = JSON.stringify({
+      version: '0.0.1',
+      configurations: [
+        {
+          name: 'demo-web',
+          runtimeExecutable: 'npm',
+          runtimeArgs: ['run', 'dev', '--', '--port', '4173'],
+          port: 4173,
+          cwd: 'apps/web',
+          env: { HOST: '127.0.0.1' },
+        },
+      ],
+    })
+    const w = world(on, [], { HOME: '/home/me' }, { files: { '/work/.claude/launch.json': launchJson } })
+    w.setOnBashLaunch(() => {
+      w.listeningPorts.add(4173)
+    })
+
+    // Default mode: never pre-starts.
+    await $.classic.SessionStart({ source: 'startup', permission_mode: 'default' })
+    await $.tool.call({ tool: 'mcp__Claude_Browser__preview_start', name: 'demo-web' } as never)
+    expect(w.toolCalls.map(c => c.tool)).toEqual(['mcp__Claude_Browser__preview_start'])
+
+    // Bypass mode: pre-starts matching background Bash task with Claude Desktop's exact description before preview_start.
+    await $.classic.ConfigChange({ source: 'user_settings', permission_mode: 'bypassPermissions' })
+    await $.tool.call({ tool: 'mcp__Claude_Browser__preview_start', name: 'demo-web' } as never)
+    expect(w.toolCalls).toEqual([
+      { tool: 'mcp__Claude_Browser__preview_start', name: 'demo-web' },
+      {
+        tool: 'Bash',
+        command: "cd '/work/apps/web' && exec env HOST='127.0.0.1' 'npm' 'run' 'dev' '--' '--port' '4173'",
+        description: 'Dev server "demo-web" (preview_start)',
+        run_in_background: true,
+      },
+      { tool: 'mcp__Claude_Browser__preview_start', name: 'demo-web' },
+    ])
+
+    // Already listening on 4173: does not spawn a duplicate background server.
+    await $.tool.call({ tool: 'mcp__Claude_Browser__preview_start', name: 'demo-web' } as never)
+    expect(w.toolCalls.filter(c => c.tool === 'Bash').length).toBe(1)
+  })
+
+  test('bridges non-bypass classic.PermissionRequest over /permission long-polls and passes AskUserQuestion through', async ($, on) => {
+    const w = world(
+      on,
+      [],
+      { HOME: '/home/me' },
+      {
+        permissionPolls: [
+          { status: 200, body: { status: 'pending' } },
+          {
+            status: 200,
+            body: {
+              status: 'decided',
+              decision: {
+                behavior: 'allow',
+                updatedPermissions: [
+                  {
+                    type: 'addRules',
+                    rules: [{ toolName: 'Bash' }],
+                    behavior: 'allow',
+                    destination: 'session',
+                  },
+                ],
+              },
+            },
+          },
+          { status: 200, body: { status: 'passthrough' } },
+        ],
+      },
+    )
+
+    // AskUserQuestion stays on the existing clq_ transcript channel without hitting /permission.
+    const askRes = await $.classic.PermissionRequest({
+      session_id: SESSION,
+      tool_name: 'AskUserQuestion',
+      tool_input: { questions: [] },
+      permission_mode: 'default',
+    })
+    expect(askRes).toEqual({})
+    expect(w.requests.filter(r => r.url.endsWith('/permission'))).toEqual([])
+
+    // Standard tool permission: polls once ('pending'), polls again ('decided'), returns remote decision.
+    const permRes = await $.classic.PermissionRequest({
+      session_id: SESSION,
+      tool_name: 'Bash',
+      tool_input: { command: 'npm test' },
+      permission_mode: 'default',
+    })
+    expect(permRes).toEqual({
+      decision: {
+        behavior: 'allow',
+        updatedPermissions: [
+          {
+            type: 'addRules',
+            rules: [{ toolName: 'Bash' }],
+            behavior: 'allow',
+            destination: 'session',
+          },
+        ],
+      },
+    })
+    const permCalls = w.requests.filter(r => r.url.endsWith('/permission'))
+    expect(permCalls.length).toBe(2)
+    expect(permCalls[0]?.body.tool_name).toBe('Bash')
+    expect(permCalls[0]?.body.request_id).toBe(permCalls[1]?.body.request_id)
+
+    // Passthrough status delegates back to Claude Code's native dialog without sending cancel.
+    const passRes = await $.classic.PermissionRequest({
+      session_id: SESSION,
+      tool_name: 'Edit',
+      tool_input: { file_path: '/work/a.ts' },
+      permission_mode: 'default',
+    })
+    expect(passRes).toEqual({})
+    expect(w.requests.filter(r => r.url.endsWith('/permission') && r.body.cancel === true)).toEqual([])
   })
 
   test('submits nothing late, empty or a slash command, and tells the node why', async ($, on) => {
@@ -214,6 +408,55 @@ describe('protocol helpers', () => {
     expect(socketPath(undefined, '/srv/persona')).toBe(undefined)
     expect(homeDir('C:\\Users\\me', '/c/Users/me')).toBe('C:\\Users\\me')
     expect(homeDir(undefined, '/Users/me')).toBe('/Users/me')
+  })
+
+  test('preview launch config and permission poll helpers', () => {
+    const cfg = parsePreviewLaunchConfig(
+      JSON.stringify({
+        configurations: [
+          {
+            name: 'my app',
+            runtimeExecutable: 'python3',
+            runtimeArgs: ['-m', 'http.server', "80'80"],
+            port: 8080,
+            env: { PORT: 8080 },
+          },
+        ],
+      }),
+      'my app',
+    )
+    expect(cfg).toEqual({
+      name: 'my app',
+      runtimeExecutable: 'python3',
+      runtimeArgs: ['-m', 'http.server', "80'80"],
+      port: 8080,
+      env: { PORT: '8080' },
+    })
+    expect(previewTaskDescription('my app')).toBe('Dev server "my app" (preview_start)')
+    expect(buildPreviewShellCommand(cfg!, '/repo')).toBe("cd '/repo' && exec env PORT='8080' 'python3' '-m' 'http.server' '80'\\''80'")
+    expect(parsePreviewLaunchConfig('{"configurations":[{"name":"bad","runtimeExecutable":"sh","port":70000}]}', 'bad')).toBe(undefined)
+    expect(parsePreviewLaunchConfig('{"configurations":[{"name":"bad","runtimeExecutable":"sh","port":3000,"env":{"BAD-KEY":"1"}}]}', 'bad')).toBe(undefined)
+
+    expect(readPermissionPoll(200, '{"status":"pending"}')).toEqual({ kind: 'pending' })
+    expect(readPermissionPoll(200, '{"status":"passthrough"}')).toEqual({ kind: 'passthrough' })
+    expect(readPermissionPoll(200, '{"status":"decided","decision":{"behavior":"deny","message":"declined on phone","interrupt":true}}')).toEqual({
+      kind: 'decided',
+      decision: { behavior: 'deny', message: 'declined on phone', interrupt: true },
+    })
+    expect(
+      readPermissionPoll(
+        200,
+        '{"status":"decided","decision":{"behavior":"allow","updatedInput":{"plan":"ok"},"updatedPermissions":[{"type":"setMode","mode":"bypassPermissions","destination":"session"}]}}',
+      ),
+    ).toEqual({
+      kind: 'decided',
+      decision: {
+        behavior: 'allow',
+        updatedInput: { plan: 'ok' },
+        updatedPermissions: [{ type: 'setMode', mode: 'bypassPermissions', destination: 'session' }],
+      },
+    })
+    expect(readPermissionPoll(500, '')).toEqual({ kind: 'passthrough' })
   })
 
   test('poll answers and override helpers', () => {

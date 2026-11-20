@@ -213,6 +213,8 @@ type Node struct {
 	forked        map[string]bool // sessions "Branch to new chat" made (fork.go): listed however short they are
 	// ccPlugins: Persona's Claude Code plugin in the sessions outside Persona's terminals that loaded it (ccplugin.go).
 	ccPlugins ccPluginRegistry
+	// ccPerms: open PermissionRequest bridges from Persona's Claude Code plugin (ccplugin_permission.go).
+	ccPerms ccPluginPermRegistry
 	// freshForks: branches nothing has started yet, which a message may start (stopped.go); a stopped agent may not.
 	freshForks map[string]bool
 	starts     startLog       // sessions starting in the background (starting.go)

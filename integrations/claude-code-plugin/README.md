@@ -8,9 +8,11 @@ words come from another session and that they are not the person's approval (`do
 
 The plugin polls the local Persona node while its session lives: it submits the owner's messages with
 `$.prompt.submit({ text, asUser: true })` (immediately when idle, or into Claude Code's prompt queue while a turn runs),
-applies in-session model / effort picks on main-loop `turn.step` calls, and cancels the active main-loop turn via
-`$.turn.abort({ turnId })` when the owner presses Stop. It reads no file but its own manifest and stays quiet when no
-node is running.
+applies in-session model / effort picks on main-loop `turn.step` calls, cancels the active main-loop turn via
+`$.turn.abort({ turnId })` when the owner presses Stop, bridges non-bypass `PermissionRequest` prompts to Persona mobile /
+web approval cards, and pre-starts `.claude/launch.json` dev servers before `mcp__Claude_Browser__preview_start` under
+`bypassPermissions` so Claude Desktop opens previews without blocking on a host shell confirmation card. It stays quiet
+when no node is running.
 
 ## Packaging
 
@@ -50,7 +52,7 @@ another session, gets `403`.
 `POST /claude-plugin/v1/poll`
 
 ```json
-{"session_id": "<uuid>", "plugin_version": "0.3.0", "engine_version": "2.1.326", "capabilities": ["settings", "busy_input", "interrupt"], "wait_ms": 25000}
+{"session_id": "<uuid>", "plugin_version": "0.4.0", "engine_version": "2.1.326", "capabilities": ["settings", "busy_input", "interrupt", "permission_bridge"], "wait_ms": 25000}
 ```
 
 - Held until work comes or `wait_ms` passes (at most 25 s; Claude Code's fetch gives up at 30 s), then asked
@@ -72,6 +74,20 @@ another session, gets `403`.
 
 `submitted: false` with a `reason` (`late`, `invalid`, `command`, `dropped`, `failed`) when the plugin did not submit it.
 The plugin submits a message only before its `deadline_ms`; after that the node may send it through the inbox instead.
+
+`POST /claude-plugin/v1/permission`
+
+```json
+{"session_id": "<uuid>", "request_id": "<id>", "tool_name": "Bash", "tool_input": {"command": "npm test"}, "permission_mode": "default", "wait_ms": 25000}
+```
+
+- Used by `classic.PermissionRequest` (except `AskUserQuestion`) over repeated 25 s long-polls while the local dialog is
+  open (`next.signal` cancels with `{"session_id": "<uuid>", "request_id": "<id>", "cancel": true}`).
+- `200 {"status": "passthrough"}`: the node does not bridge permissions for this session (e.g. a Persona-managed or tmux
+  session); the plugin calls `next(e)` at once.
+- `200 {"status": "pending"}`: still awaiting an answer; the plugin re-polls immediately.
+- `200 {"status": "decided", "decision": {...}}`: the owner answered from a Persona app (`allow` or `deny`), resolving
+  the permission request directly.
 
 Registration is the poll itself: a session counts as having the plugin while its claude process lives and a poll from
 that process waits, or ended less than 90 s ago. The node lists such a session with `capabilities.plugin_input: true`.

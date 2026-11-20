@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/nwverse/persona/server/internal/assistantwire"
@@ -59,14 +60,15 @@ type quickMeta struct {
 	// doing / doingAt: what the agent's latest tool call does, when no text came after it (transcript.Activity).
 	doing       string
 	doingAt     time.Time
-	tool        string // the name of that call (transcript.Meta.LastTool)
-	wake        bool   // the latest turn was a background task waking the agent
+	tool        string                // the name of that call (transcript.Meta.LastTool)
+	openTools   []transcript.ToolCall // unanswered tool calls in the open turn (transcript.Meta.OpenTools)
+	wake        bool                  // the latest turn was a background task waking the agent
 	readAt      time.Time
-	mode     string
-	modeAt   time.Time
-	effort   string
-	effortAt time.Time
-	modelAt  time.Time
+	mode        string
+	modeAt      time.Time
+	effort      string
+	effortAt    time.Time
+	modelAt     time.Time
 	version     string
 	versionAt   time.Time // when the line that said version was written: a resumed process has written none yet
 	ultracode   *bool
@@ -182,6 +184,7 @@ func (n *Node) meta(path string, st os.FileInfo) quickMeta {
 			// that it resumes by itself stays: it keeps anything from typing into the session, the safe side too, and the
 			// writes that make the read stale are its own continuation at the reset or the wakes of the wait (#1710).
 			m.turnErr = turnFailure{resumes: m.turnErr.resumes}
+			m.openTools = nil
 		}
 		return m
 	}
@@ -364,6 +367,9 @@ func readQuickMetaSince(path string, st os.FileInfo, prev quickMeta) quickMeta {
 	if t := tm.LastTool; t != nil {
 		m.doing, m.doingAt, m.tool = transcript.Activity(t.Name, t.Input), t.At, t.Name
 	}
+	if !tm.TurnClosed && len(tm.OpenTools) > 0 {
+		m.openTools = slices.Clone(tm.OpenTools)
+	}
 	m.turnOpen = tm.Codex && (tm.TurnOpen || off > 0 && !tm.TurnClosed)
 	m.claudeTurn = !tm.Codex && tm.TurnOpen
 	if !tm.Codex && !tm.TurnOpen && !tm.TurnClosed {
@@ -477,6 +483,7 @@ func quickLine(line []byte, tm *transcript.Meta, tail *transcript.Tail) {
 		}
 		if !bytes.Contains(line, []byte(`"tool_result"`)) {
 			tm.LastTool = nil // a long prompt: a new turn
+			tm.OpenTools = nil
 			if !tm.Codex {
 				tm.TurnOpen, tm.TurnClosed = true, false
 				tm.ClaudeTurnStarted(bytes.Contains(line, []byte(`<task-notification>`))) // the last turn's error is over
@@ -484,6 +491,8 @@ func quickLine(line []byte, tm *transcript.Meta, tail *transcript.Tail) {
 			if !bytes.Contains(line, []byte(`"isMeta":true`)) && ts.After(tm.LastPromptAt) {
 				tm.LastPromptAt = ts
 			}
+		} else {
+			tm.CloseSkippedToolResults(line)
 		}
 		if !tm.Codex && tail != nil {
 			tail.Skipped(line) // its place in the tree: a rewound turn with it in is still found, and hidden whole

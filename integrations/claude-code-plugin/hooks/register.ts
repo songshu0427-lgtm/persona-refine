@@ -3,11 +3,19 @@ import {
   BASE,
   CAPABILITIES,
   POLL_WAIT_MS,
+  PREVIEW_PRESTART_COOLDOWN_MS,
+  PREVIEW_READY_STEP_MS,
+  PREVIEW_READY_WAIT_MS,
   SUBMIT_QUEUE_SETTLE_MS,
   applyStepOverride,
+  buildPreviewShellCommand,
   homeDir,
+  isWindowsPath,
   mergeOverride,
   nextBackoff,
+  parsePreviewLaunchConfig,
+  previewTaskDescription,
+  readPermissionPoll,
   readPoll,
   socketPath,
   verdict,
@@ -15,14 +23,15 @@ import {
   type InterruptRequest,
   type Message,
   type PollAnswer,
+  type PreviewLaunchConfig,
   type SessionOverride,
   type SettingsUpdate,
 } from './bridge'
 
 // Persona's plugin (README.md): while this session lives it asks the local Persona node for the owner's own messages,
-// session-scoped model / effort picks, and owner turn interrupts from the Persona apps. Messages go in as the person's
-// words (`asUser`, queued natively when a turn runs), interrupts abort the running main-loop turn (`$.turn.abort`), and
-// model / effort overrides apply to main-loop `turn.step` requests without touching global settings files.
+// session-scoped model / effort picks, owner turn interrupts, and remote permission approvals from the Persona apps,
+// and pre-starts configured `.claude/launch.json` preview servers under `bypassPermissions` so Claude Desktop opens
+// previews without blocking on a host shell confirmation card.
 
 type Engine = EngineInterface
 
@@ -32,6 +41,40 @@ export const register: Register = on => {
   let loop = 0
   let override: SessionOverride | undefined
   let activeTurn: ActiveTurn | undefined
+  let permissionMode: string | undefined
+  let permSeq = 0
+  const prestartedPreviews = new Map<string, number>()
+
+  const trackMode = (agentId: string | undefined, mode: string | undefined) => {
+    if (agentId === undefined && typeof mode === 'string' && mode !== '') {
+      permissionMode = mode
+    }
+  }
+
+  on('classic.SessionStart', (_$, e, next) => {
+    trackMode(e.agent_id, e.permission_mode)
+    return next(e)
+  })
+
+  on('classic.UserPromptSubmit', (_$, e, next) => {
+    trackMode(e.agent_id, e.permission_mode)
+    return next(e)
+  })
+
+  on('classic.PostToolUse', (_$, e, next) => {
+    trackMode(e.agent_id, e.permission_mode)
+    return next(e)
+  })
+
+  on('classic.PostToolUseFailure', (_$, e, next) => {
+    trackMode(e.agent_id, e.permission_mode)
+    return next(e)
+  })
+
+  on('classic.ConfigChange', (_$, e, next) => {
+    trackMode(e.agent_id, e.permission_mode)
+    return next(e)
+  })
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -61,6 +104,69 @@ export const register: Register = on => {
     return yield* next(applied.step)
   })
 
+  on('tool.call', { tool: 'mcp__Claude_Browser__preview_start' }, async ($, e, next) => {
+    if (e.agentId !== undefined || permissionMode !== 'bypassPermissions') return next(e)
+    const name = typeof e.name === 'string' ? e.name.trim() : ''
+    if (name === '') return next(e)
+    await prestartPreviewServer($, name, prestartedPreviews, next.signal)
+    return next(e)
+  })
+
+  on('classic.PermissionRequest', async ($, e, next) => {
+    trackMode(e.agent_id, e.permission_mode)
+    if (e.tool_name === 'AskUserQuestion') return next(e)
+    const sock = await resolveSocket($)
+    if (sock === undefined) return next(e)
+    const requestId = `perm_${++permSeq}_${await $.clock.now()}`
+    let settled = false
+    const notifyCancel = () => {
+      if (settled) return
+      void $.http
+        .fetch(`${BASE}/permission`, post(sock, { session_id: e.session_id, request_id: requestId, cancel: true }))
+        .catch(() => undefined)
+    }
+    next.signal.addEventListener('abort', notifyCancel, { once: true })
+    try {
+      while (!next.signal.aborted) {
+        let status = 0
+        let text = ''
+        try {
+          const res = await $.http.fetch(
+            `${BASE}/permission`,
+            post(sock, {
+              session_id: e.session_id,
+              request_id: requestId,
+              agent_id: e.agent_id ?? '',
+              tool_name: e.tool_name,
+              tool_input: e.tool_input,
+              cwd: e.cwd,
+              transcript_path: e.transcript_path,
+              permission_mode: e.permission_mode ?? '',
+              wait_ms: POLL_WAIT_MS,
+            }),
+          )
+          status = res.status
+          text = res.text
+        } catch {
+          return next(e)
+        }
+        const answer = readPermissionPoll(status, text)
+        if (answer.kind === 'passthrough') {
+          settled = true
+          return next(e)
+        }
+        if (answer.kind === 'decided') {
+          settled = true
+          return { decision: answer.decision }
+        }
+      }
+      return next(e)
+    } finally {
+      next.signal.removeEventListener('abort', notifyCancel)
+      if (!settled) notifyCancel()
+    }
+  })
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     const mine = ++loop
@@ -80,6 +186,79 @@ export const register: Register = on => {
   })
 }
 
+async function resolveSocket($: Engine): Promise<string | undefined> {
+  const home = homeDir(await $.env.get('USERPROFILE'), await $.env.get('HOME'))
+  return socketPath(home, await $.env.get('PERSONA_HOME'))
+}
+
+async function prestartPreviewServer(
+  $: Engine,
+  name: string,
+  prestarted: Map<string, number>,
+  signal: AbortSignal,
+): Promise<void> {
+  try {
+    const loaded = await loadPreviewConfig($, name)
+    if (loaded === undefined) return
+    const { cfg, baseDir } = loaded
+    if (isWindowsPath(baseDir) || (cfg.cwd !== undefined && isWindowsPath(cfg.cwd))) return
+    if (await isLocalHttpListening($, cfg.port)) return
+    const session = await $.session.id().catch(() => '')
+    const key = `${session}:${cfg.name}:${cfg.port}`
+    const now = await $.clock.now()
+    const lastAt = prestarted.get(key)
+    if (lastAt !== undefined && now - lastAt < PREVIEW_PRESTART_COOLDOWN_MS) return
+    prestarted.set(key, now)
+    const launched = await $.tool.call({
+      tool: 'Bash',
+      command: buildPreviewShellCommand(cfg, baseDir),
+      description: previewTaskDescription(cfg.name),
+      run_in_background: true,
+    })
+    if ('deny' in launched) {
+      prestarted.delete(key)
+      return
+    }
+    const deadline = (await $.clock.now()) + PREVIEW_READY_WAIT_MS
+    while (!signal.aborted && (await $.clock.now()) < deadline) {
+      if (await isLocalHttpListening($, cfg.port)) return
+      await sleep($, PREVIEW_READY_STEP_MS)
+    }
+  } catch {
+    // Fall back cleanly to Claude Desktop's native preview_start flow.
+  }
+}
+
+async function loadPreviewConfig(
+  $: Engine,
+  name: string,
+): Promise<{ cfg: PreviewLaunchConfig; baseDir: string } | undefined> {
+  const dirs: string[] = []
+  const root = await $.session.root().catch(() => '')
+  if (root !== '') dirs.push(root)
+  const cwd = await $.session.cwd().catch(() => '')
+  if (cwd !== '' && !dirs.includes(cwd)) dirs.push(cwd)
+  for (const dir of dirs) {
+    try {
+      const raw = await $.fs.read(`${dir.replace(/\/+$/, '')}/.claude/launch.json`)
+      const cfg = parsePreviewLaunchConfig(raw, name)
+      if (cfg !== undefined) return { cfg, baseDir: dir }
+    } catch {
+      // Try next candidate directory.
+    }
+  }
+  return undefined
+}
+
+async function isLocalHttpListening($: Engine, port: number): Promise<boolean> {
+  try {
+    await $.http.fetch(`http://127.0.0.1:${port}/`, { method: 'HEAD' })
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function run(
   $: Engine,
   current: () => boolean,
@@ -87,8 +266,7 @@ async function run(
   getActiveTurn: () => ActiveTurn | undefined,
   clearActiveTurn: (turnId: string) => void,
 ): Promise<void> {
-  const home = homeDir(await $.env.get('USERPROFILE'), await $.env.get('HOME'))
-  const sock = socketPath(home, await $.env.get('PERSONA_HOME'))
+  const sock = await resolveSocket($)
   if (sock === undefined) return
   const pluginVersion = await manifestVersion($)
   const engineVersion = await $.session

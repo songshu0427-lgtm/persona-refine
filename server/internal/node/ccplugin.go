@@ -128,9 +128,10 @@ type ccPluginAck struct {
 }
 
 type ccPluginCaps struct {
-	settings  bool
-	busyInput bool
-	interrupt bool
+	settings         bool
+	busyInput        bool
+	interrupt        bool
+	permissionBridge bool
 }
 
 // ccPluginSession is a session whose plugin polls this node.
@@ -502,8 +503,11 @@ func (n *Node) serveCCPluginHTTP(ctx context.Context, c net.Conn, first []byte, 
 // ccPluginRequest is one of the plugin's requests, answered with a status and a JSON body.
 func (n *Node) ccPluginRequest(ctx context.Context, c net.Conn, method, path string, body []byte) (int, any) {
 	what, ok := strings.CutPrefix(path, ccPluginPrefix)
-	if !ok || method != http.MethodPost || (what != "poll" && what != "ack") {
+	if !ok || method != http.MethodPost || (what != "poll" && what != "ack" && what != "permission") {
 		return http.StatusNotFound, map[string]any{"error": "unknown"}
+	}
+	if what == "permission" {
+		return n.ccPluginPermission(ctx, c, body)
 	}
 	var in struct {
 		SessionID     string   `json:"session_id"`
@@ -541,9 +545,10 @@ func (n *Node) ccPluginRequest(ctx context.Context, c net.Conn, method, path str
 		wait = ccPluginPollMost
 	}
 	caps := ccPluginCaps{
-		settings:  slices.Contains(in.Capabilities, "settings"),
-		busyInput: slices.Contains(in.Capabilities, "busy_input"),
-		interrupt: slices.Contains(in.Capabilities, "interrupt"),
+		settings:         slices.Contains(in.Capabilities, "settings"),
+		busyInput:        slices.Contains(in.Capabilities, "busy_input"),
+		interrupt:        slices.Contains(in.Capabilities, "interrupt"),
+		permissionBridge: slices.Contains(in.Capabilities, "permission_bridge"),
 	}
 	poll, done, immediate, changed := n.ccPlugins.polled(in.SessionID, pid, clipReason(in.PluginVersion), clipReason(in.EngineVersion), caps)
 	if changed {

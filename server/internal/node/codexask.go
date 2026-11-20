@@ -97,9 +97,10 @@ func (n *Node) syncCodexCards(ctx context.Context) {
 	for _, c := range n.codexCardsNow(ctx, "") {
 		cards = append(cards, c.ix)
 	}
-	// The questions of Claude sessions outside Persona's terminals ride along: the hub keeps them as it keeps these
-	// (claudeoutside_ask.go).
+	// The questions and plugin permission prompts of Claude sessions outside Persona's terminals ride along: the hub keeps
+	// them as it keeps these (claudeoutside_ask.go, ccplugin_permission.go).
 	cards = append(cards, n.outsideAskCards()...)
+	cards = append(cards, n.outsidePermCards()...)
 	now := time.Now()
 	n.cx.mu.Lock()
 	var list []proto.Interaction
@@ -464,6 +465,9 @@ func (n *Node) codexApprovalOn(ctx context.Context, pane string) (d *screen.Code
 func (n *Node) codexAnswer(ctx context.Context, session, id string, r proto.Resolution) error {
 	if strings.HasPrefix(id, outsideAskPrefix) {
 		return n.outsideAnswer(ctx, session, id, r) // a Claude session's question outside Persona's terminals
+	}
+	if strings.HasPrefix(id, outsidePermPrefix) {
+		return n.outsidePermAnswer(ctx, session, id, r) // a Claude session's PermissionRequest via Persona's plugin
 	}
 	if r.Cancel {
 		return fmt.Errorf("question cancellation is unavailable for terminal-only questions")

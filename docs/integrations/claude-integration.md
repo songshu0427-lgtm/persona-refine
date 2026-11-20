@@ -722,11 +722,20 @@ installs and updates it.
   busy); a session waiting on an `AskUserQuestion` still takes the peer inbox at priority `now` so the question ends
   instead of blocking the queue. Older plugins without `busy_input` receive owner messages only at rest and fall back to
   the inbox while busy (`relay_reason: "busy"`).
-- **Owner Stop and session settings**: when the plugin advertises `interrupt` (0.3.0+), an owner-attested
-  `session.interrupt` cancels the running main-loop turn via `$.turn.abort({ turnId })` (falling back to the peer inbox
-  when no plugin turn is active or for non-owner interrupts), and `capabilities.interrupt` stays true in `bypassPermissions`
-  / `auto` mode while the plugin is reachable. When `settings` (0.2.0+) is advertised, `session.set_settings` hands
-  in-memory model / effort overrides over `/poll` for main-loop `turn.step` calls without modifying global settings files.
+- **Owner Stop, session settings, remote permissions, and desktop host confirmations**: when the plugin advertises
+  `interrupt` (0.3.0+), an owner-attested `session.interrupt` cancels the running main-loop turn via
+  `$.turn.abort({ turnId })` (falling back to the peer inbox when no plugin turn is active or for non-owner interrupts),
+  and `capabilities.interrupt` stays true in `bypassPermissions` / `auto` mode while the plugin is reachable. When
+  `settings` (0.2.0+) is advertised, `session.set_settings` hands in-memory model / effort overrides over `/poll` for
+  main-loop `turn.step` calls without modifying global settings files. In 0.4.0+ (`permission_bridge`), non-bypass
+  `PermissionRequest` prompts (except `AskUserQuestion`, which keeps `clq_`) long-poll `/claude-plugin/v1/permission`
+  and surface `clp_` permission / plan cards on `codex.interactions` so the owner can approve, session-allow, or deny
+  from mobile / web (`codex.answer`), cancelling automatically if answered on the computer. Under `bypassPermissions`,
+  the plugin also pre-starts `.claude/launch.json` dev servers as a matching background `Bash` task before
+  `mcp__Claude_Browser__preview_start` so Claude Desktop opens previews without a host shell confirmation card; for other
+  Electron-side host MCP confirmation cards where Claude Code's status file remains `busy`, `claudehost_stall.go`
+  promotes unanswered calls older than 8 s to `blocked` (`等待电脑端确认：…`) while keeping remote `send` and `interrupt`
+  available.
 - **Delivery and fallback**: the node hands the message to the session's waiting poll (`deadline_ms` 5 s ahead; the
   plugin submits nothing later) and counts it in once the transcript shows the plugin's prompt or its queue entry, or
   the plugin says it submitted it (its submit resolves as the turn starts). No poll takes it within 3 s, the plugin says

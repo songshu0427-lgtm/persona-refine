@@ -326,6 +326,7 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		return nil
 	case "task_complete":
 		meta.TurnOpen, meta.TurnClosed = false, true
+		meta.OpenTools = nil
 		// A turn the model service failed writes no answer: its error is here (Codex 0.166, #2185).
 		meta.clearTurnError()
 		if meta.TurnError, meta.TurnErrorKind = CodexTurnError(p.Error); meta.TurnError != "" {
@@ -348,6 +349,7 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		return []proto.Item{it}
 	case "turn_aborted":
 		meta.TurnOpen, meta.TurnClosed = false, true
+		meta.OpenTools = nil
 		meta.clearTurnError() // stopped by the user: no failure
 		meta.turnWorked = false
 		it := mk(0, "", "system", proto.KindNotice)

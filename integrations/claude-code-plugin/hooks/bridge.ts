@@ -1,12 +1,14 @@
+import type { PermissionRequestDecision } from 'claude-code'
+
 // Protocol 1 between this plugin and the local Persona node (README.md): where the node's socket is, what a poll's
-// answer holds, which messages may go in as the person's words, and session-scoped model / effort overrides. Pure
-// functions; register.ts does the I/O.
+// answer holds, which messages may go in as the person's words, session-scoped model / effort overrides, bypass-mode
+// preview server pre-start helpers, and remote permission approval parsing. Pure functions; register.ts does the I/O.
 
 /** The base of the node's endpoints; the host name is not used (the request goes over the socket). */
 export const BASE = 'http://persona/claude-plugin/v1'
 
 /** Optional protocol capabilities this plugin version serves on /poll. */
-export const CAPABILITIES = ['settings', 'busy_input', 'interrupt'] as const
+export const CAPABILITIES = ['settings', 'busy_input', 'interrupt', 'permission_bridge'] as const
 
 /** How long deliver waits for $.prompt.submit to reject or drop before treating a mid-turn call as queued. */
 export const SUBMIT_QUEUE_SETTLE_MS = 250
@@ -18,15 +20,27 @@ export const POLL_WAIT_MS = 25_000
 export const BACKOFF_FIRST_MS = 2_000
 export const BACKOFF_MOST_MS = 60_000
 
+/** Cooldown before pre-starting the same preview_start configuration again when the port has not come up yet. */
+export const PREVIEW_PRESTART_COOLDOWN_MS = 10_000
+
+/** Bounded readiness probe window after launching a background dev server before handing off to preview_start. */
+export const PREVIEW_READY_WAIT_MS = 1_500
+export const PREVIEW_READY_STEP_MS = 150
+
 /** The longest text submitted, in UTF-16 units; the node never sends more (its inbox line holds 1 MiB). */
 export const TEXT_MOST = 200_000
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/
 const MODEL = /^[A-Za-z0-9._:/[\]-]{1,200}$/
+const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export type EffortChoice = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto'
 
 const EFFORTS: ReadonlySet<string> = new Set<EffortChoice>(['low', 'medium', 'high', 'xhigh', 'max', 'auto'])
+
+const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'] as const)
+const PERMISSION_BEHAVIORS = new Set(['allow', 'deny', 'ask'] as const)
+const PERMISSION_DESTINATIONS = new Set(['userSettings', 'projectSettings', 'localSettings', 'session', 'cliArg'] as const)
 
 export function validModel(model: unknown): model is string {
   return typeof model === 'string' && MODEL.test(model) && !model.startsWith('-')
@@ -81,6 +95,22 @@ export type SessionOverride = {
   effort?: EffortChoice
 }
 
+/** Validated `.claude/launch.json` configuration entry for `mcp__Claude_Browser__preview_start`. */
+export type PreviewLaunchConfig = {
+  name: string
+  runtimeExecutable: string
+  runtimeArgs: string[]
+  port: number
+  cwd?: string
+  env?: Record<string, string>
+}
+
+/** Answer returned by `/claude-plugin/v1/permission`. */
+export type PermissionPollAnswer =
+  | { kind: 'pending' }
+  | { kind: 'passthrough' }
+  | { kind: 'decided'; decision: PermissionRequestDecision }
+
 /** What a poll came to. */
 export type PollAnswer =
   | { kind: 'messages'; messages: Message[]; settings?: SettingsUpdate; interrupt?: InterruptRequest; retryMs: number }
@@ -129,6 +159,175 @@ export function readPoll(status: number, body: string): PollAnswer {
     ...(interrupt !== undefined ? { interrupt } : {}),
     retryMs: retryOf(answer, 0),
   }
+}
+
+/** Exact shell task description Claude Desktop's `preview_start` checks in `shellTasks()`. */
+export function previewTaskDescription(name: string): string {
+  return `Dev server ${JSON.stringify(name)} (preview_start)`
+}
+
+/** POSIX single-quote escaping for arbitrary argv / cwd / env values. */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+/** Extracts and validates a launch configuration by name from `.claude/launch.json`. */
+export function parsePreviewLaunchConfig(rawJson: string, targetName: string): PreviewLaunchConfig | undefined {
+  if (typeof targetName !== 'string' || targetName.trim() === '' || targetName.length > 200) return undefined
+  const root = parse(rawJson)
+  if (root === undefined || !Array.isArray(root.configurations)) return undefined
+  for (const item of root.configurations) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+    const rec = item as Record<string, unknown>
+    if (rec.name !== targetName) continue
+    const exe = rec.runtimeExecutable
+    if (typeof exe !== 'string' || exe.trim() === '' || /[\0\r\n]/.test(exe)) return undefined
+    const port = rec.port
+    if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) return undefined
+    const argsRaw = rec.runtimeArgs
+    const runtimeArgs: string[] = []
+    if (argsRaw !== undefined) {
+      if (!Array.isArray(argsRaw)) return undefined
+      for (const a of argsRaw) {
+        if (typeof a !== 'string' || a.includes('\0')) return undefined
+        runtimeArgs.push(a)
+      }
+    }
+    let cwd: string | undefined
+    if (rec.cwd !== undefined) {
+      if (typeof rec.cwd !== 'string' || rec.cwd.includes('\0')) return undefined
+      const trimmed = rec.cwd.trim()
+      if (trimmed !== '') cwd = trimmed
+    }
+    let env: Record<string, string> | undefined
+    if (rec.env !== undefined) {
+      if (typeof rec.env !== 'object' || rec.env === null || Array.isArray(rec.env)) return undefined
+      env = {}
+      for (const [k, v] of Object.entries(rec.env as Record<string, unknown>)) {
+        if (!ENV_KEY.test(k)) return undefined
+        if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') return undefined
+        const sv = String(v)
+        if (sv.includes('\0')) return undefined
+        env[k] = sv
+      }
+    }
+    return {
+      name: targetName,
+      runtimeExecutable: exe.trim(),
+      runtimeArgs,
+      port,
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(env !== undefined ? { env } : {}),
+    }
+  }
+  return undefined
+}
+
+/** True when a path uses Windows drive or UNC syntax, where POSIX `cd ... && exec ...` shell syntax does not apply. */
+export function isWindowsPath(p: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.includes('\\')
+}
+
+/** Builds a POSIX shell command to launch `cfg` from `baseDir` with safe quoting. */
+export function buildPreviewShellCommand(cfg: PreviewLaunchConfig, baseDir: string): string {
+  let targetDir = baseDir
+  if (cfg.cwd !== undefined) {
+    targetDir = cfg.cwd.startsWith('/') ? cfg.cwd : `${baseDir.replace(/\/+$/, '')}/${cfg.cwd}`
+  }
+  const envParts: string[] = []
+  if (cfg.env !== undefined) {
+    for (const [k, v] of Object.entries(cfg.env)) {
+      envParts.push(`${k}=${shellQuote(v)}`)
+    }
+  }
+  const cmdParts = [shellQuote(cfg.runtimeExecutable), ...cfg.runtimeArgs.map(shellQuote)]
+  const execLine = envParts.length > 0 ? `env ${envParts.join(' ')} ${cmdParts.join(' ')}` : cmdParts.join(' ')
+  return `cd ${shellQuote(targetDir)} && exec ${execLine}`
+}
+
+type PermissionUpdatesList = NonNullable<Extract<PermissionRequestDecision, { behavior: 'allow' }>['updatedPermissions']>
+
+function readPermissionUpdates(raw: unknown): PermissionUpdatesList | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const out: PermissionUpdatesList = []
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return undefined
+    const rec = item as Record<string, unknown>
+    const dest = rec.destination
+    if (typeof dest !== 'string' || !PERMISSION_DESTINATIONS.has(dest as never)) return undefined
+    const destination = dest as PermissionUpdatesList[number]['destination']
+    if (rec.type === 'setMode') {
+      if (typeof rec.mode !== 'string' || !PERMISSION_MODES.has(rec.mode as never)) return undefined
+      out.push({
+        type: 'setMode',
+        mode: rec.mode as Extract<PermissionUpdatesList[number], { type: 'setMode' }>['mode'],
+        destination,
+      })
+      continue
+    }
+    if (rec.type === 'addRules' || rec.type === 'replaceRules' || rec.type === 'removeRules') {
+      if (typeof rec.behavior !== 'string' || !PERMISSION_BEHAVIORS.has(rec.behavior as never)) return undefined
+      if (!Array.isArray(rec.rules)) return undefined
+      const rules: { toolName: string; ruleContent?: string }[] = []
+      for (const r of rec.rules) {
+        if (typeof r !== 'object' || r === null || Array.isArray(r)) return undefined
+        const rr = r as Record<string, unknown>
+        if (typeof rr.toolName !== 'string' || rr.toolName === '') return undefined
+        if (rr.ruleContent !== undefined && typeof rr.ruleContent !== 'string') return undefined
+        rules.push({
+          toolName: rr.toolName,
+          ...(typeof rr.ruleContent === 'string' ? { ruleContent: rr.ruleContent } : {}),
+        })
+      }
+      out.push({
+        type: rec.type,
+        rules,
+        behavior: rec.behavior as 'allow' | 'deny' | 'ask',
+        destination,
+      })
+      continue
+    }
+    return undefined
+  }
+  return out
+}
+
+/** Reads `/claude-plugin/v1/permission` responses into a typed permission poll answer. */
+export function readPermissionPoll(status: number, body: string): PermissionPollAnswer {
+  if (status !== 200) return { kind: 'passthrough' }
+  const answer = parse(body)
+  if (answer === undefined) return { kind: 'passthrough' }
+  if (answer.status === 'pending') return { kind: 'pending' }
+  if (answer.status !== 'decided') return { kind: 'passthrough' }
+  const raw = answer.decision
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { kind: 'passthrough' }
+  const dec = raw as Record<string, unknown>
+  if (dec.behavior === 'allow') {
+    const updatedInput =
+      typeof dec.updatedInput === 'object' && dec.updatedInput !== null && !Array.isArray(dec.updatedInput)
+        ? (dec.updatedInput as Record<string, unknown>)
+        : undefined
+    const updatedPermissions = dec.updatedPermissions !== undefined ? readPermissionUpdates(dec.updatedPermissions) : undefined
+    return {
+      kind: 'decided',
+      decision: {
+        behavior: 'allow',
+        ...(updatedInput !== undefined ? { updatedInput } : {}),
+        ...(updatedPermissions !== undefined ? { updatedPermissions } : {}),
+      },
+    }
+  }
+  if (dec.behavior === 'deny') {
+    return {
+      kind: 'decided',
+      decision: {
+        behavior: 'deny',
+        ...(typeof dec.message === 'string' && dec.message !== '' ? { message: dec.message } : {}),
+        ...(dec.interrupt === true ? { interrupt: true } : {}),
+      },
+    }
+  }
+  return { kind: 'passthrough' }
 }
 
 /** Merges a new settings update into the active session override. */

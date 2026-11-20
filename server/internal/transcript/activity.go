@@ -1,9 +1,11 @@
 package transcript
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -11,16 +13,19 @@ import (
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
-// ToolCall is the latest tool call of a transcript that no assistant text or new prompt came after (Meta.LastTool):
-// what an agent that only runs tools (reads code, runs tests, waits for CI) is doing, while its last text stays put.
+// ToolCall is a tool call recorded in a transcript: Meta.LastTool holds the latest call before assistant text or a new
+// prompt, and Meta.OpenTools holds calls whose tool_result has not arrived yet.
 type ToolCall struct {
+	ID    string
 	Name  string
 	Input json.RawMessage
 	At    time.Time
 }
 
-// trackActivity keeps Meta.LastTool for one parsed item: a tool call is the activity until the agent writes text
-// (its words come first again) or a new turn starts.
+const openToolsMax = 32
+
+// trackActivity keeps Meta.LastTool and Meta.OpenTools for one parsed item: LastTool stays until the agent writes text
+// or a new turn starts, while OpenTools drops each call as soon as its tool_result arrives or the turn closes.
 func (m *Meta) trackActivity(it proto.Item) {
 	switch {
 	case it.Role == "assistant" && it.Kind == proto.KindToolUse:
@@ -31,11 +36,100 @@ func (m *Meta) trackActivity(it proto.Item) {
 		if at.IsZero() && m.LastTool != nil {
 			at = m.LastTool.At
 		}
-		m.LastTool = &ToolCall{Name: it.ToolName, Input: it.ToolInput, At: at}
+		in := slices.Clone(it.ToolInput)
+		call := ToolCall{ID: it.ToolUseID, Name: it.ToolName, Input: in, At: at}
+		m.LastTool = &call
+		m.openTool(call)
+	case it.Kind == proto.KindToolResult:
+		m.closeTool(it.ToolUseID)
 	case it.Role == "assistant" && it.Kind == proto.KindText:
 		m.LastTool = nil
 	case it.Role == "user" && it.Kind == proto.KindText && !it.Queued:
 		m.LastTool = nil
+		m.OpenTools = nil
+	case it.Role == "system" && it.Kind == proto.KindNotice && it.Text == InterruptedNotice:
+		m.OpenTools = nil
+	}
+}
+
+func (m *Meta) openTool(call ToolCall) {
+	if call.ID != "" {
+		for i := range m.OpenTools {
+			if m.OpenTools[i].ID == call.ID {
+				cp := slices.Clone(m.OpenTools)
+				cp[i] = call
+				m.OpenTools = cp
+				return
+			}
+		}
+	}
+	cp := make([]ToolCall, 0, min(len(m.OpenTools)+1, openToolsMax))
+	if len(m.OpenTools) >= openToolsMax {
+		cp = append(cp, m.OpenTools[len(m.OpenTools)-openToolsMax+1:]...)
+	} else {
+		cp = append(cp, m.OpenTools...)
+	}
+	m.OpenTools = append(cp, call)
+}
+
+func (m *Meta) closeTool(id string) {
+	if len(m.OpenTools) == 0 {
+		return
+	}
+	if id == "" {
+		m.OpenTools = slices.Clone(m.OpenTools[1:])
+		return
+	}
+	for i := range m.OpenTools {
+		if m.OpenTools[i].ID == id {
+			cp := make([]ToolCall, 0, len(m.OpenTools)-1)
+			cp = append(cp, m.OpenTools[:i]...)
+			cp = append(cp, m.OpenTools[i+1:]...)
+			m.OpenTools = cp
+			return
+		}
+	}
+}
+
+// CloseSkippedToolResults closes any OpenTools whose tool_use_id appears in a skipped large user tool_result line.
+func (m *Meta) CloseSkippedToolResults(line []byte) {
+	if len(m.OpenTools) == 0 {
+		return
+	}
+	key := []byte(`"tool_use_id"`)
+	rest := line
+	for {
+		i := bytes.Index(rest, key)
+		if i < 0 {
+			return
+		}
+		rest = rest[i+len(key):]
+		j := 0
+		for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+			j++
+		}
+		if j >= len(rest) || rest[j] != ':' {
+			continue
+		}
+		j++
+		for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+			j++
+		}
+		if j >= len(rest) || rest[j] != '"' {
+			continue
+		}
+		rest = rest[j+1:]
+		end := bytes.IndexByte(rest, '"')
+		if end < 0 {
+			return
+		}
+		if id := string(rest[:end]); id != "" && !strings.ContainsRune(id, '\\') {
+			m.closeTool(id)
+			if len(m.OpenTools) == 0 {
+				return
+			}
+		}
+		rest = rest[end+1:]
 	}
 }
 

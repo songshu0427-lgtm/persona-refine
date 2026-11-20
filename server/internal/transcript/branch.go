@@ -543,7 +543,11 @@ func (t *Tail) Settle(meta *Meta) bool {
 	// The pre-tail fallback is replay's initial state; meta may instead describe an abandoned branch's last reply.
 	replay := Meta{ModelFallback: t.modelFallback}
 	for _, rec := range t.tree.recs {
-		if t.tree.hidden[rec.uuid] || !rec.hasOutcome || len(rec.raw) == 0 || rec.errorLine != "" && t.tree.hidden[rec.errorLine] {
+		if t.tree.hidden[rec.uuid] || len(rec.raw) == 0 || rec.errorLine != "" && t.tree.hidden[rec.errorLine] {
+			continue
+		}
+		if !rec.hasOutcome {
+			replay.CloseSkippedToolResults(rec.raw)
 			continue
 		}
 		ParseLine(0, rec.raw, &replay)
@@ -554,6 +558,7 @@ func (t *Tail) Settle(meta *Meta) bool {
 		}
 	}
 	meta.TurnOpen, meta.TurnClosed = replay.TurnOpen, replay.TurnClosed
+	meta.OpenTools = replay.OpenTools
 	meta.localTurn, meta.beforeLocal = replay.localTurn, replay.beforeLocal
 	meta.LastTurnWake, meta.ModelFallback = replay.LastTurnWake, replay.ModelFallback
 	meta.turnWorked, meta.turnSucceeded = replay.turnWorked, replay.turnSucceeded

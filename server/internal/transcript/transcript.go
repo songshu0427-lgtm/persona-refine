@@ -257,6 +257,8 @@ type Meta struct {
 	// LastTool: the latest tool call no assistant text or new prompt came after (activity.go), nil when the agent's
 	// last word is newer.
 	LastTool *ToolCall
+	// OpenTools: tool calls in the open turn whose tool_result has not arrived yet, oldest first.
+	OpenTools []ToolCall
 	// tree is where the line just parsed sits in the transcript's tree (branch.go); the File reads and clears it.
 	tree treeLine
 	// localInput: the line being parsed is input the terminal handles itself (a slash command, "! cmd"), no message.
@@ -697,6 +699,7 @@ func parseLine(seq int, line []byte, meta *Meta) []proto.Item {
 		switch e.Subtype {
 		case "turn_duration":
 			meta.TurnOpen, meta.TurnClosed = false, true
+			meta.OpenTools = nil
 			meta.turnSucceeded = meta.turnWorked && meta.TurnError == ""
 			meta.turnWorked = false // the turn's work is done: Claude Code's own continuation after a limit opens with no prompt
 			ms, ok := recordedMilliseconds(e.DurationMS)

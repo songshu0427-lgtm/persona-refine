@@ -173,11 +173,33 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 				status = proto.StatusDone
 			}
 		}
+		var hostStallReason string
+		if source == proto.SourceClaudeDesktop && c.Status == "busy" && outsidePane(c) == "" {
+			if why := desktopHostStallReason(m.openTools, time.Now()); why != "" {
+				status = proto.StatusBlocked
+				hostStallReason = why
+			}
+		}
+		var permReason string
+		if outsidePane(c) == "" {
+			if why := n.ccPerms.attentionReason(id, c.pid, time.Now()); why != "" {
+				status = proto.StatusBlocked
+				permReason = why
+			}
+		}
+		attention := hostStallReason
+		if permReason != "" {
+			attention = permReason
+		}
 		s := proto.Session{
 			SessionID: id, Cwd: c.Cwd, Status: status, Agent: "claude", Title: m.title, SourceKind: source,
 			Model: n.shownModel(id, m.model), LastText: snippet(m.lastText), UpdatedAt: lastUsed(m, st), Rev: st.Size(), AgentSurface: m.surface,
+			AttentionReason: attention,
 		}
 		s.Capabilities, s.ReadOnlyReason = outsideCapabilities(c)
+		if permReason != "" && s.Capabilities != nil {
+			s.Capabilities.Approve = true
+		}
 		if s.Capabilities != nil && s.Capabilities.Send && n.ccPluginInput(id, c.pid) {
 			s.Capabilities.PluginInput = true // the owner's messages go in as their input (ccplugin.go)
 			if n.ccPluginSettingsCapable(id, c.pid) {
