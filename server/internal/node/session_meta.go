@@ -2,6 +2,8 @@ package node
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -92,6 +94,10 @@ type quickMeta struct {
 	// turnOpen: a Codex rollout whose tail is inside a turn: the last turn it starts has not finished, or one turn
 	// fills the whole tail (a finished turn's task_complete is within a few KB of the end; real turns write MBs)
 	turnOpen bool
+
+	// Generated Codex journal: only a complete revision can close its turn.
+	historySnapshot bool
+
 	// turnErr: the latest turn failed on the model service, as the agent's record says it (transcript.Meta.TurnError…:
 	// a Codex rollout's task_complete, #2185; Claude Code's own reply for a failed request, #1710).
 	turnErr turnFailure
@@ -185,6 +191,11 @@ func (n *Node) meta(path string, st os.FileInfo) quickMeta {
 			// writes that make the read stale are its own continuation at the reset or the wakes of the wait (#1710).
 			m.turnErr = turnFailure{resumes: m.turnErr.resumes}
 			m.openTools = nil
+			if m.historySnapshot {
+				// The new revision has not been read yet: a cached completion must not
+				// stand in for an unfinished or partly written next turn.
+				m.turnOpen, m.turnClosed = true, false
+			}
 		}
 		return m
 	}
@@ -230,7 +241,8 @@ func readQuickMetaSince(path string, st os.FileInfo, prev quickMeta) quickMeta {
 		return m
 	}
 	defer f.Close()
-	head, start := transcriptHead(f)
+	head, start, historySnapshot := transcriptHead(f)
+	m.historySnapshot = historySnapshot
 	// What the tail may not repeat: a rollout names its directory, version and client on its first line only, its model
 	// and effort once a turn. Nothing of the head's exchange, turn or mode.
 	tm := transcript.Meta{Codex: head.Codex, Cwd: head.Cwd, Version: head.Version, VersionAt: head.VersionAt, Surface: head.Surface,
@@ -253,21 +265,42 @@ func readQuickMetaSince(path string, st os.FileInfo, prev quickMeta) quickMeta {
 	tail.Rewound(prev.rewound)
 	m.rewound = prev.rewound
 	whole := off // where the tail's whole lines begin: after the line off cuts
-	buf := make([]byte, st.Size()-off)
-	if _, err := f.ReadAt(buf, off); err == nil || len(buf) > 0 {
-		lines := bytes.Split(buf, []byte("\n"))
-		if off > 0 && len(lines) > 0 {
-			whole += int64(len(lines[0]))
-			lines = lines[1:] // first line is partial
+	if historySnapshot {
+		// Reconstruct only the latest snapshot and its appended rows/terminal.
+		// The snapshot may be bigger than quickTail; the unterminated tail is
+		// never committed. An empty terminal append still needs its prior text,
+		// prompt and tools (has_work alone only restores the error's AfterWork).
+		if data, pos, err := quickHistoryTail(f, st.Size()); err == nil {
+			whole = pos
+			for _, line := range bytes.Split(data, []byte("\n")) {
+				if len(line) == 0 {
+					continue
+				}
+				if ts := lineTime(line); ts.After(m.contentAt) {
+					m.contentAt = ts
+				}
+				// Nested tool arguments can look like a large Claude user line;
+				// quickLine's skip heuristic must not skip a journal record.
+				transcript.ParseLine(0, line, &tm)
+			}
 		}
-		for _, line := range lines {
-			if len(line) == 0 {
-				continue
+	} else {
+		buf := make([]byte, st.Size()-off)
+		if _, err := f.ReadAt(buf, off); err == nil || len(buf) > 0 {
+			lines := bytes.Split(buf, []byte("\n"))
+			if off > 0 && len(lines) > 0 {
+				whole += int64(len(lines[0]))
+				lines = lines[1:] // first line is partial
 			}
-			if ts := lineTime(line); ts.After(m.contentAt) {
-				m.contentAt = ts
+			for _, line := range lines {
+				if len(line) == 0 {
+					continue
+				}
+				if ts := lineTime(line); ts.After(m.contentAt) {
+					m.contentAt = ts
+				}
+				quickLine(line, &tm, &tail)
 			}
-			quickLine(line, &tm, &tail)
 		}
 	}
 	if rest, ok := tail.Revoked(); ok { // Claude went on from a turn the node took for rewound (transcript.File.RewoundAt)
@@ -370,7 +403,7 @@ func readQuickMetaSince(path string, st os.FileInfo, prev quickMeta) quickMeta {
 	if !tm.TurnClosed && len(tm.OpenTools) > 0 {
 		m.openTools = slices.Clone(tm.OpenTools)
 	}
-	m.turnOpen = tm.Codex && (tm.TurnOpen || off > 0 && !tm.TurnClosed)
+	m.turnOpen = tm.Codex && (tm.TurnOpen || (off > 0 || historySnapshot) && !tm.TurnClosed)
 	m.claudeTurn = !tm.Codex && tm.TurnOpen
 	if !tm.Codex && !tm.TurnOpen && !tm.TurnClosed {
 		// The tail starts and ends no turn: the turn stands as it stood before it. A turn seen starting stays open when
@@ -442,13 +475,17 @@ func (n *Node) mergeNamingMetadata(path string, m *quickMeta) {
 
 // transcriptHead reads a transcript's head up to its first prompt, for what belongs to the session's start: the first
 // prompt, and start, the first directory its lines name (head.Cwd moves with every `cd` they record).
-func transcriptHead(f *os.File) (head transcript.Meta, start string) {
+func transcriptHead(f *os.File) (head transcript.Meta, start string, historySnapshot bool) {
 	// The first prompt is usually in the first 32 KB. A Codex rollout puts its instructions first (the assistant's
 	// AGENTS.md and snapshot: 74 KB in), so up to 256 KB is read while it has not turned up.
 	buf := make([]byte, 32*1024)
 	nr, _ := f.ReadAt(buf, 0)
 	for {
 		for _, line := range bytes.Split(buf[:nr], []byte("\n")) {
+			// The journal writer puts payload.type before its potentially huge items.
+			// Recognize it even when the first snapshot does not fit in the head read.
+			historySnapshot = historySnapshot || bytes.Contains(line, []byte(`"type":"persona_history_snapshot"`)) ||
+				bytes.Contains(line, []byte(`"type":"persona_history_append"`))
 			if bytes.Contains(line, []byte(`"cwd"`)) || bytes.Contains(line, []byte(`"type":"user"`)) ||
 				bytes.Contains(line, []byte(`"type":"UserMessage"`)) { // Codex rollouts: session_meta, then the first prompt
 				transcript.ParseLine(0, line, &head)
@@ -466,7 +503,50 @@ func transcriptHead(f *os.File) (head transcript.Meta, start string) {
 		buf = make([]byte, len(buf)*2)
 		nr, _ = f.ReadAt(buf, 0)
 	}
-	return head, start
+	return head, start, historySnapshot
+}
+
+// quickHistoryTail reads the newest snapshot and subsequent newline-committed
+// appends at size. Expanding suffixes find the nearest snapshot, so a cold read
+// recovers a whole turn even when its base is bigger than quickTail. Read volume
+// is linear in that turn plus the partial append, not the entire history.
+// Ordinary rollout/Claude files do not use this path.
+// Every read must fill its request: a file truncated during the read is unknown,
+// never a partly decoded completion. Appends beyond the captured size wait for
+// the next read, and an atomic replacement keeps this descriptor's old revision.
+func quickHistoryTail(f io.ReaderAt, size int64) ([]byte, int64, error) {
+	marker := []byte(`"type":"persona_history_snapshot"`)
+	for width := min(int64(quickTail), size); ; width = min(2*width, size) {
+		start := size - width
+		data := make([]byte, width)
+		if _, err := f.ReadAt(data, start); err != nil {
+			return nil, 0, err
+		}
+		end := bytes.LastIndexByte(data, '\n') + 1
+		for hi := end - 1; hi >= 0; {
+			lo := bytes.LastIndexByte(data[:hi], '\n') + 1
+			if lo == 0 && start > 0 {
+				break // the first line may be partial; expand to its beginning
+			}
+			line := data[lo:hi]
+			if bytes.Contains(line, marker) {
+				var record struct {
+					Type    string `json:"type"`
+					Payload struct {
+						Type string `json:"type"`
+					} `json:"payload"`
+				}
+				// A tool argument can contain the marker: only payload.type is a base.
+				if json.Unmarshal(line, &record) == nil && record.Type == "event_msg" && record.Payload.Type == "persona_history_snapshot" {
+					return data[lo:end], start + int64(lo), nil
+				}
+			}
+			hi = lo - 1
+		}
+		if start == 0 {
+			return data[:end], 0, nil
+		}
+	}
 }
 
 // quickLine reads one line of a transcript's end into tm, as the quick read does: tail is the tree the line takes its

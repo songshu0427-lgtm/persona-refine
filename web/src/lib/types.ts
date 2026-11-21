@@ -684,6 +684,8 @@ export interface TokenUsage {
 
 export interface Item {
   id: string;
+  /** Runtime turn identity when available; used to align live text with its own history. */
+  turn_id?: string;
   seq: number;
   ts?: string;
   role: "user" | "assistant" | "system";

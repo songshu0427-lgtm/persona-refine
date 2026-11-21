@@ -2,6 +2,8 @@
 // does not grow the registry the reconnect handler walks.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connect, getSession, getState, listenSession, reset, upsertSession, sessionListenerKeysForTests, type ItemsEvent } from "./store";
+import { mergeItems } from "./turns";
+import { codexSnapshot } from "./testdata/codex-snapshot";
 
 class FakeSocket {
   static OPEN = 1;
@@ -52,6 +54,32 @@ afterEach(() => {
 });
 
 describe("per-session listeners", () => {
+  it("preserves scoped main-chat delta identity, including an empty turn-end frame", () => {
+    const socket = online(), receive = vi.fn();
+    const off = listenSession("m", "main", { delta: receive });
+    const identity = { turn_id: "turn-2", item_id: "reply-2" };
+    socket.push({ type: "delta", machine_id: "m", session_id: "main", text: "Current", ...identity });
+    expect(receive).toHaveBeenLastCalledWith("Current", expect.objectContaining(identity));
+    socket.push({ type: "delta", machine_id: "m", session_id: "main", text: "", ...identity, turn_done: true });
+    expect(receive).toHaveBeenLastCalledWith("", expect.objectContaining({ ...identity, turn_done: true }));
+    off();
+  });
+  it("delivers mutable Codex snapshot batches before completion and merges final/reconnected copies once", () => {
+    const socket = online();
+    let page = codexSnapshot(1), reconnects = 0;
+    const off = listenSession("m", "snapshot", { items: (event) => { page = mergeItems(page, event.items); }, reconnected: () => reconnects++ });
+    const push = (seq: number, phase: Parameters<typeof codexSnapshot>[1]) => socket.push({ type: "items", machine_id: "m", session_id: "snapshot", items: codexSnapshot(seq, phase), from_seq: seq - 1, to_seq: seq });
+    push(2, "updated");
+    expect(page).toHaveLength(5);
+    expect(page[1].text).toBe("Checking the encoder.");
+    push(3, "final"); push(3, "final");
+    expect(page).toHaveLength(6);
+    socket.push({ type: "hello", server_version: "v1", event_stream: "s1", event_seq: 3 });
+    push(3, "final");
+    expect(page).toEqual(codexSnapshot(3, "final"));
+    expect(reconnects).toBe(1);
+    off();
+  });
   it("leaves no key behind for a session once its last listener goes", () => {
     const before = sessionListenerKeysForTests();
     for (let i = 0; i < 100; i++) listenSession("m", `s${i}`, {})();

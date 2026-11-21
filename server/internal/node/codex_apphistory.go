@@ -24,21 +24,19 @@ import (
 
 // A Codex App chat whose rollout is gone (codex_appdb.go) keeps its history in <CODEX_HOME>/thread_history_<n>.sqlite:
 // thread_turns, and thread_items holding the app-server's ThreadItems (v2: userMessage, agentMessage, commandExecution…).
-// Its transcript is that history written back as rollout lines — session_meta, then per finished turn task_started, an
-// item_completed per item, and task_complete (with its error when it failed) or turn_aborted — so the transcript reader,
-// the clients and every check on a rollout read it as any other (#3305). The file is
-// <state dir>/codex-app-history/<home hash>-<thread>.jsonl. It grows as a rollout does: the turns finished since it was
-// last written are appended (the last turn while it still runs is left for later; one that never finished but has turns
-// after it is written as interrupted), so a reader goes on where it was. <file>.mark records what was written; a file
+// Its transcript is a journal of atomic turn revisions (codex_history_snapshots.go), including the recorded items of
+// an unfinished turn without a completion. The transcript reader emits ordinary stable-ID items, so clients use
+// their existing incremental merge. The file is <state dir>/codex-app-history/<home hash>-<thread>.jsonl.
+// It appends only changed/new turns, never rewrites a long conversation on every poll. <file>.mark records what was written; a file
 // unlike its mark, or whose last turn is no longer in the database as it was, is written again from the start (and
-// removed when no turn is left finished). It is brought up to date when the transcript is read (file) and, while the chat
+// removed when no turn is left in an App-only chat). It is brought up to date when the transcript is read (file) and, while the chat
 // is watched, about once a second (pumpWatch), never by the list; one writer at a time, across processes too
 // (<file>.lock: the others wait for its write). The database is read while the App has it closed too (codexDBTarget).
 // Without sqlite3 or the history database there is none, as before.
 
 // codexAppHistoryVersion changes when already-written JSONL no longer matches what the converter produces. A mark
 // without it is a legacy cache and is rebuilt once, even when the App database has not changed.
-const codexAppHistoryVersion = 2
+const codexAppHistoryVersion = 3
 
 // codexAppHistoryWait bounds one read of the history database; a long chat's turns stream in well under it.
 const codexAppHistoryWait = 30 * time.Second
@@ -69,14 +67,19 @@ type codexHistoryFailure struct {
 // files (the App may write a turn's rows after updating the chat, and finish a turn without updating it) — and the size
 // the file had then (-1: no file, the chat has no finished turn).
 type codexHistoryMark struct {
-	Version int    `json:"version,omitempty"`
-	Turn    int64  `json:"turn"`
-	TurnID  string `json:"turn_id"`
-	Status  string `json:"status"`
-	Updated int64  `json:"updated"`
-	History string `json:"history"`
-	Size    int64  `json:"size"`
-	Lineage string `json:"lineage,omitempty"`
+	Version   int                 `json:"version,omitempty"`
+	Turn      int64               `json:"turn"`
+	TurnID    string              `json:"turn_id"`
+	Status    string              `json:"status"`
+	Updated   int64               `json:"updated"`
+	History   string              `json:"history"`
+	Size      int64               `json:"size"`
+	Lineage   string              `json:"lineage,omitempty"`
+	Snapshot  string              `json:"snapshot,omitempty"`  // digest of the last Codex turn, including its mutable items
+	Unsettled map[int64]string    `json:"unsettled,omitempty"` // older turns provisionally closed by a later turn
+	ItemIDs   []string            `json:"item_ids,omitempty"`
+	FileOrder map[string][]string `json:"file_order,omitempty"`
+	Rows      []string            `json:"rows,omitempty"` // per-item source digests for append-only growth
 }
 
 // codexHistoryDBPath is the newest history database in home (thread_history_1.sqlite in 2026-11).
@@ -241,7 +244,7 @@ func (n *Node) refreshCodexAppHistory(id string) error {
 	if err == nil {
 		_, size = readCodexHistoryMark(p)
 		err = writeCodexHistoryMark(p, codexHistoryMark{Version: codexAppHistoryVersion, Turn: res.turn, TurnID: res.turnID, Status: res.status,
-			Updated: t.UpdatedAtMs, History: history, Size: size, Lineage: lineage})
+			Updated: t.UpdatedAtMs, History: history, Size: size, Lineage: lineage, Snapshot: res.snapshot, Unsettled: res.unsettled, ItemIDs: res.itemIDs, FileOrder: res.fileOrder, Rows: res.rows})
 	}
 	codexAppHistoryFailed.Lock()
 	if err != nil {
@@ -327,6 +330,11 @@ var errCodexHistoryChanged = errors.New("a written turn changed")
 type codexHistoryWrite struct {
 	turn           int64  // the last turn written (rollout_ordinal); the mark's when none was
 	turnID, status string // its turn_id, and its status in the database ("inProgress" for one written as interrupted)
+	snapshot       string
+	unsettled      map[int64]string
+	itemIDs        []string
+	fileOrder      map[string][]string
+	rows           []string
 }
 
 // writeCodexAppHistory writes thread t's turns to path: when grow, those after the mark's last turn, appended (that turn
@@ -335,6 +343,9 @@ type codexHistoryWrite struct {
 // turn is written as it streams in; the last turn while it still runs is left for later; one that never finished but has
 // turns after it is written as interrupted.
 func writeCodexAppHistory(ctx context.Context, db string, t codexAppThread, path string, mark codexHistoryMark, grow bool) (codexHistoryWrite, error) {
+	if !t.includeRunning {
+		return writeCodexHistorySnapshots(ctx, db, t, path, mark, grow)
+	}
 	res := codexHistoryWrite{turn: -1}
 	if grow {
 		res = codexHistoryWrite{turn: mark.Turn, turnID: mark.TurnID, status: mark.Status}
@@ -606,6 +617,10 @@ func shellWord(s string) (string, bool) {
 // carries (transcript/codex.go codexItem); nil for a kind the chat does not show (a sleep, a subagent's progress) and for
 // an item still running.
 func codexRolloutItem(kind string, raw []byte) map[string]any {
+	return codexHistoryItem(kind, raw, false)
+}
+
+func codexHistoryItem(kind string, raw []byte, running bool) map[string]any {
 	var v struct {
 		ID      string `json:"id"`
 		Content []struct {
@@ -656,10 +671,13 @@ func codexRolloutItem(kind string, raw []byte) map[string]any {
 			Snippet string `json:"snippet"`
 		} `json:"results"`
 	}
-	if json.Unmarshal(raw, &v) != nil || v.Status == "inProgress" {
+	if json.Unmarshal(raw, &v) != nil || v.Status == "inProgress" && !running {
 		return nil
 	}
 	item := map[string]any{"id": v.ID}
+	if v.Status == "inProgress" {
+		item["status"] = v.Status
+	}
 	switch kind {
 	case "userMessage":
 		var content []map[string]string

@@ -115,6 +115,10 @@ type block struct {
 
 // Meta is session-level information collected while parsing.
 type Meta struct {
+	echoFullText                                 bool // temporary exact Codex input comparison only; ordinary readers always leave this false
+	historyTurn, historySnapshot                 string
+	historySeq, historyTurns, historyCompactions int
+	historyAppend                                bool
 	// Developer info for the chat header (all from fields Claude Code writes on each line).
 	GitBranch string
 	Version   string
@@ -453,10 +457,14 @@ const (
 
 // ParseLine converts one JSONL line (1-based seq) into items, updating meta.
 func ParseLine(seq int, line []byte, meta *Meta) []proto.Item {
+	meta.historySnapshot = ""
 	var items []proto.Item
 	if meta.Codex || isCodexLine(line) {
 		meta.Codex = true
 		items = parseCodexLine(seq, line, meta)
+		if meta.historySnapshot != "" {
+			return items // each item in an atomic history snapshot was already tracked
+		}
 	} else {
 		items = parseLine(seq, line, meta)
 	}

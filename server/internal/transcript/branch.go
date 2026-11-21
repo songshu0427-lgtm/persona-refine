@@ -79,6 +79,8 @@ type treeRec struct {
 
 // branchTree tracks the lines read so far (file order) and which of them lie on abandoned branches.
 type branchTree struct {
+	historySnapshots map[string]historySpan
+
 	recs    []treeRec
 	replies map[string]bool     // lines that are the assistant's
 	rounds  map[string]bool     // the background supervisor's rounds (treeRec.round)
@@ -324,6 +326,7 @@ func setOf(uuids []string) map[string]bool {
 // trackLine puts a line just parsed into the tree. drop says it is on an abandoned branch: its items must not be
 // kept. When it abandons an earlier branch, that branch's items are taken out of *kept and *sent (either may be nil).
 func trackLine(t *branchTree, meta *Meta, items []proto.Item, kept, sent *[]proto.Item) (drop bool) {
+	trackCodexHistory(t, meta, kept, sent)
 	tl := meta.tree
 	meta.tree = treeLine{}
 	if tl.uuid == "" || tl.sidechain || meta.Sidechain || meta.Codex {

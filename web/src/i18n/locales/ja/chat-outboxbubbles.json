@@ -1,4 +1,7 @@
 {
+  "queued": "送信待ち",
+  "awaiting_echo": "受信済・同期待ち",
+  "images_not_kept": "画像{count}枚（未保存・再送は再添付）",
   "failed": "送信できませんでした：{error}",
   "clear_and_send": "クリアして送信",
   "retry": "再試行",

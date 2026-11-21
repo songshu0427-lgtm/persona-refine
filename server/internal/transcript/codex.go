@@ -107,6 +107,7 @@ type codexItem struct {
 		UnifiedDiff string `json:"unified_diff"`
 		Content     string `json:"content"`
 	} `json:"changes"`
+	HistoryFileOrder []string `json:"persona_file_order,omitempty"`
 	// McpToolCall
 	Server    string          `json:"server"`
 	Tool      string          `json:"tool"`
@@ -301,6 +302,8 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		return proto.Item{ID: fmt.Sprintf("%s#%d", id, idx), Seq: seq, TS: l.Timestamp, Role: role, Kind: kind}
 	}
 	switch p.Type {
+	case "persona_history_snapshot", "persona_history_append":
+		return parseCodexHistory(seq, l.Timestamp, l.Payload, meta)
 	case "token_count":
 		if p.Info != nil {
 			meta.ContextTokens, meta.OutputTokens = int(p.Info.Last.Input), int(p.Info.Total.Output)
@@ -344,6 +347,7 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 			return nil
 		}
 		it := mk(0, "", "system", "turn_duration")
+		it.TurnID = p.TurnID
 		it.TurnDuration = &proto.TurnDuration{DurationMS: ms, Source: "codex_task_complete", TurnID: p.TurnID, UserItemID: meta.codexUserID}
 		it.Usage = usage // the turn's requests, summed (item_usage.go)
 		return []proto.Item{it}
@@ -353,12 +357,13 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		meta.clearTurnError() // stopped by the user: no failure
 		meta.turnWorked = false
 		it := mk(0, "", "system", proto.KindNotice)
+		it.TurnID = meta.codexTurnID
 		it.Text = InterruptedNotice
 		it.Usage = meta.codexTurnUsage() // what the turn used before it was stopped
 		return []proto.Item{it}
 	case "thread_goal_updated":
 		return meta.codexGoalUpdated(p.Goal, l.Timestamp, func() proto.Item { return mk(0, "", "system", proto.KindNotice) })
-	case "item_completed":
+	case "item_completed", "persona_item_running":
 	default:
 		return nil
 	}
@@ -366,6 +371,15 @@ func parseCodexLine(seq int, line []byte, meta *Meta) []proto.Item {
 		return nil
 	}
 	out := codexItemLines(seq, l.Timestamp, p.Item, meta)
+	if p.Type == "persona_item_running" {
+		kept := out[:0]
+		for _, it := range out {
+			if it.Kind != proto.KindToolResult && it.ToolUseID == "" || it.Kind == proto.KindToolUse {
+				kept = append(kept, it)
+			}
+		}
+		out = kept
+	}
 	meta.codexWorked(out)
 	return meta.codexModel(out)
 }
@@ -413,7 +427,11 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 		if id == "" {
 			id = fmt.Sprintf("line%d", seq)
 		}
-		return proto.Item{ID: fmt.Sprintf("%s#%d", id, idx), Seq: seq, TS: ts, Role: role, Kind: kind}
+		out := proto.Item{ID: fmt.Sprintf("%s#%d", id, idx), Seq: seq, TS: ts, Role: role, Kind: kind}
+		if it.Type == "UserMessage" || it.Type == "AgentMessage" {
+			out.TurnID = meta.codexTurnID
+		}
+		return out
 	}
 	switch it.Type {
 	case "UserMessage":
@@ -431,7 +449,7 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			if prompt, ok := codexHeartbeatPrompt(strings.TrimSpace(parts[0])); ok {
 				u := mk(0, it.ID, "user", proto.KindText)
 				u.Source = &proto.MessageSource{Kind: proto.SourceScheduledTask}
-				u.Text = clip(prompt)
+				u.Text = meta.codexUserClip(prompt)
 				if meta.codexUserID == "" {
 					meta.codexUserID = u.ID
 				}
@@ -442,7 +460,7 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			parts[i] = codexUserText(parts[i])
 		}
 		text := strings.TrimSpace(strings.Join(parts, "\n"))
-		items, paseo := paseoInput(func(n int, role, kind string) proto.Item { return mk(n, it.ID, role, kind) }, 0, text)
+		items, paseo := paseoInputWithClip(func(n int, role, kind string) proto.Item { return mk(n, it.ID, role, kind) }, 0, text, meta.codexUserClip)
 		if paseo && (len(images) == 0 || attachImages(items, images)) {
 			if meta.codexUserID == "" && len(items) > 0 { // it started the turn: its notices woke the agent
 				markWake(items)
@@ -458,7 +476,7 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			return nil
 		}
 		u := mk(0, it.ID, "user", proto.KindText)
-		u.Text = clip(text)
+		u.Text = meta.codexUserClip(text)
 		if meta.codexUserID == "" {
 			meta.codexUserID = u.ID
 		}
@@ -516,10 +534,15 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			paths = append(paths, path)
 		}
 		sort.Strings(paths)
+		if len(it.HistoryFileOrder) > 0 {
+			paths = it.HistoryFileOrder // projection slots survive additions to a running FileChange
+		}
 		var out []proto.Item
-		n := 0
-		for _, path := range paths {
-			ch := it.Changes[path]
+		for n, path := range paths {
+			ch, exists := it.Changes[path]
+			if !exists {
+				continue
+			}
 			diff := ch.UnifiedDiff
 			if diff == "" {
 				diff = ch.Content
@@ -532,7 +555,6 @@ func codexItemLines(seq int, ts time.Time, it *codexItem, meta *Meta) []proto.It
 			res.ToolUseID, res.Text, res.IsError = id, ch.Type+" "+path, it.Status == "failed"
 			res.Outcome = &proto.ToolOutcome{Status: codexStatus(it.Status, res.IsError)}
 			out = append(out, use, res)
-			n++
 		}
 		return out
 	case "McpToolCall":

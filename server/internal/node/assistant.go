@@ -120,6 +120,9 @@ type assistantProc struct {
 	compacted     bool // compactIdle ran in this process: it is let go when idle again
 	manual        bool // an explicit /compact (manual or idle-aware delivery): its end is reported
 	requested     bool // its first request was logged
+
+	partialIdentity proto.StreamIdentity // Codex only; captured with partial under mu
+
 	// tui: started as interactive Claude Code through `personad assistant-tui` (assistant_tui.go). tuiNote: why it
 	// runs claude -p although interactive was asked for (the bridge fell back, or a recent fallback holds new starts
 	// off); "" when it runs as asked.
@@ -1306,8 +1309,9 @@ func (n *Node) flushPartial(p *assistantProc) {
 		return
 	}
 	p.lastDelta, p.deltaSent = time.Now(), text
+	identity := p.partialIdentity
 	p.mu.Unlock()
-	n.notifyDelta(p.id, text)
+	n.notifyDelta(p.id, text, identity)
 }
 
 // emitDelta sends a conversation's live text ("" clears it). Sends are serialized (deltaMu) with flushPartial's.
@@ -1317,9 +1321,21 @@ func (n *Node) emitDelta(id, text string) {
 	n.notifyDelta(id, text)
 }
 
-func (n *Node) notifyDelta(id, text string) {
+func (n *Node) notifyDelta(id, text string, identity ...proto.StreamIdentity) {
 	if n.peer != nil {
-		_ = n.peer.Notify("session.delta", map[string]any{"session_id": id, "text": text})
+		payload := map[string]any{"session_id": id, "text": text}
+		if len(identity) > 0 {
+			if identity[0].TurnID != "" {
+				payload["turn_id"] = identity[0].TurnID
+			}
+			if identity[0].ItemID != "" {
+				payload["item_id"] = identity[0].ItemID
+			}
+			if identity[0].TurnDone {
+				payload["turn_done"] = true
+			}
+		}
+		_ = n.peer.Notify("session.delta", payload)
 	}
 }
 

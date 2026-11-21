@@ -312,7 +312,9 @@ func (n *Node) resumeAssistants(adopted []*assistantProc) {
 		busy := p.busy
 		p.mu.Unlock()
 		n.rememberTasks(p.id, tasks)
-		if busy && text != "" {
+		if p.cx != nil {
+			n.replayCodexPartial(p)
+		} else if busy && text != "" {
 			n.emitDelta(p.id, text)
 		}
 	}

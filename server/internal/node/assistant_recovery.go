@@ -653,7 +653,11 @@ func (n *Node) finishAssistantRecoveryOnExit(p *assistantProc, r *assistantTurnR
 	if valid && current == nil {
 		n.finishAssistantRecovery(p, r)
 	} else if !valid { // cancelled meanwhile (a Stop): the exit is the last word, as without a recovery (#3495)
-		n.emitDelta(p.id, "")
+		if p.cx != nil {
+			n.clearCodexPartial(p)
+		} else {
+			n.emitDelta(p.id, "")
+		}
 		n.notifySessions()
 	}
 }
@@ -682,6 +686,10 @@ func (n *Node) finishAssistantRecovery(p *assistantProc, r *assistantTurnRecover
 		p.lastActive = time.Now()
 		p.mu.Unlock()
 	}
-	n.emitDelta(p.id, "")
+	if p.cx != nil {
+		n.clearCodexPartial(p)
+	} else {
+		n.emitDelta(p.id, "")
+	}
 	n.notifySessions()
 }

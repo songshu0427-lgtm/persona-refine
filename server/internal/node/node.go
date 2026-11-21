@@ -1631,6 +1631,11 @@ func (n *Node) handle(ctx context.Context, method string, params json.RawMessage
 	case "session.send":
 		var opts sendOpts
 		_ = json.Unmarshal(params, &opts)
+		desktopSend := codexDesktopSendID{session: p.SessionID, message: opts.ClientMsgID}
+		if res, err, known := codexDesktopQueue.reply(desktopSend); known {
+			return res, err
+		}
+		ctx = context.WithValue(ctx, codexDesktopSendKey{}, desktopSend)
 		ctx = context.WithValue(ctx, sendTraceKey{}, opts.ClientMsgID)
 		ctx, waits := withComputerWait(ctx) // claudebg.go: an outside Claude took it behind a dialog
 		ctx, queued := withSendQueued(ctx)  // codex_desktop_queue.go: it waits behind the turn under way
@@ -1653,6 +1658,9 @@ func (n *Node) handle(ctx context.Context, method string, params json.RawMessage
 		})
 		if err != nil {
 			return ok(err)
+		}
+		if res, err, known := codexDesktopQueue.reply(desktopSend); known {
+			return res, err
 		}
 		res := map[string]any{"ok": true}
 		if *waits {
@@ -2327,7 +2335,11 @@ func (n *Node) handle(ctx context.Context, method string, params json.RawMessage
 		n.syncAssistantSkills(dir)
 		return map[string]any{"cwd": dir, "plugin_skills_need": need}, nil
 	case "session.info":
-		return n.sessionInfo(ctx, p.SessionID)
+		info, err := n.sessionInfo(ctx, p.SessionID)
+		if err == nil {
+			info["codex_desktop_queue"] = n.codexDesktopQueueSnapshot(p.SessionID)
+		}
+		return info, err
 	case "session.queue.edit":
 		var a struct {
 			Keep []int `json:"keep"`

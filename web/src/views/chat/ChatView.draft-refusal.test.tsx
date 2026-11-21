@@ -47,6 +47,7 @@ let host: HTMLDivElement;
 let root: Root;
 let fetcher: ReturnType<typeof vi.fn>;
 const flush = async () => {
+  await act(async () => { await import("./OutboxFailure"); });
   for (let i = 0; i < 4; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 };
 const box = () => host.querySelector<HTMLTextAreaElement>("textarea")!;

@@ -562,7 +562,7 @@ export interface ItemsEvent {
 
 type SessionListener = {
   items?: (e: ItemsEvent) => void;
-  delta?: (text: string) => void;
+  delta?: (text: string, identity?: import("./assistant-stream").DeltaIdentity) => void;
   /** The hub's `revs` event: the transcript grew to this rev; the list's row keeps the rev it had (lib/stale-page.ts). */
   rev?: (rev: number) => void;
   reconnected?: () => void;
@@ -999,7 +999,7 @@ function onMessage(msg: Record<string, unknown>) {
       break;
     case "delta":
       if (conversationDeleted(msg.machine_id as string, msg.session_id as string)) break;
-      sessionListeners.get(key(msg.machine_id as string, msg.session_id as string))?.forEach((l) => l.delta?.(msg.text as string));
+      sessionListeners.get(key(msg.machine_id as string, msg.session_id as string))?.forEach((l) => l.delta?.(msg.text as string, msg));
       break;
   }
   if (typeof msg.type !== "string") return;

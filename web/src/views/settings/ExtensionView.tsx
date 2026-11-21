@@ -15,6 +15,7 @@ import {
   type UIAction, type UIContext, type UIItem, type UIMore, type UIPage, type UIPlace, type UIPush, type UITabs, type UIView,
 } from "../../lib/extension-ui";
 import { navigate } from "../../lib/router";
+import { askPersona } from "../../lib/outbox";
 import { isResumed } from "../../lib/reconnect";
 import { appSocketReady, onAppSocket, onHubEvent } from "../../lib/store";
 import { wideView } from "../../lib/code-view";
@@ -786,10 +787,10 @@ function LauncherSection({ place, launcher, machine }: { place: UIPlace; launche
   );
 }
 
-/** Sends the subscription pages' Set Up with … text to the assistant's main conversation (Ask Persona), loading the
- *  outbox only then; a conversation that can't start says so. Inbox Sources' relationship view sends the same. */
+/** Sends the subscription pages' Set Up with … text to the assistant's main conversation (Ask Persona).
+ *  Outbox already loads with chat: use its named entry, not a dynamic namespace retaining every export.
+ *  A conversation that can't start says so. Inbox Sources' relationship view sends the same. */
 export function askAssistant(text: string) {
-  void import("../../lib/outbox")
-    .then((m) => m.askPersona(text))
+  void askPersona(text)
     .catch((e: unknown) => toast(t("settings-extensionview.action_failed", { error: errorText(e) }), "error"));
 }

@@ -172,27 +172,7 @@ func (n *Node) spawnCodexWithMode(id, cwd, launcher string, resume, spare bool, 
 			n.keeper.forget(p)
 		}
 		n := p.ownerOr(n)
-		n.mu.Lock()
-		delete(n.akeys, key)
-		wasSpare := n.spare == p
-		if wasSpare {
-			n.spare = nil
-		}
-		var recovery *assistantTurnRecovery
-		if p.id != "" && n.procs[p.id] == p {
-			delete(n.procs, p.id)
-			recovery = n.recoveries[p.id] // do not confuse a replaced process's late exit with the current one
-		}
-		n.mu.Unlock()
-		if wasSpare || p.id == "" {
-			return
-		}
-		if recovery != nil {
-			n.finishAssistantRecoveryOnExit(p, recovery)
-			return
-		}
-		n.emitDelta(p.id, "")
-		n.notifySessions()
+		n.finishCodexExit(p, key)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), codexStartTimeout)
@@ -207,6 +187,44 @@ func (n *Node) spawnCodexWithMode(id, cwd, launcher string, resume, spare bool, 
 		n.mu.Unlock()
 	}
 	return p, nil
+}
+
+// finishCodexExit is the publication half of exit cleanup; it is testable without
+// creating a process, discovering an installed CLI or touching an App bundle.
+func (n *Node) finishCodexExit(p *assistantProc, key string) {
+	n.deltaMu.Lock()
+	n.mu.Lock()
+	if n.akeys[key] == p {
+		delete(n.akeys, key)
+	}
+	wasSpare := n.spare == p
+	if wasSpare {
+		n.spare = nil
+	}
+	var recovery *assistantTurnRecovery
+	owned := p.id != "" && n.procs[p.id] == p
+	if owned {
+		delete(n.procs, p.id)
+		recovery = n.recoveries[p.id]
+	}
+	n.mu.Unlock()
+	p.mu.Lock()
+	p.partial.Reset() // disarm an old process's trailing timer as well
+	p.deltaSent = ""
+	identity := p.partialIdentity
+	p.mu.Unlock()
+	if owned && !wasSpare && recovery == nil {
+		n.notifyDelta(p.id, "", identity)
+	}
+	n.deltaMu.Unlock()
+	if wasSpare || !owned {
+		return
+	}
+	if recovery != nil {
+		n.finishAssistantRecoveryOnExit(p, recovery)
+		return
+	}
+	n.notifySessions()
 }
 
 // codexDirs is the workspace and the memory directory (made if missing) as Codex gets them, symlinks resolved: both

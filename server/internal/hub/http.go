@@ -1206,10 +1206,14 @@ func (h *Hub) toSubscribersLocked(machineID, sessionID, feature string, v any) {
 // and no key sort. Fields are in sorted key order, the bytes the map[string]any each replaced encoded to.
 type (
 	deltaPush struct {
-		MachineID string `json:"machine_id"`
-		SessionID string `json:"session_id"`
-		Text      string `json:"text"`
-		Type      string `json:"type"` // "delta"
+		ItemID     string `json:"item_id,omitempty"`
+		MachineID  string `json:"machine_id"`
+		SessionID  string `json:"session_id"`
+		Text       string `json:"text"`
+		TurnDone   bool   `json:"turn_done,omitempty"`
+		TurnID     string `json:"turn_id,omitempty"`
+		Type       string `json:"type"` // "delta"
+		cacheOrder uint64 // hub-local, never on the wire
 	}
 	screenPush struct {
 		MachineID string    `json:"machine_id"`

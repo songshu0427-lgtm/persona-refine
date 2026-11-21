@@ -837,13 +837,10 @@ func (m *Machine) onEvent(event string, params json.RawMessage) {
 			m.hub.terminalEnded(m.cfg.ID, p.SessionID, p.Error, nil)
 		}
 	case "session.delta":
-		var p struct {
-			SessionID string `json:"session_id"`
-			Text      string `json:"text"`
-		}
+		var p deltaPush
 		if json.Unmarshal(params, &p) == nil {
-			m.hub.rememberLiveText(m.cfg.ID, p.SessionID, p.Text)
-			m.hub.toSubscribers(m.cfg.ID, p.SessionID, deltaPush{Type: "delta", MachineID: m.cfg.ID, SessionID: p.SessionID, Text: p.Text})
+			p.MachineID, p.Type = m.cfg.ID, "delta"
+			m.hub.forwardLiveText(p)
 		}
 	case "codex.inventory":
 		if !m.codexInventoryHanded() {

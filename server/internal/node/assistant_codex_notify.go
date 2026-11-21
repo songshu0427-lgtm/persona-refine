@@ -68,6 +68,7 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 			ServiceTier json.RawMessage `json:"serviceTier"`
 		} `json:"threadSettings"`
 		TurnID string `json:"turnId"`
+		ItemID string `json:"itemId"`
 		Delta  string `json:"delta"`
 		Turn   struct {
 			ID     string          `json:"id"`
@@ -104,6 +105,18 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 	if ev.ThreadID != "" && thread != "" && ev.ThreadID != thread {
 		return // a subagent's thread: its items are in the main rollout's events anyway
 	}
+	c.notifyMu.Lock()
+	defer c.notifyMu.Unlock()
+	turn, item := ev.TurnID, firstNonEmpty(ev.ItemID, ev.Item.ID)
+	if method == "turn/started" || method == "turn/completed" {
+		turn = ev.Turn.ID
+	}
+	switch method {
+	case "turn/started", "turn/completed", "item/started", "item/completed", "item/agentMessage/delta":
+		if !c.acceptStreamEvent(method, turn, item, ev.Item.Type) {
+			return
+		}
+	}
 	switch method {
 	case "thread/settings/updated":
 		c.mu.Lock()
@@ -119,9 +132,8 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 		c.turnID = ev.Turn.ID
 		c.loop = codexCompactionLoop{}
 		c.mu.Unlock()
+		n.codexPartial(p, proto.StreamIdentity{TurnID: ev.Turn.ID}, "", false)
 		p.mu.Lock()
-		had := p.partial.Len() > 0
-		p.partial.Reset()
 		p.turnError = ""
 		p.turnErrorKind = ""
 		resumed := !p.busy
@@ -130,9 +142,6 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 		p.mu.Unlock()
 		if resumed {
 			n.notifySessions()
-		}
-		if had {
-			n.emitDelta(p.id, "")
 		}
 	case "item/started":
 		if ev.Item.Type == "fileChange" {
@@ -148,23 +157,10 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 			return
 		}
 		// A new message: the last one is in the rollout by now; clear the live copy so it is not shown twice.
-		p.mu.Lock()
-		had := p.partial.Len() > 0
-		p.partial.Reset()
-		p.lastActive = time.Now()
-		p.mu.Unlock()
-		if had {
-			n.emitDelta(p.id, "")
-		}
+		identity := c.streamIdentity(turn, item)
+		n.codexPartial(p, identity, "", false)
 	case "item/agentMessage/delta":
-		p.mu.Lock()
-		p.partial.WriteString(ev.Delta)
-		text := n.partialGrewLocked(p)
-		p.lastActive = time.Now()
-		p.mu.Unlock()
-		if text != "" {
-			n.emitDelta(p.id, text)
-		}
+		n.codexPartial(p, c.streamIdentity(turn, item), ev.Delta, true)
 	case "thread/tokenUsage/updated":
 		c.noteRequest(ev.TokenUsage.Last.InputTokens, ev.TokenUsage.ModelContextWindow, c.turnModel())
 	case "thread/compacted":
@@ -177,7 +173,8 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 			c.compacted()
 		}
 		if ev.Item.Type == "agentMessage" {
-			n.emitDelta(p.id, ev.Item.Text) // until the item arrives from the rollout
+			identity := c.streamIdentity(turn, item)
+			n.codexPartial(p, identity, ev.Item.Text, false) // until the item arrives from the rollout
 		}
 		if f, err := n.file(p.id); err == nil {
 			n.refresh(p.id, f)
@@ -223,7 +220,9 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 		p.turnError = failure
 		p.turnErrorKind = failureKind
 		p.lastActive = time.Now()
-		p.partial.Reset()
+		identity := p.partialIdentity
+		identity.TurnID = firstNonEmpty(turn, identity.TurnID)
+		identity.TurnDone = true
 		manual := p.manual
 		p.manual, p.compacting = false, false
 		p.mu.Unlock()
@@ -233,7 +232,7 @@ func (c *codexConn) notification(method string, params json.RawMessage) {
 		if f, err := n.file(p.id); err == nil {
 			n.refresh(p.id, f)
 		}
-		n.emitDelta(p.id, "")
+		n.codexPartial(p, identity, "", false)
 		if !recovering {
 			n.notifySessions()
 		}

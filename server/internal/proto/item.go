@@ -187,6 +187,9 @@ type Item struct {
 	// its pictures, or the notice it became (/compact). Set by the node, which ties the transcript's line to the send
 	// (node/echo.go); absent for anything else and from older nodes. docs/protocol/protocol.md "Matching pending messages".
 	ClientMsgID string `json:"client_msg_id,omitempty"`
+	// TurnID is the source Codex turn identity, when recorded. It aligns a live
+	// delta with user/assistant items even when history arrives after the delta.
+	TurnID string `json:"turn_id,omitempty"`
 	// FullSize: Text was cut for pages and pushes (it ends in a "truncated, open for the full text" line, in Chinese); the whole of it, this many
 	// bytes, comes from GET /api/v1/sessions/{mid}/{sid}/items/{item id}/full.
 	FullSize int `json:"full_size,omitempty"`

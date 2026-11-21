@@ -124,6 +124,8 @@ export function mergeItems(have: Item[], batch: Item[]): Item[] {
   const byId = new Map(have.map((i) => [i.id, i]));
   for (const it of batch) {
     const old = byId.get(it.id);
+    // Codex history revisions retain IDs while their physical seq advances. An overlapping older page is stale.
+    if (old && it.id?.startsWith("history:") && it.seq < old.seq) continue;
     let next = old?.supervisionUser ? { ...it, supervisionUser: true } : it;
     if (old?.fold?.supervision_user && next.fold && old.fold.through_seq === next.fold.through_seq) next = { ...next, fold: { ...next.fold, supervision_user: true } };
     byId.set(it.id, next);
@@ -951,8 +953,8 @@ function turnLines(t: Turn, live: boolean, results?: ReadonlyMap<string, Item>):
   // what the background task that woke it used is the work it woke
   if (woke && segs[0]) countUsage(segs[0], woke);
   // stopped after everything it did (not an exchange that went on after it): its last words are not a finished reply
-  const end = segs.at(-1), at = t.ordered.at(-1)?.seq ?? 0;
-  if (end && !live && t.trailing.some((n) => isInterruptNotice(n) && n.seq > at)) end.cut = true;
+  const end = segs.at(-1), last = t.ordered.at(-1);
+  if (end && !live && t.trailing.some((n) => isInterruptNotice(n) && (!last || blockOrder(n, last) > 0))) end.cut = true;
   // what a stopped turn's notice carries (a Codex turn's total) is its last exchange's
   if (end) for (const n of t.trailing) countUsage(end, n);
   segs.forEach((seg, k) => {

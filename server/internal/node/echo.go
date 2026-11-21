@@ -33,14 +33,16 @@ import (
 
 // echoRecord is one send the node ties to the transcript: expected while Line is "", found after.
 type echoRecord struct {
-	SessionID   string    `json:"session_id"`
-	ClientMsgID string    `json:"client_msg_id"`
-	Text        string    `json:"text,omitempty"`    // the start of what was typed (echoTextLen runes)
-	Literal     string    `json:"literal,omitempty"` // its raw start when clipping a text-only send left Text empty
-	Images      int       `json:"images,omitempty"`
-	SentAt      time.Time `json:"sent_at"`
-	AfterSeq    int       `json:"after_seq"`      // the session's last item before it was typed (counted in In)
-	Line        string    `json:"line,omitempty"` // the line found: its items' id before "#" (one of In's)
+	SessionID   string            `json:"session_id"`
+	ClientMsgID string            `json:"client_msg_id"`
+	Text        string            `json:"text,omitempty"`    // the start of what was typed (echoTextLen runes)
+	Literal     string            `json:"literal,omitempty"` // its raw start when clipping a text-only send left Text empty
+	Images      int               `json:"images,omitempty"`
+	SentAt      time.Time         `json:"sent_at"`
+	AfterSeq    int               `json:"after_seq"`         // the session's last item before it was typed (counted in In)
+	Line        string            `json:"line,omitempty"`    // the line found: its items' id before "#" (one of In's)
+	Before      []string          `json:"before,omitempty"`  // replayable history entries already present before this send
+	Desktop     *codexDesktopEcho `json:"desktop,omitempty"` // the real dispatch boundary and exact batch proof
 	// In is where AfterSeq and Line count: echoInTranscript or echoInRuntime. A record sent after nothing (a start's
 	// first message) or handed back by a hub from before #8358 has none: it is looked for and tagged wherever the
 	// items come from, as before, and counts where it is found from then on.
@@ -59,7 +61,7 @@ const (
 // is one of a runtime's own items, which stood in for the transcript before it was named or written. A line found in
 // the transcript stays its line (above), and one sent too long ago to be found again keeps what it has.
 func (r *echoRecord) movesTo(in string) bool {
-	return r.In != "" && r.In != in && (r.Line == "" || r.In == echoInRuntime) && time.Since(r.SentAt) <= echoWithin
+	return r.In != "" && r.In != in && (r.Line == "" || r.In == echoInRuntime) && time.Since(r.matchAt()) <= echoWithin
 }
 
 // foundIn: r's line is one of the items from in (one with no In: wherever it was found).
@@ -121,6 +123,9 @@ func (l *echoLog) expect(r echoRecord) bool {
 	list := l.recs[r.SessionID]
 	for _, o := range list {
 		if o.ClientMsgID == r.ClientMsgID {
+			if mergeDesktopEcho(o, r) {
+				return false
+			}
 			if o.Line == "" && r.Line != "" {
 				o.Line, o.In = r.Line, r.In
 			}
@@ -168,7 +173,7 @@ func (l *echoLog) waitingFrom(id, in string) (int, bool) {
 		switch {
 		case r.movesTo(in):
 			at = 0 // looked for from the start: its seq counted elsewhere
-		case r.Line != "" || time.Since(r.SentAt) > echoWithin:
+		case r.Line != "" || time.Since(r.matchAt()) > echoWithin:
 			continue
 		}
 		if !waiting || at < from {
@@ -190,6 +195,7 @@ func (l *echoLog) match(id, in string, items []proto.Item) []echoRecord {
 	for _, r := range recs {
 		if r.movesTo(in) {
 			r.In, r.AfterSeq, r.scanned, r.Line = in, 0, 0, ""
+			r.Before = nil
 		}
 		if r.foundIn(in) {
 			taken[r.Line] = true
@@ -204,7 +210,7 @@ func (l *echoLog) match(id, in string, items []proto.Item) []echoRecord {
 			}
 			taken[ln.key] = true
 			for _, r := range recs {
-				if r.ClientMsgID == it.ClientMsgID && r.Line == "" {
+				if r.ClientMsgID == it.ClientMsgID && r.Line == "" && r.Desktop == nil {
 					r.Line, r.In = ln.key, in
 					found = append(found, *r)
 				}
@@ -216,19 +222,23 @@ func (l *echoLog) match(id, in string, items []proto.Item) []echoRecord {
 		last = items[len(items)-1].Seq
 	}
 	for _, r := range recs {
-		if r.Line != "" || time.Since(r.SentAt) > echoWithin {
+		if r.Line != "" || time.Since(r.matchAt()) > echoWithin {
 			continue
 		}
 		for _, ln := range lines {
-			if taken[ln.key] || ln.seq <= r.AfterSeq || ln.seq <= r.scanned {
+			if taken[ln.key] || ln.seq <= r.AfterSeq || ln.seq <= r.scanned || slices.Contains(r.Before, ln.key) {
 				continue
 			}
-			if !ln.ts.IsZero() && (ln.ts.Before(r.SentAt.Add(-echoSlack)) || ln.ts.After(r.SentAt.Add(echoWithin))) {
+			if !ln.ts.IsZero() && (ln.ts.Before(r.matchAt().Add(-echoSlack)) || ln.ts.After(r.matchAt().Add(echoWithin))) {
 				continue
 			}
 			if echoFits(r, ln.items) {
 				r.Line, r.In, taken[ln.key] = ln.key, in, true
-				found = append(found, *r)
+				if r.Desktop != nil {
+					found = append(found, tieDesktopGroup(recs, r, ln.key, in)...)
+				} else {
+					found = append(found, *r)
+				}
 				break
 			}
 		}
@@ -252,6 +262,9 @@ func (l *echoLog) tag(id, in string, items []proto.Item) []proto.Item {
 				byLine = map[string]string{}
 			}
 			byLine[r.Line] = r.ClientMsgID
+			if r.Desktop != nil && len(r.Desktop.Group) > 0 {
+				byLine[r.Line] = r.Desktop.Group[0]
+			}
 		}
 	}
 	l.mu.Unlock()
@@ -403,6 +416,9 @@ func echoLiteralFits(literal string, line []proto.Item) bool {
 // pictures fits a line with none; a bare command fits the command with the arguments picked for it; /compact fits the
 // notice it became.
 func echoFits(r *echoRecord, line []proto.Item) bool {
+	if r.Desktop != nil {
+		return r.Desktop.fits(line)
+	}
 	if r.Literal != "" {
 		return echoLiteralFits(r.Literal, line)
 	}
@@ -448,8 +464,9 @@ func echoFits(r *echoRecord, line []proto.Item) bool {
 // echoAfter is where a session's items end before a send: the seq of the last one, and where it counts
 // (echoRecord.In). The zero value is after nothing, wherever the items come from.
 type echoAfter struct {
-	seq int
-	in  string
+	seq    int
+	in     string
+	before []string
 }
 
 // echoBase is where the session's transcript ends before a send is typed (what it has so far is read, and pushed to
@@ -460,7 +477,11 @@ func (n *Node) echoBase(id string) echoAfter {
 		return echoAfter{in: echoInTranscript}
 	}
 	n.refresh(id, f)
-	return echoAfter{seq: f.LastSeq(), in: echoInTranscript}
+	// A Codex snapshot replays the current turn with newer transport seqs. Capture
+	// its identities together with the seq under the reader lock; those old entries
+	// cannot be the echo of this new send, even if their text and timestamps match.
+	seq, before := f.EchoBoundary()
+	return echoAfter{seq: seq, in: echoInTranscript, before: before}
 }
 
 // sendEchoed runs send and records it to tie; once it reached the pane, or may have, the hub is told (it hands the
@@ -473,7 +494,7 @@ func (n *Node) sendEchoed(id, clientMsgID, text string, images int, after echoAf
 	if clientMsgID == "" {
 		return send()
 	}
-	r := echoRecord{SessionID: id, ClientMsgID: clientMsgID, Text: text, Images: images, SentAt: time.Now(), AfterSeq: after.seq, In: after.in}
+	r := echoRecord{SessionID: id, ClientMsgID: clientMsgID, Text: text, Images: images, SentAt: time.Now(), AfterSeq: after.seq, In: after.in, Before: after.before}
 	fresh := n.echoes.expect(r)
 	err := send()
 	if !fresh {
@@ -501,6 +522,10 @@ func (n *Node) expectFirstLine(id, clientMsgID, text string, images int, at time
 }
 
 func (n *Node) notifyEcho(r echoRecord) {
+	if r.Desktop != nil && r.Desktop.DispatchAt.IsZero() {
+		return
+	} // nothing to restore or match until real dispatch
+	codexDesktopQueue.rememberEcho(r)
 	if n.peer == nil {
 		return
 	}
@@ -518,6 +543,10 @@ func (n *Node) echoed(id string, f *transcript.File, items []proto.Item) []proto
 			break
 		}
 		page, more, _ := f.After(from, 2000)
+		page, full := n.echoes.desktopFullItems(id, f, page)
+		if !full {
+			break
+		} // retry a failed full-text read next poll; do not advance the matching cursor past it
 		for _, r := range n.echoes.match(id, echoInTranscript, page) {
 			n.notifyEcho(r)
 		}

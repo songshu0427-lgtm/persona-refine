@@ -119,7 +119,8 @@ const { toast } = await import("../../ui/atoms");
 const { t } = await import("../../i18n");
 const { applyCompleteSessions, getSession, getState, onHubEvent, send, setOutbox, subscribe } = await import("../../lib/store");
 const { setRoute } = await import("../../lib/feed");
-const { keepOutgoing, outboxKey, resetOutboxClaimsForTests, resetRestoredForTests, SENT_GRACE_MS } = await import("../../lib/outbox");
+const { keepOutgoing, outboxKey, resetOutboxClaimsForTests, resetRestoredForTests } = await import("../../lib/outbox");
+const SENT_GRACE_MS = 60_000; // The former expiry must not delete accepted messages.
 const { configureMessageFeedback, receiveMessageSend, resetMessageFeedback } = await import("../../lib/message-send");
 configureMessageFeedback({ getSession, send, onHubEvent, subscribe, receiptsAllowed: () => true }); // injected trusted transport
 const { SESSIONS_LOOKUP_FEATURE } = await import("../../lib/runtime-list");
@@ -132,6 +133,8 @@ let reply: () => Response;
 let host: HTMLDivElement;
 let root: Root;
 const flush = async () => {
+  // Wait only for this recovery chunk; UndeliveredBubbles deliberately stays gated in separate fallback tests.
+  await act(async () => { await import("./OutboxFailure"); });
   for (let i = 0; i < 6; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
 };
 
@@ -670,6 +673,32 @@ describe("accepted messages waiting for their transcript copy (#2792)", () => {
   });
   afterEach(() => { transcript.items = []; });
 
+  it.each([false, true])("does not consume a new same-text send when only the old user snapshot is revised (queued=%s)", async (queued) => {
+    const original = captured.session;
+    captured.session = { ...original, machine_id: "hub", session_id: "c1", agent: "codex", status: "working", state: "working" } as Session;
+    const text = "Repeat this exact request";
+    const old = { id: "history:old:user#0", seq: 1, role: "user", kind: "text", text, ts: new Date().toISOString() };
+    transcript.items = [old];
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/messages")) bodies.push(JSON.parse(String(init?.body)));
+      return Promise.resolve(json({ queued }));
+    }));
+    try {
+      act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+      await act(async () => { await captured.onSend!({ text, images: [] }); }); await flush();
+      transcript.items = [{ ...old, seq: 2 }, { id: "history:old:agent#1000000", seq: 2, role: "assistant", kind: "text", text: "Still working" }];
+      act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+      expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(2);
+      const id = bodies[0].client_msg_id;
+      expect(localStorage.getItem(`outbox-msg:hub/c1/${id}`)).not.toBeNull();
+      transcript.items = [...transcript.items, { ...old, id: "history:new:user#0", seq: 3, client_msg_id: queued ? id : undefined }];
+      act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+      expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(2);
+      expect(host.querySelector("[data-user-bubble][data-send-state]")).toBeNull();
+      expect(localStorage.getItem(`outbox-msg:hub/c1/${id}`)).toBeNull();
+    } finally { captured.session = original; }
+  });
+
   it.each(["reload", "navigation"])("keeps one pending copy after %s without sending again, then replaces it with the echo", async (reopen) => {
     act(() => root.render(<ChatView mid="hub" sid="c1" />));
     await flush();
@@ -793,7 +822,7 @@ describe("accepted messages waiting for their transcript copy (#2792)", () => {
     expect(bodies).toEqual([]);
   });
 
-  it("expires a restored accepted bubble even when no further transcript arrives", async () => {
+  it("keeps a restored accepted bubble when no further transcript arrives", async () => {
     vi.useFakeTimers();
     const key = "outbox-msg:hub/c1/accepted";
     keepOutgoing(outboxKey("hub", "c1"), { id: "accepted", text: "Waiting for a copy", images: [], at: Date.now(), state: "sent" });
@@ -805,13 +834,72 @@ describe("accepted messages waiting for their transcript copy (#2792)", () => {
 
       await act(async () => { await vi.advanceTimersByTimeAsync(SENT_GRACE_MS); });
       await act(async () => { await vi.advanceTimersByTimeAsync(100); });
-      expect(host.querySelector('[data-outbox="accepted"]')).toBeNull();
-      expect(localStorage.getItem(key)).toBeNull();
+      expect(host.querySelector('[data-outbox="accepted"]')).not.toBeNull();
+      expect(host.textContent).toContain(t("chat-outboxbubbles.awaiting_echo"));
+      expect(localStorage.getItem(key)).not.toBeNull();
       expect(bodies).toEqual([]);
     } finally {
       act(() => root.render(null));
       vi.useRealTimers();
     }
+  });
+
+  it("shows Codex queued acceptance through multiple turns and a late reload, then merges one echo", async () => {
+    const original = captured.session;
+    captured.session = { ...original, machine_id: "hub", session_id: "c1", agent: "codex", state: "working", status: "working" } as Session;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/messages")) bodies.push(JSON.parse(String(init?.body)));
+      return Promise.resolve(json({ queued: true }));
+    }));
+    const clock = vi.spyOn(Date, "now");
+    try {
+      act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+      await act(async () => { await captured.onSend!({ text: "A queued follow-up", images: [] }); }); await flush();
+      expect(host.textContent).toContain(t("chat-outboxbubbles.queued"));
+      const id = bodies[0].client_msg_id;
+      expect(JSON.parse(localStorage.getItem(`outbox-msg:hub/c1/${id}`)!)).toMatchObject({ state: "sent", queued: true });
+      for (let turn = 1; turn <= 3; turn++) {
+        transcript.items = [{ id: `other-${turn}`, seq: turn, role: "assistant", kind: "text", text: `Other turn ${turn}` }];
+        captured.session = { ...captured.session!, state: turn % 2 ? "idle" : "working" };
+        act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+        expect(host.textContent).toContain(t("chat-outboxbubbles.queued"));
+      }
+      act(() => root.render(null));
+      clock.mockReturnValue(Date.now() + 10 * SENT_GRACE_MS);
+      resetOutboxClaimsForTests(); resetRestoredForTests();
+      act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+      expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(1);
+      expect(host.textContent).toContain(t("chat-outboxbubbles.queued"));
+      transcript.items = [{ id: "queued-echo", seq: 4, role: "user", kind: "text", text: bodies[0].text, client_msg_id: id }];
+      for (let poll = 0; poll < 3; poll++) {
+        transcript.items = [...transcript.items];
+        act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+        expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(1);
+        expect(host.querySelector("[data-user-bubble][data-send-state]")).toBeNull();
+      }
+      expect(bodies).toHaveLength(1);
+      expect(localStorage.getItem(`outbox-msg:hub/c1/${id}`)).toBeNull();
+    } finally { clock.mockRestore(); captured.session = original; }
+  });
+
+  it("claims an untagged echo once across restored and composer bubbles, also after reload", async () => {
+    const text = "Repeat this request";
+    keepOutgoing("hub/c1", { id: "restored-first", text, images: [], at: Date.now(), state: "sent" });
+    act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+    await act(async () => { await captured.onSend!({ text, images: [] }); }); await flush();
+    const second = bodies[0].client_msg_id;
+    transcript.items = [{ id: "only-one-copy", seq: 1, role: "user", kind: "text", text }];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+    expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(2);
+    expect(localStorage.getItem(`outbox-msg:hub/c1/${second}`)).not.toBeNull();
+    act(() => root.render(null));
+    setOutbox("hub/c1", []); resetOutboxClaimsForTests(); resetRestoredForTests();
+    act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+    expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(2);
+    transcript.items = [...transcript.items, { id: "second-copy", seq: 2, role: "user", kind: "text", text, client_msg_id: second }];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />)); await flush();
+    expect(host.querySelectorAll("[data-user-bubble]")).toHaveLength(2);
+    expect(host.querySelector("[data-user-bubble][data-send-state]")).toBeNull();
   });
 });
 

@@ -151,8 +151,8 @@ func statOf(t *testing.T, p string) os.FileInfo {
 }
 
 // The transcript of an App chat whose rollout is gone is its history in the App's database, written as a rollout: only
-// this chat's finished turns, in order, a failed one with its error, an interrupted one marked, one with no item kept; a
-// turn still running is left for later. The list writes nothing. Read again with no change, the file stays as it is; once
+// this chat's turns, in order, a failed one with its error, an interrupted one marked, one with no item kept; a
+// turn still running is visible without a completion. The list writes nothing. With no change, the file stays as it is; once
 // the App finished more turns they are appended, so a reader goes on where it was (#3305).
 func TestCodexAppChatHistoryComesFromTheAppsDatabase(t *testing.T) {
 	n := remoteTestNode(t)
@@ -198,8 +198,8 @@ func TestCodexAppChatHistoryComesFromTheAppsDatabase(t *testing.T) {
 			t.Fatalf("missing %q in %s", want, s)
 		}
 	}
-	if strings.Contains(s, "another chat") || strings.Contains(s, "and the PDF?") {
-		t.Fatalf("another chat's or a running turn's words: %s", s)
+	if strings.Contains(s, "another chat") || !strings.Contains(s, "and the PDF?") {
+		t.Fatalf("another chat leaked or the running turn is missing: %s", s)
 	}
 	if strings.Index(s, "fix the export") > strings.Index(s, "Fixed.") || strings.Index(s, "Fixed.") > strings.Index(s, "try again") {
 		t.Fatalf("out of order: %s", s)
@@ -253,7 +253,7 @@ func TestCodexAppChatHistoryComesFromTheAppsDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := historyText(more); !strings.Contains(s, "user:text:and the PDF?") || !strings.Contains(s, "assistant:text:PDF too.") ||
+	if s := historyText(more); strings.Contains(s, "user:text:and the PDF?") || !strings.Contains(s, "assistant:text:PDF too.") ||
 		!strings.Contains(s, "user:text:thanks") || strings.Contains(s, "fix the export") {
 		t.Fatalf("after the App's turns = %s", s)
 	}
@@ -425,8 +425,7 @@ func TestCodexHistoryDBPathTakesTheNewest(t *testing.T) {
 	}
 }
 
-// A turn that failed keeps the App's error, as a rollout's task_complete does; a chat with only a running turn has no
-// transcript yet.
+// A turn that failed keeps the App's error; a running-only chat has its items but no completion.
 func TestCodexAppChatFailedTurnAndRunningOnly(t *testing.T) {
 	n := remoteTestNode(t)
 	home := n.codexHome()
@@ -453,8 +452,10 @@ func TestCodexAppChatFailedTurnAndRunningOnly(t *testing.T) {
 	if m := f.Meta(); m.TurnError == "" {
 		t.Fatalf("the failed turn's error is lost: %+v", m)
 	}
-	if _, err := n.file(ids[appOld]); err == nil {
-		t.Fatal("a transcript for a chat whose only turn still runs")
+	if running, err := n.file(ids[appOld]); err != nil {
+		t.Fatal(err)
+	} else if _, err := running.Refresh(); err != nil || !running.Meta().TurnOpen || running.Meta().TurnClosed {
+		t.Fatalf("running-only history: %v", err)
 	}
 }
 
@@ -495,7 +496,7 @@ func TestCodexAppChatHistoryFollowsTheDatabase(t *testing.T) {
 	writeCodexHistory(t, home, turns)
 	id, s := readChat(t, n, appChat)
 	if !strings.Contains(s, "user:text:left running") || !strings.Contains(s, transcript.InterruptedNotice) || !strings.Contains(s, "user:text:next one") ||
-		strings.Contains(s, "still going") {
+		!strings.Contains(s, "still going") {
 		t.Fatalf("first read = %s", s)
 	}
 
@@ -706,7 +707,7 @@ func TestCodexAppChatHistoryMidChange(t *testing.T) {
 		historyTurn{thread: appChat, id: "t2", status: "inProgress", ordinal: 2, items: [][2]string{userItem("u2", "slow one")}},
 		historyTurn{thread: appChat, id: "t3", status: "inProgress", ordinal: 3, items: [][2]string{userItem("u3", "next one")}})
 	writeCodexHistory(t, home, turns)
-	if _, s := readChat(t, n, appChat); !strings.Contains(s, "slow one") || !strings.Contains(s, transcript.InterruptedNotice) || strings.Contains(s, "next one") {
+	if _, s := readChat(t, n, appChat); !strings.Contains(s, "slow one") || !strings.Contains(s, transcript.InterruptedNotice) || !strings.Contains(s, "next one") {
 		t.Fatalf("with t2 left running = %s", s)
 	}
 	turns[2].status = "completed"
@@ -716,15 +717,23 @@ func TestCodexAppChatHistoryMidChange(t *testing.T) {
 		t.Fatalf("after t2 finished = %s", s)
 	}
 
-	// Rolled back to its first message, asked again and still running: no finished turn, no transcript.
+	// Rolled back to its first message: replace abandoned history with the running revision.
 	writeCodexHistory(t, home, []historyTurn{{thread: appChat, id: "t0b", status: "inProgress", ordinal: 0, items: [][2]string{userItem("u0b", "asked again")}}})
 	p := n.transcriptPath(id)
 	n.file(id)
-	if _, err := os.Stat(p); !os.IsNotExist(err) {
-		t.Fatalf("the rolled back turns' file stays: %v", err)
+	f, err := n.file(id)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := n.transcriptPath(id); got != "" {
-		t.Fatalf("transcript at %q with no finished turn", got)
+	if _, err := f.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	page, _, _ := f.Page(0, 80)
+	if s := historyText(page); !strings.Contains(s, "asked again") || strings.Contains(s, "slow one") || !f.Meta().TurnOpen {
+		t.Fatalf("rollback: %s", s)
+	}
+	if got := n.transcriptPath(id); got != p {
+		t.Fatalf("running transcript changed path: %q", got)
 	}
 }
 

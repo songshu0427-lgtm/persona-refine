@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"sync"
@@ -8,12 +9,46 @@ import (
 	"time"
 )
 
+// New node-only batch evidence travels opaquely through the existing hub contract.
+// No queue is restored by the hub, and no second route or protocol version is needed.
+func TestCodexDesktopBatchEchoEvidenceSurvivesHubReconnect(t *testing.T) {
+	h := newTestHub(t)
+	store := &echoMem{sentStore: newSentStore(), echoes: map[string]json.RawMessage{}, wrote: make(chan struct{}, 8)}
+	h.store = store
+	m := newMachine(h, MachineConfig{ID: "box", Name: "box"})
+	evidence := json.RawMessage(`{"session_id":"s","client_msg_id":"a","after_seq":4,"before":["history:old:user"],"desktop":{"dispatch_at":"2026-11-21T10:00:00Z","group":["a","b"],"text_sha256":"fixture-proof","images":2},"line":"history:new:user"}`)
+	m.onEvent("session.echo", evidence)
+	select {
+	case <-store.wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RecordEcho")
+	}
+	reply := h.machineConnected(context.Background(), m, time.Now())
+	for _, c := range reply.Calls {
+		if c.Method != "session.echoes" {
+			continue
+		}
+		var p struct {
+			Echoes []json.RawMessage `json:"echoes"`
+		}
+		if err := json.Unmarshal(c.Params, &p); err != nil {
+			t.Fatal(err)
+		}
+		if len(p.Echoes) != 1 || !bytes.Equal(p.Echoes[0], evidence) {
+			t.Fatalf("batch evidence was changed: %s", c.Params)
+		}
+		return
+	}
+	t.Fatal("reconnect did not restore opaque echo evidence")
+}
+
 // echoMem keeps sent_messages.echo like the table does (db.RecordEcho / Echoes).
 type echoMem struct {
 	*sentStore
 	emu    sync.Mutex
 	echoes map[string]json.RawMessage // client_msg_id -> record, for machine "box"
 	order  []string
+	wrote  chan struct{}
 }
 
 func (s *echoMem) RecordEcho(_ context.Context, id, machine string, echo json.RawMessage) error {
@@ -34,6 +69,12 @@ func (s *echoMem) RecordEcho(_ context.Context, id, machine string, echo json.Ra
 		s.order = append(s.order, id)
 	}
 	s.echoes[id] = echo
+	if s.wrote != nil {
+		select {
+		case s.wrote <- struct{}{}:
+		default:
+		}
+	}
 	return nil
 }
 

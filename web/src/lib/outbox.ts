@@ -5,7 +5,6 @@ import { conversationDeleted, conversationKeyDeleted, onConversationDeleted } fr
 // where it was sent (placeFailed). The conversation's own composer keeps its local sending bubbles (ChatView); one of
 // those that fails comes here (keepFailed), so its words stay in the chat and not in the box, as in the apps (#1122).
 import { t } from "../i18n";
-import { toast } from "../ui/atoms";
 import { api, ApiError, credentialOwner, errorText, getToken, sessionPath } from "./api";
 import { pickedLauncher, pickedModel, conversationKey } from "./assistant-chat";
 import { showLauncherNote, startConversation } from "./assistant-start";
@@ -14,13 +13,14 @@ import { uuid } from "./format";
 import { conversationPage } from "./conversation-page";
 import { navigate } from "./router";
 import { getState, refreshAssistant, setOutbox } from "./store";
-import { chosenManager, noteConversation, otherManager, ownerHeaders } from "./manager-choice";
+import { chosenManager, noteConversation, otherManager } from "./manager-choice";
 import { apiOp, isTransient, OP_OFFLINE_MS, OP_RETRY_MS } from "./ops";
 import { echoed, isEcho, type Seen, type Sent } from "./echo";
 import { parseUserText, type ChatLine, type UserMessage } from "./turns";
-import type { AssistantInfo, Item } from "./types";
+import type { Item } from "./types";
 import { beginMessageSend, settleMessageEcho } from "./message-send";
 import { assertDelivered, isKept, showKept, type KeptReply } from "./undelivered";
+import type { ClientOperation } from "./outbox-receipt";
 
 export interface OutboxImage {
   mime: string;
@@ -34,9 +34,16 @@ export interface OutboxEntry {
   wordsOnly?: boolean;
   text: string;
   images: OutboxImage[];
+  /** Only the count survives reloads; missing originals must never be retried as an empty attachment. */
+  imageCount?: number;
   at: number;
-  /** Acceptance starts the transcript grace without changing the send time used to match an untagged copy. */
+  /** Acceptance time, separate from the send time used to match an untagged copy. */
   acceptedAt?: number;
+  /** The node accepted it into its queue, not into the running turn. Only an echo settles it. */
+  queued?: boolean;
+  /** Only this unresolved message's boundary is persisted; never an ever-growing history-wide claim log. */
+  echoExcluded?: string[];
+  queueReceipt?: { state: "queued" | "delivered" | "failed" | "cancelled" | "unknown"; at?: string; echoLine?: string };
   /** sent: the hub has it (or it started the conversation); the bubble waits for the transcript. */
   state: "sending" | "sent" | "failed";
   error?: string;
@@ -56,9 +63,6 @@ export interface OutboxEntry {
   model?: string;
 }
 
-/** How long a sent message waits for the transcript before its bubble goes (the transcript may word it differently). */
-export const SENT_GRACE_MS = 60_000;
-
 export function outboxKey(mid: string, sid: string) {
   return conversationKey(mid, sid);
 }
@@ -67,15 +71,16 @@ export function outboxKey(mid: string, sid: string) {
 export function outboxMessage(e: OutboxEntry): UserMessage {
   return {
     id: `outbox:${e.id}`,
-    ...parseUserText(e.text),
+    ...parseUserText([e.text, missingOutboxImages(e) ? t("chat-outboxbubbles.images_not_kept", { count: e.imageCount! }) : ""].filter(Boolean).join("\n\n")),
     images: e.images.map((image, i): Item => ({ id: `outbox:${e.id}#${i}`, seq: 0, role: "user", kind: "image", image })),
   };
 }
 
-type Described = Pick<OutboxEntry, "text" | "images" | "at"> & Partial<Pick<OutboxEntry, "id" | "wordsOnly">>;
+type Described = Pick<OutboxEntry, "text" | "images" | "at"> & Partial<Pick<OutboxEntry, "id" | "wordsOnly" | "echoExcluded">>;
 
 const seenAs = (e: Described & Partial<Pick<OutboxEntry, "inDoubt">>): Sent => ({
   id: e.wordsOnly ? undefined : e.id, text: parseUserText(e.text).text, images: e.images, at: e.at, inDoubt: e.inDoubt,
+  excluded: e.echoExcluded,
 });
 
 /** The transcript has this message: one of its latest user messages, or an item the hub tied to it, is its copy (lib/echo.ts). */
@@ -83,17 +88,22 @@ export function arrived(e: Described, users: Seen[]): boolean {
   return users.some((u) => isEcho(seenAs(e), u));
 }
 
-/** What stays once the transcript moved: arrived ones go (one copy each), and sent ones past the grace; sending and
+export const missingOutboxImages = (e: OutboxEntry) => (e.imageCount ?? 0) > e.images.length;
+
+// A held desktop send may share its words with later native input. Only its exact tag or queue echo proof settles it.
+const canMatchWords = (e: OutboxEntry) => !e.queueReceipt && (e.state !== "failed" || (!e.newId && (e.restored || e.inDoubt)));
+
+/** What stays once the transcript moved: arrived ones go (one copy each); sending and
  *  failed stay, but a failed one the hub tied a copy to went in after all (delivered unknown, #1121): the copy is it.
  *  One whose send ended in doubt is found by its words too: the hub's tie can come late or not at all (a node slow to
  *  answer wrote the message after the hub stopped waiting), and a failed bubble over a message that went in had the
  *  owner send it again. A refusal (nothing went in) is never settled by words alone.
  *  `users`: the latest user messages and the items the hub tied to a message (taggedSeen). `claimed`: the ones that
  *  already answered one, kept across calls. A definite new-id failure never settles by words alone: its Retry must stay. */
-export function settle(list: OutboxEntry[], users: Seen[], now: number, claimed = new Set<string>()): OutboxEntry[] {
-  const shown = echoed(list.filter((e) => e.state !== "failed" || (!e.newId && (e.restored || e.inDoubt))), users, seenAs, claimed);
+export function settle(list: OutboxEntry[], users: Seen[], _now: number, claimed = new Set<string>()): OutboxEntry[] {
+  const shown = echoed(list.filter(canMatchWords), users, seenAs, claimed);
   const tied = new Set(users.flatMap((u) => u.client_msg_id ?? []));
-  return list.filter((e) => !shown.has(e) && !(e.state === "failed" && !e.wordsOnly && tied.has(e.id)) && (e.state !== "sent" || now - (e.acceptedAt ?? e.at) < SENT_GRACE_MS));
+  return list.filter((e) => !shown.has(e) && !(!e.wordsOnly && tied.has(e.id)));
 }
 
 // When this page wrote the messages it sent, by client_msg_id: a failed message goes before the first one written
@@ -176,7 +186,7 @@ function list(key: string): OutboxEntry[] {
   return getState().outbox[key] ?? [];
 }
 
-/** Keep messages until their transcript copy arrives, they expire, or the user deletes them. */
+/** Keep messages until their transcript copy arrives or the user deletes them. */
 function write(key: string, next: OutboxEntry[]) {
   if (conversationKeyDeleted(key)) return;
   const before = list(key);
@@ -185,7 +195,9 @@ function write(key: string, next: OutboxEntry[]) {
   for (const e of next) {
     const previous = before.find((x) => x.id === e.id);
     if (previous === e) continue; // another tab may already have settled this entry
-    if (e.state === "sent" && previous) acceptOutgoing(key, e.id, e.acceptedAt ?? e.at);
+    if (e.state === "sent" && previous) {
+      acceptOutgoing(key, e.id, e.acceptedAt ?? e.at, e.queued, e.queueReceipt);
+    }
     else keepOutgoing(key, e);
   }
 }
@@ -194,38 +206,93 @@ function update(key: string, id: string, patch: Partial<OutboxEntry>) {
   write(key, list(key).map((e) => (e.id === id ? { ...e, ...patch } : e)));
 }
 
-const claimedBy = new Map<string, Set<string>>();
+/** Apply a read-only queue lookup only while the exact local entry is still current; echo and retry always win. */
+export function updateQueueReceipt(mid: string, sid: string, before: OutboxEntry, patch: Partial<OutboxEntry>) {
+  const key = outboxKey(mid, sid);
+  if (list(key).find((e) => e.id === before.id) !== before) return;
+  update(key, before.id, patch);
+}
+
+/** Replace one local entry. Accepted desktop queues and failed sends share this persistence path, so receipt
+ *  lookups and failure recovery both reach the currently mounted composer. */
+export function keepQueued(mid: string, sid: string, entry: OutboxEntry) {
+  const key = outboxKey(mid, sid);
+  write(key, [...list(key).filter((e) => e.id !== entry.id), entry]);
+}
+
+const visibleUsers = new Map<string, string[]>();
+const boundaries = new Map<string, string[]>();
+export const outgoingEchoBoundary = (mid: string, sid: string) => visibleUsers.get(outboxKey(mid, sid)) ?? [];
+const boundaryKey = (key: string, id: string) => JSON.stringify([key, id]);
+function boundary(key: string, id: string, ids: readonly string[] = []): string[] {
+  return [...new Set([...(boundaries.get(boundaryKey(key, id)) ?? []), ...ids])];
+}
+function excludeEchoes(key: string, id: string, ids: string[]) {
+  boundaries.set(boundaryKey(key, id), ids);
+  try {
+    const saved = storedValue(keptKey(key, id));
+    if (saved !== null) storeValue(keptKey(key, id), JSON.stringify({ ...JSON.parse(saved), echoExcluded: ids }));
+  } catch { /* The active message still has its in-memory boundary. */ }
+}
 
 /** A fresh page for the tests: which transcript lines answered a sent message is kept for as long as the page runs
  *  (one answers no later message with the same words), so cases with the same chat and line ids start without it. */
 export function resetOutboxClaimsForTests() {
-  claimedBy.clear();
+  boundaries.clear();
+  visibleUsers.clear();
 }
 
-/** Drops what the transcript now has (ChatView calls it with the latest user messages and the tagged items). */
-export function settleOutbox(mid: string, sid: string, users: Seen[]) {
+/** Reconcile composer and restored bubbles together: exact ties first, then oldest matching words, one echo once.
+ *  Claims survive navigation/reload so the same untagged history cannot swallow the next identical send. */
+export function settleOutbox(mid: string, sid: string, users: Seen[], pending: Sent[] = [], items: Item[] = []): Set<string> {
   const key = outboxKey(mid, sid);
   const before = list(key);
-  if (!before.length) return;
-  const claimed = claimedBy.get(key) ?? new Set<string>();
-  claimedBy.set(key, claimed);
-  const after = settle(before, users, Date.now(), claimed);
-  if (after.length !== before.length) {
-    for (const e of before) if (!after.includes(e) && arrived(e, users)) settleMessageEcho(mid, sid, e.id);
-    write(key, after);
+  // Keep only the currently visible page for a bounded number of chats, even when there is no local send yet.
+  visibleUsers.delete(key);
+  visibleUsers.set(key, users.flatMap((u) => u.id ?? []));
+  if (visibleUsers.size > 128) visibleUsers.delete(visibleUsers.keys().next().value!);
+  const dropped = new Set<string>();
+  if (!before.length && !pending.length) return dropped;
+  const claimed = new Set<string>();
+  // A desktop batch has one user item but several send IDs. Its line hint is evidence only with the real item here.
+  for (const e of before) {
+    const line = e.queueReceipt?.echoLine;
+    if (!line) continue;
+    const excluded = boundary(key, e.id, e.echoExcluded);
+    for (const it of items) {
+      if (it.role === "user" && (it.kind === "text" || it.kind === "image") && !it.queued &&
+        !excluded.includes(it.id) && it.id.split("#")[0] === line) {
+        dropped.add(e.id);
+        claimed.add(it.id);
+      }
+    }
   }
+  const candidates = before.filter(canMatchWords).map((e) => ({ id: e.id, sent: seenAs(e) }));
+  for (const p of pending) if (!before.some((e) => e.id === p.id)) candidates.push({ id: p.id!, sent: p });
+  for (const e of candidates) e.sent = { ...e.sent, excluded: boundary(key, e.id, e.sent.excluded) };
+  // Queue entries already handled above are excluded by canMatchWords and the pending-ID boundary.
+  for (const match of echoed(candidates, users, (e) => e.sent, claimed)) dropped.add(match.id);
+  // A tied copy also settles a definite failure; untagged words never do.
+  for (const e of before) if (!e.wordsOnly && users.some((u) => u.client_msg_id === e.id)) dropped.add(e.id);
+  // An echo can only consume one ordinary message. Carry that exclusion on remaining messages through reloads.
+  if (claimed.size) for (const e of candidates) if (!dropped.has(e.id)) excludeEchoes(key, e.id, [...e.sent.excluded!, ...claimed]);
+  for (const id of dropped) { forgetOutgoing(key, id); settleMessageEcho(mid, sid, id); }
+  const after = before.filter((e) => !dropped.has(e.id));
+  if (after.length !== before.length) write(key, after);
+  return dropped;
 }
 
 /** A failed entry's fields for the error its send ended with. */
 function failedWith(err: unknown): Pick<OutboxEntry, "state" | "error" | "code" | "clearable" | "newId" | "inDoubt"> {
-  const inDoubt = err instanceof ApiError && err.body.delivered === "unknown";
+  const known = err instanceof ApiError ? err : undefined;
+  const inDoubt = known?.body.delivered === "unknown";
   return {
     // the hub stopped waiting (delivered "unknown"): it may have gone in, and its copy in the transcript settles it (settle)
     inDoubt,
     state: "failed",
     error: failureText(err),
-    code: err instanceof ApiError ? err.code : undefined,
-    clearable: err instanceof ApiError && err.code === "input_draft" && typeof err.body.clearable === "string" ? err.body.clearable : undefined,
+    code: known?.code,
+    clearable: known?.code === "input_draft" && typeof known.body.clearable === "string" ? known.body.clearable : undefined,
     // A definite answer stays on this id, so its ordinary Retry is another operation. An uncertain send has no Retry:
     // Check queries the original operation instead (a network gap with no answer still retries with the same id).
     newId: !inDoubt && !isTransient(err),
@@ -235,8 +302,7 @@ function failedWith(err: unknown): Pick<OutboxEntry, "state" | "error" | "code" 
 /** A message this conversation's own composer sent that did not go (ChatView): from now on a failed bubble here, with
  *  why, "Retry" and "Delete", where it was sent; the box stays empty (#1122). */
 export function keepFailed(mid: string, sid: string, sent: Pick<OutboxEntry, "id" | "text" | "images" | "at" | "launcher" | "model">, err: unknown) {
-  const key = outboxKey(mid, sid);
-  write(key, [...list(key).filter((e) => e.id !== sent.id), { ...sent, ...failedWith(err) }]);
+  keepQueued(mid, sid, { ...sent, ...failedWith(err) });
 }
 
 // ── one conversation's sends, in order ──────────────────
@@ -263,15 +329,20 @@ export function inSendOrder<T>(key: string, post: () => Promise<T>): Promise<T> 
 
 const KEPT_PREFIX = "outbox-msg:";
 const keptKey = (key: string, id: string) => `${KEPT_PREFIX}${key}/${id}`;
-type Outgoing = Pick<OutboxEntry, "id" | "text" | "images" | "at" | "launcher" | "model"> & Partial<Pick<OutboxEntry, "newId" | "inDoubt" | "error" | "code" | "state" | "wordsOnly" | "acceptedAt" | "clearable">>;
+type Outgoing = Pick<OutboxEntry, "id" | "text" | "images" | "at" | "launcher" | "model"> & Partial<Pick<OutboxEntry, "newId" | "inDoubt" | "error" | "code" | "state" | "wordsOnly" | "acceptedAt" | "clearable" | "queued" | "queueReceipt" | "echoExcluded" | "imageCount">>;
 
 /** Keeps one message's words until its transcript copy arrives (pictures are not kept: they would fill the
  *  storage). Storage can be full or refused; the message then lasts only as long as the page. */
-export function keepOutgoing(key: string, e: Outgoing) {
+export function keepOutgoing(key: string, e: Outgoing & { restored?: boolean }) {
   if (conversationKeyDeleted(key)) return;
-  if (!e.text.trim()) return;
+  const echoExcluded = boundary(key, e.id, e.echoExcluded);
+  boundaries.set(boundaryKey(key, e.id), echoExcluded);
+  const imageCount = Math.max(e.imageCount ?? 0, e.images.length);
+  if (!e.text.trim() && !imageCount) return;
+  // Persist the delivery envelope, not the in-memory attachments or reload marker.
+  const { images: _images, imageCount: _imageCount, restored: _restored, ...saved } = e;
   try {
-    storeValue(keptKey(key, e.id), JSON.stringify({ id: e.id, text: e.text, at: e.at, launcher: e.launcher, model: e.model, newId: e.newId, inDoubt: e.inDoubt, error: e.error, code: e.code, state: e.state, acceptedAt: e.acceptedAt, wordsOnly: e.wordsOnly, clearable: e.clearable, images: e.images.length }));
+    storeValue(keptKey(key, e.id), JSON.stringify({ ...saved, echoExcluded, images: imageCount }));
   } catch {
     // only this page's copy then
   }
@@ -279,24 +350,25 @@ export function keepOutgoing(key: string, e: Outgoing) {
 
 /** HTTP acceptance keeps the bubble pending across reloads, but never revives a copy already settled by an echo
  *  (possibly in another tab) before the HTTP response arrived. */
-export function acceptOutgoing(key: string, id: string, acceptedAt = Date.now()) {
+export function acceptOutgoing(key: string, id: string, acceptedAt = Date.now(), queued = false, queueReceipt?: OutboxEntry["queueReceipt"]) {
   if (conversationKeyDeleted(key)) return;
   // Navigation can restore the message while its original page's POST is still open. Update that existing bubble
   // too; the original component's setPending no longer reaches it. An already settled entry stays absent.
   const entries = list(key);
-  if (entries.some((e) => e.id === id && e.state !== "sent")) {
-    setOutbox(key, entries.map((e) => e.id === id ? { ...e, state: "sent", acceptedAt, error: undefined, code: undefined, clearable: undefined, newId: undefined, inDoubt: undefined } : e));
+  if (entries.some((e) => e.id === id && (e.state !== "sent" || Boolean(e.queued) !== queued))) {
+    setOutbox(key, entries.map((e) => e.id === id ? { ...e, state: "sent", queued, acceptedAt, error: undefined, code: undefined, clearable: undefined, newId: undefined, inDoubt: undefined } : e));
   }
   try {
     const saved = storedValue(keptKey(key, id));
     if (saved === null) return;
-    storeValue(keptKey(key, id), JSON.stringify({ ...JSON.parse(saved), state: "sent", acceptedAt, error: undefined, code: undefined, newId: undefined, inDoubt: undefined }));
+    storeValue(keptKey(key, id), JSON.stringify({ ...JSON.parse(saved), ...(queueReceipt && { queueReceipt }), state: "sent", queued, acceptedAt, error: undefined, code: undefined, newId: undefined, inDoubt: undefined }));
   } catch {
     // storage unavailable: keep only the current page's bubble
   }
 }
 
 export function forgetOutgoing(key: string, id: string) {
+  boundaries.delete(boundaryKey(key, id));
   try {
     removeStoredValue(keptKey(key, id));
   } catch {
@@ -304,15 +376,15 @@ export function forgetOutgoing(key: string, id: string) {
   }
 }
 
-function keptEntries(key: string): (Omit<Outgoing, "images"> & { lostImages: boolean })[] {
-  const out: (Omit<Outgoing, "images"> & { lostImages: boolean })[] = [];
+function keptEntries(key: string): Omit<Outgoing, "images">[] {
+  const out: Omit<Outgoing, "images">[] = [];
   try {
     const prefix = keptKey(key, "");
     for (let i = 0; i < localStorage.length; i++) {
       const name = localStorage.key(i);
       if (!name?.startsWith(prefix)) continue;
       const { images, ...k } = JSON.parse(storedValue(name) ?? "null") as Omit<Outgoing, "images"> & { images?: number };
-      if (k.id && typeof k.text === "string") out.push({ ...k, lostImages: Boolean(images) });
+      if (k.id && typeof k.text === "string") out.push({ ...k, imageCount: typeof images === "number" ? images : 0 });
     }
   } catch {
     // storage unavailable or an unreadable entry: nothing to bring back
@@ -336,16 +408,10 @@ export function restoreOutbox(mid: string, sid: string, inFlight: string[] = [])
     // live POST into a failed bubble with Retry. Accepted messages can return whenever this conversation is revisited.
     if (k.state !== "sent" && !first) return false;
     if (inFlight.includes(k.id) || list(key).some((e) => e.id === k.id)) return false;
-    // Preserve the original grace across reloads: a transcript may never echo a command verbatim, and retaining it
-    // indefinitely would leave a stale pending bubble and stored text forever. Unconfirmed sends still need Retry.
-    if (k.state === "sent" && Date.now() - (k.acceptedAt ?? k.at) >= SENT_GRACE_MS) {
-      forgetOutgoing(key, k.id);
-      return false;
-    }
     return true;
   });
   if (!back.length) return;
-  const entries = back.map(({ lostImages, ...k }): OutboxEntry => ({ ...k, images: [], state: k.state === "sent" ? "sent" : "failed", code: k.state === "sent" ? undefined : k.code, restored: true, error: k.state === "sent" ? undefined : lostImages ? t("lib-outbox.not_confirmed_images") : k.error ?? t("lib-outbox.not_confirmed") }));
+  const entries = back.map((k): OutboxEntry => ({ ...k, images: [], state: k.state === "sent" ? "sent" : "failed", code: k.state === "sent" ? undefined : k.code, restored: true, error: k.state === "sent" ? undefined : k.imageCount ? t("lib-outbox.not_confirmed_images") : k.error ?? t("lib-outbox.not_confirmed") }));
   setOutbox(key, [...list(key), ...entries]);
 }
 
@@ -355,7 +421,7 @@ export function resetRestoredForTests() {
 }
 
 /** How the node says your own message went into a Claude outside Persona's terminals (session.send's answer). */
-export type DeliveryReply = { delivered_as?: string; relay_reason?: string };
+export type DeliveryReply = { delivered_as?: string; relay_reason?: string; queued?: boolean };
 
 /**
  * What to tell you when your own message to a Claude with Persona's plugin went through its message inbox instead of
@@ -363,17 +429,10 @@ export type DeliveryReply = { delivered_as?: string; relay_reason?: string };
  * take it as your approval. Nothing when it went in as your input, or when the session has no plugin (it always used
  * the inbox there, and its row says so).
  */
-export function relayNotice(reply?: DeliveryReply): string | undefined {
-  if (reply?.delivered_as !== "relayed") return undefined;
-  switch (reply.relay_reason) {
-    case "busy":
-      return t("lib-outbox.relayed_busy");
-    case "plugin_unavailable":
-    case "plugin_refused":
-    case "plugin_unconfirmed":
-      return t("lib-outbox.relayed_plugin");
-  }
-  return undefined;
+export async function showDeliveryNotice(reply?: DeliveryReply & { waits_on_computer?: boolean }): Promise<void> {
+  if (!reply?.waits_on_computer && reply?.delivered_as !== "relayed") return;
+  try { (await import("./outbox-receipt")).showDeliveryNotice(reply); }
+  catch { /* An optional notice chunk failing to load must never undo an accepted send. */ }
 }
 
 async function deliver(mid: string, sid: string, e: OutboxEntry, clearDraft?: string, flight = beginMessageSend(mid, sid, e.id, e.text)): Promise<boolean> {
@@ -396,12 +455,11 @@ async function deliver(mid: string, sid: string, e: OutboxEntry, clearDraft?: st
       return true;
     }
     flight.finish("delivered");
-    update(key, e.id, { state: "sent", acceptedAt: Date.now(), error: undefined, code: undefined, clearable: undefined });
+    const codex = getState().sessions?.[mid]?.find((s) => s.session_id === sid)?.agent === "codex";
+    update(key, e.id, { state: "sent", queued: r?.queued === true, queueReceipt: r?.queued && codex ? { state: "queued" } : undefined, acceptedAt: Date.now(), error: undefined, code: undefined, clearable: undefined });
     showLauncherNote(`${mid}/${sid}`, r?.launcher_note);
     // An outside-terminal Claude took it behind a question only the computer can answer (#5890).
-    if (r?.waits_on_computer) toast(t("lib-outbox.waits_on_computer"), "info");
-    const relayed = relayNotice(r);
-    if (relayed) toast(relayed, "info");
+    await showDeliveryNotice(r);
     return true;
   } catch (err) {
     if (!flight.current()) return false;
@@ -422,7 +480,7 @@ export function sendToSession(mid: string, sid: string, out: { text: string; ima
 /** sendToSession, also naming the entry it made: for a place that offers its own retry of it (the overview's Continue). */
 export function queueToSession(mid: string, sid: string, out: { text: string; images?: OutboxImage[] }, opts: { launcher?: string; model?: string } = {}): { id: string; sent: Promise<boolean> } {
   const key = outboxKey(mid, sid);
-  const e: OutboxEntry = { id: uuid(), text: out.text, images: out.images ?? [], at: Date.now(), state: "sending", launcher: opts.launcher, model: opts.model };
+  const e: OutboxEntry = { id: uuid(), text: out.text, images: out.images ?? [], at: Date.now(), state: "sending", echoExcluded: outgoingEchoBoundary(mid, sid), launcher: opts.launcher, model: opts.model };
   const flight = beginMessageSend(mid, sid, e.id, e.text);
   noteWritten(e.id, e.at);
   write(key, [...list(key), e]);
@@ -432,14 +490,6 @@ export function queueToSession(mid: string, sid: string, out: { text: string; im
 /** One entry of a conversation's outbox, as it stands. */
 export function outboxEntry(mid: string, sid: string, id: string): OutboxEntry | undefined {
   return list(outboxKey(mid, sid)).find((e) => e.id === id);
-}
-
-interface ClientOperation {
-  id?: string;
-  kind?: string;
-  target?: { path?: string };
-  state?: string;
-  result?: { status?: number; body?: string };
 }
 
 export type OutboxCheck = "applied" | "not_applied" | "unknown" | "stale";
@@ -459,31 +509,6 @@ export function registerOutboxRecheck(mid: string, sid: string, recheck: () => v
   };
 }
 
-function messageOperation(op: ClientOperation, mid: string, sid: string, id: string): boolean {
-  // Go stores r.URL.Path, already decoded once. Compare the raw ids directly: decoding the receipt again would turn a
-  // literal "%2F" in an id into a slash. Also accept the previously encoded form for compatibility.
-  const decoded = `/api/v1/sessions/${mid}/${sid}/messages`, encoded = `/api/v1${sessionPath(mid, sid)}/messages`;
-  return op.id?.toLowerCase() === id.toLowerCase() && op.kind === "message" && (op.target?.path === decoded || op.target?.path === encoded);
-}
-
-/** The original HTTP reason on a definite receipt, without putting the operation's internals in the bubble. */
-function operationFailure(op: ClientOperation): Pick<OutboxEntry, "error" | "code"> {
-  const saved = op.result;
-  if (saved?.body && typeof saved.status === "number") {
-    try {
-      const bytes = Uint8Array.from(atob(saved.body), (c) => c.charCodeAt(0));
-      const body = JSON.parse(new TextDecoder().decode(bytes)) as Record<string, unknown>;
-      const message = typeof body.error === "string" && body.error ? body.error : `HTTP ${saved.status}`;
-      const err = new ApiError(saved.status, message, body);
-      // the receipt's code too: a dialog_open refusal found by a Check lights the terminal button as a live one does
-      return { error: failureText(err), code: err.code };
-    } catch {
-      // A receipt without readable original JSON still has its authoritative state below.
-    }
-  }
-  return { error: t("lib-outbox.delivery_failed"), code: undefined };
-}
-
 /** Read-only reconciliation of an uncertain send: query its original operation, then let the open transcript's ordinary
  *  echo check run. Only a saved success or a reliable echo settles it; only a saved definite failure brings Retry back. */
 export function checkOutbox(mid: string, sid: string, id: string): Promise<OutboxCheck> {
@@ -491,47 +516,14 @@ export function checkOutbox(mid: string, sid: string, id: string): Promise<Outbo
   const existing = checks.get(checkKey);
   if (existing) return existing;
   const e = list(key).find((x) => x.id === id);
-  if (!e || e.state !== "failed" || !e.inDoubt) return Promise.resolve("stale");
+  const queue = e?.queueReceipt?.state === "queued" || e?.queueReceipt?.state === "unknown";
+  if (!e || (!queue && (e.state !== "failed" || !e.inDoubt))) return Promise.resolve("stale");
   const token = getToken(), tokenOwner = credentialOwner();
   const current = () => credentialOwner() === tokenOwner && getToken() === token && list(key).find((x) => x.id === id) === e;
-  const reread = () => {
-    if (!current()) return;
-    // Snapshot the registrations: views mounted or unmounted by a reload take part in the next Check, not this one.
-    for (const recheck of [...(rechecks.get(key) ?? [])]) {
-      try { recheck(); } catch {
-        // A view that closed cannot refresh; the other views still can, and the next visit reconciles the same entry.
-      }
-    }
-  };
-  const run = (async (): Promise<OutboxCheck> => {
-    let op: ClientOperation;
-    try {
-      op = await api<ClientOperation>(`/ops/${encodeURIComponent(id)}`, { token, tokenOwner, isAuthContextCurrent: current });
-    } catch {
-      if (!current()) return "stale";
-      reread(); // A missing receipt (404 included) proves nothing; a transcript copy may still settle the message.
-      return "unknown";
-    }
-    if (!current()) return "stale";
-    if (!messageOperation(op, mid, sid, id)) {
-      reread();
-      return "unknown";
-    }
-    if (op.state === "done") {
-      reread();
-      if (!current()) return "stale";
-      update(key, id, { state: "sent", acceptedAt: Date.now(), error: undefined, code: undefined, clearable: undefined, newId: undefined, inDoubt: undefined });
-      return "applied";
-    }
-    if (op.state === "failed") {
-      reread();
-      if (!current()) return "stale";
-      update(key, id, { inDoubt: false, newId: true, ...operationFailure(op) });
-      return "not_applied";
-    }
-    reread(); // pending and unknown stay uncertain: never a new message id, never an ordinary Retry.
-    return "unknown";
-  })();
+  // Start the read immediately. Handle rejection now too, even if the recovery chunk loads after the response.
+  const request = queue ? undefined : api<ClientOperation>(`/ops/${encodeURIComponent(id)}`, { token, tokenOwner, isAuthContextCurrent: current }).catch(() => undefined);
+  const run = import("./outbox-receipt").then(({ checkReceipt }) => checkReceipt(mid, sid, id, request, current,
+    () => rechecks.get(key) ?? [], (patch) => update(key, id, patch)));
   checks.set(checkKey, run);
   const forget = () => { if (checks.get(checkKey) === run) checks.delete(checkKey); };
   void run.then(forget, forget);
@@ -555,9 +547,10 @@ export function retryOutboxEntry(mid: string, sid: string, id: string, clearDraf
   if (!e || e.state !== "failed") return { id, sent: Promise.resolve(false) };
   // Every entry point is held to the same rule: an uncertain send is checked, never posted again under a new id.
   if (e.inDoubt) return { id, sent: checkOutbox(mid, sid, id).then((result) => result === "applied") };
+  if (missingOutboxImages(e)) return { id, sent: Promise.resolve(false) };
   // A gap the hub never answered is retried with the same id (the hub does it at most once). A definite answer stays
   // on the old receipt, so this ordinary Retry is a new operation.
-  const next: OutboxEntry = { ...e, id: e.newId ? uuid() : e.id, newId: false, state: "sending", error: undefined, code: undefined, acceptedAt: undefined, at: Date.now() };
+  const next: OutboxEntry = { ...e, id: e.newId ? uuid() : e.id, newId: false, state: "sending", error: undefined, code: undefined, queued: false, queueReceipt: undefined, echoExcluded: outgoingEchoBoundary(mid, sid), acceptedAt: undefined, at: Date.now() };
   const flight = beginMessageSend(mid, sid, next.id, next.text);
   noteWritten(next.id, next.at);
   write(key, list(key).map((x) => (x.id === id ? next : x)));
@@ -604,31 +597,9 @@ export async function askPersona(text: string): Promise<void> {
   navigate(conversationPage(r.session.session_id, r.session.machine_id, chosen));
 }
 
-/**
- * askPersona for one manager's main conversation (an inbox item's `manager`, none: the default's), whatever the assistant
- * page shows (Android's mainConversationOf): its main conversation is read from that manager, the page opens that
- * conversation (the current assistant stays as it is, docs/assistant/managers.md "Clients") and the text goes there;
- * with none yet, the text starts it. Throws when the manager can't be read or the conversation can't start, before the
- * page moves; `sent` then says whether the text got there (a failed bubble says why).
- */
-export async function askPersonaOf(owner: string | undefined, text: string): Promise<{ sent: Promise<boolean> }> {
-  const headers = ownerHeaders(owner);
-  const a = await api<AssistantInfo>("/assistant", { headers });
-  if (a.machine_id && a.main) {
-    adoptConversation(owner, a.main, a.machine_id);
-    return { sent: sendToMain(a.machine_id, a.main, text, owner) };
-  }
-  const r = await startConversation({ prompt: text, main: true }, headers);
-  adoptConversation(owner, r.session.session_id, r.session.machine_id);
-  noteSent(r.session.machine_id, r.session.session_id, { text });
-  void refreshAssistant().catch(() => {});
-  navigate(conversationPage(r.session.session_id, r.session.machine_id, owner));
-  return { sent: Promise.resolve(true) };
-}
-
 /** Opens owner's main conversation (owner none: the default's) and sends text there with the launcher and model picked
  *  for it. */
-function sendToMain(mid: string, sid: string, text: string, owner: string | undefined): Promise<boolean> {
+export function sendToMain(mid: string, sid: string, text: string, owner: string | undefined): Promise<boolean> {
   navigate(conversationPage(sid, mid, owner));
   const key = outboxKey(mid, sid);
   return sendToSession(mid, sid, { text }, { launcher: pickedLauncher(key), model: pickedModel(key) });
@@ -656,4 +627,5 @@ onConversationDeleted((mid, sid) => {
   const key = outboxKey(mid, sid);
   for (const entry of keptEntries(key)) forgetOutgoing(key, entry.id);
   restored.delete(key);
+  visibleUsers.delete(key);
 });

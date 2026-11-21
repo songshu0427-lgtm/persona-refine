@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,20 +26,118 @@ import (
 //
 // A turn the node started counts as running from the request until the App writes it down (codexDesktopStartGrace),
 // so a second message right after the first waits too, rather than being steered into the turn the first started.
-// What waits lives in this process: a node that stops before the turn ends drops it (logged).
+// What waits lives in this process: a node that stops before the turn ends drops it. session.info exposes the
+// receipts still known in this process; an absent receipt is unknown, never evidence that a message still waits.
 
 var (
 	// codexDesktopHoldPoll: how often a waiting message looks whether its thread's turn ended.
 	codexDesktopHoldPoll = time.Second
-	// codexDesktopHoldMax: how long a message waits for a turn to end before it is dropped (logged).
+	// codexDesktopHoldMax: how long a message waits for a turn to end before it fails without delivery.
 	codexDesktopHoldMax = 12 * time.Hour
 	// codexDesktopStartGrace: how long a turn the node started counts as running while the App has written nothing of it.
 	codexDesktopStartGrace = 20 * time.Second
 )
 
 type codexDesktopMessage struct {
-	text  string
-	paths []string // the pictures, saved on this computer
+	text       string
+	paths      []string // the pictures, saved on this computer
+	sendID     codexDesktopSendID
+	acceptedAt time.Time
+}
+
+type codexDesktopSendID struct{ session, message string }
+type codexDesktopSendKey struct{}
+
+// These receipts describe input delivery, not model execution. No message content or raw transport errors are
+// exposed. They survive link reconnections in this process, but are deliberately not restored as a pending queue.
+type codexDesktopSendState struct {
+	ClientMsgID string    `json:"client_msg_id"`
+	State       string    `json:"state"`
+	At          time.Time `json:"at"`
+	Code        string    `json:"code,omitempty"`
+	Delivered   string    `json:"delivered,omitempty"`
+	EchoLine    string    `json:"echo_line,omitempty"`
+	echo        *echoRecord
+}
+
+type codexDesktopQueueSnapshot struct {
+	Version  int                     `json:"version"`
+	Messages []codexDesktopSendState `json:"messages"`
+}
+
+func (q *codexDesktopThreads) note(id codexDesktopSendID, state, code, delivered string) {
+	if id.session == "" || id.message == "" {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.states == nil {
+		q.states = make(map[codexDesktopSendID]codexDesktopSendState)
+	}
+	if previous, known := q.states[id]; known && (previous.State != "queued" || state == "queued") {
+		return // a replay cannot rewrite a terminal receipt, nor renew the original queue acceptance time
+	}
+	q.states[id] = codexDesktopSendState{ClientMsgID: id.message, State: state, At: time.Now().UTC(), Code: code, Delivered: delivered, echo: q.states[id].echo}
+	q.pruneStates(id.session)
+}
+
+// pruneStates bounds terminal receipts per session without ever expiring a message that is actually held.
+// The caller holds q.mu. Older missing receipts must be checked against the transcript, not resent automatically.
+func (q *codexDesktopThreads) pruneStates(session string) {
+	var terminal []codexDesktopSendID
+	for id, r := range q.states {
+		if r.State == "queued" {
+			continue
+		}
+		if time.Since(r.At) > 24*time.Hour {
+			delete(q.states, id)
+			continue
+		}
+		if id.session == session {
+			terminal = append(terminal, id)
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool { return q.states[terminal[i]].At.Before(q.states[terminal[j]].At) })
+	for len(terminal) > 200 {
+		delete(q.states, terminal[0])
+		terminal = terminal[1:]
+	}
+}
+
+func (q *codexDesktopThreads) snapshot(session string) codexDesktopQueueSnapshot {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.pruneStates(session)
+	out := codexDesktopQueueSnapshot{Version: 1, Messages: []codexDesktopSendState{}}
+	for id, r := range q.states {
+		if id.session == session {
+			out.Messages = append(out.Messages, r)
+		}
+	}
+	sort.Slice(out.Messages, func(i, j int) bool { return out.Messages[i].At.Before(out.Messages[j].At) })
+	return out
+}
+
+// reply preserves queued on replay (sentLog only remembers errors), also after its ten-minute dedupe expires.
+// A terminal queue receipt is never a new attempt. In particular, an unknown outcome must not be sent again.
+func (q *codexDesktopThreads) reply(id codexDesktopSendID) (map[string]any, error, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	r, ok := q.states[id]
+	if ok && r.State != "queued" && time.Since(r.At) > 24*time.Hour {
+		delete(q.states, id)
+		ok = false
+	}
+	if !ok {
+		return nil, nil, false
+	}
+	switch r.State {
+	case "failed", "cancelled":
+		return nil, refusal(r.Code, "The queued message was not delivered", map[string]any{"queue_state": r}), true
+	case "unknown":
+		return nil, &rpc.Error{Code: "codex_queue_delivery_unknown", Message: "The queued message may have been delivered; check its transcript before sending again", Data: []byte(`{"delivered":"unknown"}`)}, true
+	}
+	return map[string]any{"ok": true, "queued": r.State == "queued", "queue_state": r}, nil, true
 }
 
 // codexDesktopThread is the node's side of one App thread: what waits for its turn to end, and the last turn it started.
@@ -52,8 +151,9 @@ type codexDesktopThread struct {
 }
 
 type codexDesktopThreads struct {
-	mu sync.Mutex
-	m  map[string]*codexDesktopThread
+	mu     sync.Mutex
+	m      map[string]*codexDesktopThread
+	states map[codexDesktopSendID]codexDesktopSendState
 }
 
 var codexDesktopQueue codexDesktopThreads
@@ -70,7 +170,6 @@ func (q *codexDesktopThreads) thread(src codexSource) *codexDesktopThread {
 		t = &codexDesktopThread{src: src}
 		q.m[key] = t
 	}
-	t.src = src
 	return t
 }
 
@@ -90,12 +189,28 @@ func markSendQueued(ctx context.Context) {
 
 // sendOrHoldCodexDesktop starts a turn with m in src's thread, or holds m until the turn running there ends.
 func (n *Node) sendOrHoldCodexDesktop(ctx context.Context, src codexSource, m codexDesktopMessage) error {
+	m.sendID, _ = ctx.Value(codexDesktopSendKey{}).(codexDesktopSendID)
 	t := codexDesktopQueue.thread(src)
 	t.send.Lock()
 	defer t.send.Unlock()
+	t.src = src // the same lock the delivery loop holds, including after a rollout path changes
+	if _, err, known := codexDesktopQueue.reply(m.sendID); known {
+		return err // concurrent retries may both have passed the outer receipt check
+	}
+	if err := ctx.Err(); err != nil {
+		state, code := "cancelled", "codex_queue_cancelled"
+		if errors.Is(err, context.DeadlineExceeded) {
+			state, code = "failed", "codex_queue_timeout"
+		}
+		codexDesktopQueue.note(m.sendID, state, code, deliveredNone)
+		return refusal(code, "The send ended before queue acceptance", nil)
+	}
 	working, mark := n.codexDesktopTurnState(src)
 	if len(t.held) > 0 || working || t.recentlyStarted(mark) {
+		m.acceptedAt = time.Now().UTC()
+		n.echoes.holdDesktop(m.sendID)
 		t.held = append(t.held, m)
+		codexDesktopQueue.note(m.sendID, "queued", "", "")
 		if !t.waiting {
 			t.waiting = true
 			go n.deliverHeldCodexDesktop(t)
@@ -154,6 +269,10 @@ func (n *Node) deliverHeldCodexDesktop(t *codexDesktopThread) {
 				continue
 			}
 			log.Printf("codex app %s: %d held message(s) dropped: its turn ran past %v", t.src.thread, len(t.held), codexDesktopHoldMax)
+			for _, m := range t.held {
+				codexDesktopQueue.note(m.sendID, "failed", "codex_queue_timeout", deliveredNone)
+				n.forgetHeldCodexEcho(m.sendID)
+			}
 			t.held, t.waiting = nil, false
 			t.send.Unlock()
 			return
@@ -161,12 +280,41 @@ func (n *Node) deliverHeldCodexDesktop(t *codexDesktopThread) {
 		msgs := t.held
 		t.held, t.waiting = nil, false
 		if len(msgs) > 0 {
-			if err := t.start(context.Background(), n, msgs, mark); err != nil {
+			ctx := context.WithValue(context.Background(), codexDesktopDispatchKey{}, func() { n.prepareHeldCodexEcho(msgs) })
+			err := t.start(ctx, n, msgs, mark)
+			if err != nil {
 				log.Printf("codex app %s: %d held message(s) not delivered after its turn: %v", t.src.thread, len(msgs), err)
 			}
+			n.finishHeldCodexDesktop(msgs, err)
 		}
 		t.send.Unlock()
 		return
+	}
+}
+
+func (n *Node) finishHeldCodexDesktop(msgs []codexDesktopMessage, err error) {
+	state, code, delivered := "delivered", "", ""
+	if err != nil {
+		state, code, delivered = "unknown", "codex_queue_delivery_unknown", deliveredUnknown
+		var re *rpc.Error
+		if errors.As(err, &re) && deliveredOf(re) == deliveredNone {
+			state, code, delivered = "failed", re.Code, deliveredNone
+			if errors.Is(err, context.Canceled) || re.Code == "codex_queue_cancelled" {
+				state, code = "cancelled", "codex_queue_cancelled"
+			}
+		}
+	}
+	for _, m := range msgs {
+		codexDesktopQueue.note(m.sendID, state, code, delivered)
+		if delivered == deliveredNone {
+			n.forgetHeldCodexEcho(m.sendID)
+		}
+	}
+}
+
+func (n *Node) forgetHeldCodexEcho(id codexDesktopSendID) {
+	if _, known := n.echoes.record(id.session, id.message); known {
+		n.echoes.forget(id.session, id.message)
 	}
 }
 

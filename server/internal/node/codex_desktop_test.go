@@ -29,13 +29,15 @@ type fakeCodexBus struct {
 
 	// The owning window's thread settings (codex_desktop_effort.go): the updates it took, the effort it reads back,
 	// and how it answers an update (an error, not applied, applied but read back unchanged).
-	settings   chan map[string]any
-	mu         sync.Mutex
-	model      string
-	effort     *string
-	refuse     string
-	notApplied bool
-	unchanged  bool
+	settings      chan map[string]any
+	mu            sync.Mutex
+	model         string
+	effort        *string
+	refuse        string
+	notApplied    bool
+	unchanged     bool
+	dropTurnReply bool // the App accepts input, but its acknowledgement is lost
+	closeBus      func() error
 }
 
 // holds: the window owns the request's thread.
@@ -53,7 +55,7 @@ func startFakeCodexBus(t *testing.T, owned string) (home string, bus *fakeCodexB
 	}
 	t.Cleanup(func() { l.Close() })
 	bus = &fakeCodexBus{owned: owned, turns: make(chan map[string]any, 1), stops: make(chan map[string]any, 1), asked: make(chan bool, 1),
-		settings: make(chan map[string]any, 4)}
+		settings: make(chan map[string]any, 4), closeBus: l.Close}
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -116,6 +118,12 @@ func (b *fakeCodexBus) serve(conn net.Conn) {
 			ok(map[string]any{"supportsUntrustedAppInput": true})
 		case method == "thread-follower-start-turn" && version == 2 && m["targetClientId"] == "window" && (params["conversationId"] == b.owned || b.opened.Load() && params["conversationId"] == b.later):
 			b.turns <- params
+			b.mu.Lock()
+			drop := b.dropTurnReply
+			b.mu.Unlock()
+			if drop {
+				return
+			}
 			ok(map[string]any{"result": map[string]any{"turn": map[string]any{"id": "turn-1", "status": "inProgress"}}})
 		case method == "thread-follower-interrupt-turn" && version == 4 && m["targetClientId"] == "window" && params["conversationId"] == b.owned:
 			b.stops <- params

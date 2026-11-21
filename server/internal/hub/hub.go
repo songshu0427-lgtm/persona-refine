@@ -116,9 +116,10 @@ type Hub struct {
 	// slot: the hub's edge started this process (hub_edge.go, docs/operations/hub-restart.md "Blue-green switching: the hub's edge"); it listens on the edge's
 	// sockets, and an update or a rollback hands over to the next slot instead of exec'ing. nil: the hub listens itself.
 	slot *hubedge.Slot
-	// deltas: the live text of each session's message being generated, as last relayed (machine, session -> text): a
+	// deltas: each session's live text and optional source identity, as last relayed (machine, session -> delta): a
 	// client subscribing in the middle of it gets it after the backlog instead of waiting for the next token.
-	deltas     map[[2]string]string
+	deltas     map[[2]string]deltaPush
+	deltaOrder uint64 // ordering for the bounded terminal-only replay cache
 	phoneTools map[string]db.PhoneToolRegistration
 	calls      map[string]chan proto.ToolResult
 	wokeAt     map[string]time.Time // device -> last silent push to wake it for a tool call

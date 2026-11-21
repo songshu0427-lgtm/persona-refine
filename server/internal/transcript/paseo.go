@@ -78,6 +78,10 @@ const (
 // other item's of the line (paseoBatch). The caller marks the notices of input that started a turn as wakes, and the
 // messages of input absorbed mid-turn as queued.
 func paseoInput(mk func(int, string, string) proto.Item, part int, s string) ([]proto.Item, bool) {
+	return paseoInputWithClip(mk, part, s, clip)
+}
+
+func paseoInputWithClip(mk func(int, string, string) proto.Item, part int, s string, clipText func(string) string) ([]proto.Item, bool) {
 	envelopes := paseoEnvelopes(s)
 	if envelopes == nil {
 		return nil, false
@@ -95,7 +99,7 @@ func paseoInput(mk func(int, string, string) proto.Item, part int, s string) ([]
 				continue
 			}
 			it := mk(n, "user", proto.KindText)
-			it.Text = clip(body)
+			it.Text = clipText(body)
 			if e.kind == "agent-message" {
 				it.From = FromSession
 				if t := paseoTitle(e); t != "" {

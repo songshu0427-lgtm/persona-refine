@@ -16,6 +16,8 @@ import (
 // for a while longer than that).
 const restartBackIn = 3 * time.Second
 
+const terminalDeltaCacheMax = 256
+
 // beginStop runs once, when the stop is asked for, before the hub's context ends.
 func (h *Hub) beginStop() {
 	if h.stopping.Swap(true) {
@@ -56,17 +58,52 @@ func (h *Hub) beginStop() {
 // the transcript), for clients that subscribe in the middle of it: one reconnecting after a restart, whose node
 // sends the text again when it connects (node: resumeAssistants), sees the answer go on where it was.
 func (h *Hub) rememberLiveText(machineID, sessionID, text string) {
-	key := [2]string{machineID, sessionID}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if text == "" {
+	h.rememberDeltaLocked(deltaPush{Type: "delta", MachineID: machineID, SessionID: sessionID, Text: text})
+}
+
+// Remember and forward in one order relative to subscription replay. Keep an
+// identity-bearing reset/end too: an empty text alone does not close a Codex turn.
+func (h *Hub) forwardLiveText(p deltaPush) {
+	if h.conversationDeleted(p.MachineID, p.SessionID) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rememberDeltaLocked(p)
+	h.toSubscribersLocked(p.MachineID, p.SessionID, "", p)
+}
+
+func (h *Hub) rememberDeltaLocked(p deltaPush) {
+	key := [2]string{p.MachineID, p.SessionID}
+	if p.Text == "" && p.TurnID == "" && p.ItemID == "" && !p.TurnDone {
 		delete(h.deltas, key)
 		return
 	}
 	if h.deltas == nil {
-		h.deltas = map[[2]string]string{}
+		h.deltas = map[[2]string]deltaPush{}
 	}
-	h.deltas[key] = text
+	if p.TurnDone {
+		h.deltaOrder++
+		p.cacheOrder = h.deltaOrder
+	}
+	h.deltas[key] = p
+	if p.TurnDone {
+		// Only terminal transitions scan this bounded tail, never streaming tokens.
+		count, oldest := 0, key
+		for k, d := range h.deltas {
+			if d.TurnDone {
+				count++
+				if d.cacheOrder < h.deltas[oldest].cacheOrder {
+					oldest = k
+				}
+			}
+		}
+		if count > terminalDeltaCacheMax {
+			delete(h.deltas, oldest)
+		}
+	}
 }
 
 // sendLiveText follows a subscription's backlog with the session's live text, if a message is being generated. Queued
@@ -78,18 +115,20 @@ func (h *Hub) sendLiveText(c *client, machineID, sessionID string) {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if text := h.deltas[[2]string{machineID, sessionID}]; text != "" {
-		c.sendJSON(deltaPush{Type: "delta", MachineID: machineID, SessionID: sessionID, Text: text})
+	if p, ok := h.deltas[[2]string{machineID, sessionID}]; ok {
+		c.sendJSON(p)
 	}
 }
 
 func (h *Hub) forgetLiveText(machineID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for k := range h.deltas {
+	for k, p := range h.deltas {
 		if k[0] == machineID {
 			delete(h.deltas, k)
-			h.toSubscribersLocked(k[0], k[1], "", deltaPush{Type: "delta", MachineID: k[0], SessionID: k[1], Text: ""})
+			// Disconnecting neither completes a live turn nor reopens a known end.
+			p.Text = ""
+			h.toSubscribersLocked(k[0], k[1], "", p)
 		}
 	}
 }

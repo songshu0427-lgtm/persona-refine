@@ -113,7 +113,7 @@ func TestPersonaDeleteReplyFencesBeforeFleetNotification(t *testing.T) {
 		t.Fatal("successful DELETE did not synchronously fence the old subscription")
 	}
 	h.mu.Lock()
-	live := h.deltas[key]
+	live := h.deltas[key].Text
 	h.mu.Unlock()
 	if live != "" {
 		t.Fatal("successful DELETE retained live text")

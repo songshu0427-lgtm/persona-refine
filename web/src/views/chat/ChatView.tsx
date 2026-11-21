@@ -31,12 +31,12 @@ import { buildTaskIndex, loopCadence, loopNext, stableSubagents, STOP_LOOP_MESSA
 import { runStep, sameStep, turnDone, type RunStep } from "../../lib/run-step";
 import { stabilizeLines, stableValue } from "../../lib/stable-lines";
 import { planProgress, workLineStyle } from "../../lib/work-groups";
-import { echoed, taggedSeen } from "../../lib/echo";
+import { taggedSeen } from "../../lib/echo";
 import { AGENT_MESSAGE_HOLD_FEATURE, assertDelivered, isKept, keptBubble, showKept, shownUndelivered, type KeptReply } from "../../lib/undelivered";
 import { lazyPage } from "../../lib/lazy-page";
-import { acceptOutgoing, forgetOutgoing, inSendOrder, keepFailed, keepOutgoing, noteWritten, outboxKey, placeFailed, registerOutboxRecheck, relayNotice, restoreOutbox, retryOutbox, SENT_GRACE_MS, settleOutbox, type DeliveryReply } from "../../lib/outbox";
+import { acceptOutgoing, forgetOutgoing, inSendOrder, keepFailed, keepOutgoing, keepQueued, noteWritten, outgoingEchoBoundary, outboxKey, placeFailed, registerOutboxRecheck, showDeliveryNotice, restoreOutbox, retryOutbox, settleOutbox, type DeliveryReply } from "../../lib/outbox";
 import { apiOp } from "../../lib/ops";
-import { beginMessageSend, observeMessageItems, settleMessageEcho, stopMessageFeedback, useMessageFeedback } from "../../lib/message-send";
+import { beginMessageSend, observeMessageItems, stopMessageFeedback, useMessageFeedback } from "../../lib/message-send";
 import { conversationKey, pickedLauncher, pickedModel, usePickedLauncher } from "../../lib/assistant-chat";
 import { splitSkillDraft } from "../../lib/skill-mentions";
 import { unlinkAgentFromTodo } from "../../lib/todos";
@@ -117,7 +117,8 @@ import type { MessagePick } from "../../lib/message-pick";
 import { foldHolding, lineOfItem, loadEarlierForSearch, untilStill, type ChatSearchHit, type SearchLoadOutcome } from "../../lib/chat-search";
 import { chatFiles } from "../../lib/mentions";
 import { pairPhotoOnly, sameMessage } from "../../lib/queue";
-import { OutboxBubbles } from "./OutboxBubbles";
+import { DeliveryStatus, OutboxBubbles } from "./OutboxBubbles";
+import { useQueuedMessages } from "./useQueuedMessages";
 import { MainRuntimeSlot } from "../assistant/MainRuntimeSlot";
 import { AssistantFace, CompactionStrip, useAssistantMenu } from "../assistant/AssistantChat";
 import { PageBoundary } from "../PageBoundary";
@@ -230,6 +231,8 @@ interface Pending {
   msg: UserMessage;
   at: number;
   acceptedAt?: number;
+  queued?: boolean;
+  echoExcluded?: string[];
   /** The node held it back until an ultracode change waiting for the turn is through (#3428): it goes again then. */
   waits?: boolean;
   /** Its POST has not been answered yet (it may be behind earlier ones): the bubble does not time out. */
@@ -438,7 +441,9 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
   const [draftRefusal, setDraftRefusal] = useState<{ id: string; draft: string; clearable?: string } | null>(null);
   // what other pages sent here ("Ask Persona", "Hand to AI"…): shown like this page's own sending bubbles (lib/outbox.ts)
   const outbox = useStore((s) => s.outbox[outboxKey(mid, sid)] ?? []);
+  const queueEchoes = outbox.map((e) => e.queueReceipt?.echoLine ?? "").join("\0");
   const online = useStore((s) => s.conn === "online");
+  useQueuedMessages(mid, sid, outbox, online);
   const sendFeedback = useMessageFeedback(mid, sid);
   // a message Claude queued shows in the queue strip, not as a sending bubble too (ChatView.swift chatScroll)
   const queued = session?.queued ?? [];
@@ -679,50 +684,19 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
     skills: { manager: skillManager, session: sid, launcher: assistant ? skillLauncher : undefined, environment: skillEnvironment, agent: !assistant },
   }), [session?.cwd, skillManager, draftKey, assistant, sid, skillLauncher, skillEnvironment]);
 
-  // a sent message stays as a "sending" bubble until the transcript has it (lib/echo.ts): an item the hub tied to it
+  // A sent message keeps its accepted/queued bubble until the transcript has it: an item the hub tied to it
   // (any kind, a notice too), or else a latest user message with its words; one that answered one answers no other
-  const claimed = useRef(new Set<string>());
   useEffect(() => {
     // what a reload interrupted, once the hub's first page can tell what went in (a cached page cannot),
     // and not before this chat is known: a restored bubble's Retry posts without passing through deliver
     if (tr.firstRead && !refusedNoRow) restoreOutbox(mid, sid, pending.map((p) => p.id));
     observeMessageItems(mid, sid, tr.items);
-    const users = [...segs.slice(-4).flatMap((seg) => (seg.user && !seg.user.injected ? [seg.user] : [])), ...taggedSeen(tr.items)];
+    const users = [...segs.flatMap((seg) => (seg.user && !seg.user.injected ? [seg.user] : [])), ...taggedSeen(tr.items)];
     users.forEach((user) => acknowledgeLaunch(mid, sid, user));
-    settleOutbox(mid, sid, users);
-    if (!pending.length) return;
-    const shown = echoed(pending, users, (p) => ({ id: p.id, text: p.msg.text, images: p.msg.images, at: p.at }), claimed.current);
-    const drop = new Set([...shown].map((p) => p.id));
-    const now = Date.now();
-    for (const p of pending) {
-      if (drop.has(p.id) || (!p.waits && !p.posting && state !== "working" && now - (p.acceptedAt ?? p.at) >= SENT_GRACE_MS)) {
-        forgetOutgoing(outboxKey(mid, sid), p.id);
-        if (drop.has(p.id)) settleMessageEcho(mid, sid, p.id);
-      }
-    }
-    setPending((ps) => {
-      // a sent one waits for its copy while the agent works and SENT_GRACE_MS after, as the outbox and the apps do: the
-      // transcript can write it late (a long context compacted first, #1119); one held back for an ultracode change
-      // waits as long as the turn does
-      return ps.filter((p) => !drop.has(p.id) && (p.waits || p.posting || state === "working" || now - (p.acceptedAt ?? p.at) < SENT_GRACE_MS));
-    });
+    const drop = settleOutbox(mid, sid, users, pending.map((p) => ({ id: p.id, text: p.msg.text, images: p.msg.images, at: p.at, excluded: p.echoExcluded })), tr.items);
+    if (drop.size) setPending((ps) => ps.filter((p) => !drop.has(p.id)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [segs, tr.firstRead, refusedNoRow]);
-
-  // A quiet transcript must not leave accepted bubbles forever. Reloads use the same stored deadline; local
-  // composer bubbles retain their existing grace while the agent works. Never expire a POST still in flight.
-  useEffect(() => {
-    const expiring = state === "working" ? [] : pending.filter((p) => !p.posting && !p.waits);
-    const deadlines = [...expiring, ...outbox.filter((e) => e.state === "sent")].map((e) => (e.acceptedAt ?? e.at) + SENT_GRACE_MS);
-    if (!deadlines.length) return;
-    const timer = setTimeout(() => {
-      settleOutbox(mid, sid, []);
-      const expired = new Set(expiring.filter((p) => Date.now() - (p.acceptedAt ?? p.at) >= SENT_GRACE_MS).map((p) => p.id));
-      for (const id of expired) forgetOutgoing(outboxKey(mid, sid), id);
-      if (expired.size) setPending((ps) => ps.filter((p) => !expired.has(p.id)));
-    }, Math.max(0, Math.min(...deadlines) - Date.now()));
-    return () => clearTimeout(timer);
-  }, [mid, sid, pending, outbox, state]);
+  }, [segs, tr.firstRead, refusedNoRow, queueEchoes]);
 
   // seen: on open, when the page comes back to the front, and whenever a turn ends while it is on screen (lib/store.ts
   // viewSession)
@@ -1127,7 +1101,7 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
       }
       const flight = beginMessageSend(mid, sid, id, out.text);
       // a sending bubble shows picked contexts as quote cards, like the transcript will (not the raw tags)
-      const p: Pending = { id, at: Date.now(), posting: true, msg: { id: `pending:${id}`, ...parseUserText(out.text), images: out.images.map((image, i) => ({ id: `pending:${id}#${i}`, seq: 0, role: "user", kind: "image", image })) } };
+      const p: Pending = { id, at: Date.now(), posting: true, echoExcluded: outgoingEchoBoundary(mid, sid), msg: { id: `pending:${id}`, ...parseUserText(out.text), images: out.images.map((image, i) => ({ id: `pending:${id}#${i}`, seq: 0, role: "user", kind: "image", image })) } };
       // a new try: an earlier failure's card no longer applies (its bubble stays, with Retry)
       setSendFailure(null);
       noteWritten(id, p.at);
@@ -1137,7 +1111,7 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
       const key = outboxKey(mid, sid);
       const launcher = assistant ? pickedLauncher(conversationKey(mid, sid)) : undefined;
       const model = assistant ? pickedModel(conversationKey(mid, sid)) : undefined;
-      keepOutgoing(key, { id, text: out.text, images: out.images, at: p.at, launcher, model });
+      keepOutgoing(key, { id, text: out.text, images: out.images, at: p.at, echoExcluded: p.echoExcluded, launcher, model });
       try {
         // the bubble stays as sending while a gap (a hub restart) is waited out; the id is the op id too
         const reply = await inSendOrder(key, () => apiOp<({ session?: Session; waits_on_computer?: boolean } & DeliveryReply & KeptReply) | undefined>(`${sessionPath(mid, sid)}/messages`, {
@@ -1161,13 +1135,13 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
         }
         flight.finish("delivered");
         const acceptedAt = Date.now();
-        acceptOutgoing(key, id, acceptedAt);
-        setPending((ps) => ps.map((x) => (x.id === id ? { ...x, posting: false, acceptedAt } : x)));
+        acceptOutgoing(key, id, acceptedAt, reply?.queued === true);
+        if (reply?.queued && row?.agent === "codex") {
+          if (!flight.echoed()) keepQueued(mid, sid, { id, text: out.text, images: out.images, at: p.at, acceptedAt, state: "sent", queued: true, echoExcluded: p.echoExcluded, queueReceipt: { state: "queued" }, launcher, model });
+          setPending((ps) => ps.filter((x) => x.id !== id));
+        } else setPending((ps) => ps.map((x) => (x.id === id ? { ...x, posting: false, acceptedAt, queued: reply?.queued === true } : x)));
         // a terminal Agent waiting on a question at the computer reads it only after that is answered (#5890)
-        if (reply?.waits_on_computer) toast(t("lib-outbox.waits_on_computer"), "info");
-        // your own message went through a Claude's inbox although Persona's plugin is there: it may not count as approval
-        const relayed = relayNotice(reply);
-        if (relayed) toast(relayed, "info");
+        await showDeliveryNotice(reply);
         // a Codex's first message: the answer is the thread it began, where the conversation goes on (lib/codex-waiting.ts)
         const began = reply?.session;
         if (began?.session_id && began.session_id !== sid) {
@@ -2193,7 +2167,8 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
             {/* what is on its way, and failed messages with nothing sent after them, in the order they were written */}
             {[...shownPending.map((p) => ({ at: p.at, el: (
               <div key={p.id} className="flex flex-col gap-3">
-                <UserBubble msg={p.msg} mid={mid} sid={sid} pending sendState="sending" />
+                <UserBubble msg={p.msg} mid={mid} sid={sid} pending={p.posting || p.waits || !p.acceptedAt} sendState={p.acceptedAt ? "sent" : "sending"} />
+                {p.acceptedAt && <DeliveryStatus queued={p.queued} />}
               </div>
             ) })), ...placed.rest.map((e) => ({ at: e.at, el: <OutboxBubbles key={`outbox:${e.id}`} mid={mid} sid={sid} entries={[e]} canRetry={!refusedNoRow} /> })),
               ...keptUndelivered.map((m) => ({ at: Date.parse(m.at) || 0, el: (

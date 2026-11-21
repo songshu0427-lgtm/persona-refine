@@ -43,6 +43,13 @@ type codexConn struct {
 	// (assistantLarkEnvNamed). nil when the id was known at the start.
 	nameGates func(id string)
 
+	// Notifications are ordered with one another; timers use the proc's partial
+	// identity under its mutex and the node's deltaMu, never a later turnID lookup.
+	notifyMu       sync.Mutex
+	streamTurns    []string
+	streamItems    map[string]bool
+	streamItemDone bool
+
 	mu                  sync.Mutex
 	pending             map[int64]chan codexReply
 	asks                map[string]context.CancelFunc // server request id → the phone question waiting for it

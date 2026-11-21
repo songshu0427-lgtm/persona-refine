@@ -585,6 +585,14 @@ on-demand model panel, not the everyday Assistant home (#6887).
   Delete). A failed one with messages sent after it sits before the first of them, at the end of the exchange it was
   written in (`ChatLines.placeFailed`; Android in every style, `placeFailed`). Android draws the bubble so on Glass
   (`OutboxBubble`, #4339 C9) and keeps its status line for a delivery the phone has to check.
+  Web accepted messages say "Queued — waiting for the current turn" or "Received — waiting to sync" and survive
+  reloads without a time-based expiry until their echo arrives; definite failure/cancellation keeps the text with
+  Retry, while an unconfirmed queue outcome says to check the chat before sending again and offers only Check;
+  restored images keep only their count, explain that originals were not saved, and cannot Retry without reattachment.
+- In the Persona main chat, a live reply belongs to its runtime turn and message, not the latest reused answer slot.
+  A new question must not inherit the previous answer while waiting for its first text. Identified frames that arrive
+  before their own user history are buffered, not attached to another question; matching history reveals them without
+  requiring another delta. Late old frames/history cannot clear newer progress. Equal text in distinct turns stays.
 - Files sent with a message (iOS `AttachedFileCards`, #8361; web `FileCards`, Android `FileCards.kt`): above your bubble,
   right-aligned, one card each, at most `box280` wide: a video or a recording plays (`AttachedVideoCard`), any other file
   opens the file viewer (`AttachedDocumentCard`: an `avatarL` tile of its kind in the accent's tint, the name in

@@ -1,4 +1,7 @@
 {
+  "queued": "Queued — sends after this turn",
+  "awaiting_echo": "Received — awaiting sync",
+  "images_not_kept": "Images ({count}) — not saved here; reattach to resend",
   "failed": "Not sent: {error}",
   "clear_and_send": "Clear and send",
   "retry": "Retry",

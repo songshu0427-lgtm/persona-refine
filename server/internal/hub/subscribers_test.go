@@ -165,9 +165,9 @@ func TestForgetLiveTextClearsSubscribers(t *testing.T) {
 	followerOtherSession := &client{out: make(chan []byte, 4), subs: map[[2]string]bool{{"m1", "s2"}: true}}
 	h := &Hub{
 		clients: map[*client]struct{}{follower1: {}, followerOtherMachine: {}, followerOtherSession: {}},
-		deltas: map[[2]string]string{
-			{"m1", "s1"}: "in progress",
-			{"m2", "s1"}: "machine 2 in progress",
+		deltas: map[[2]string]deltaPush{
+			{"m1", "s1"}: {Type: "delta", MachineID: "m1", SessionID: "s1", Text: "in progress"},
+			{"m2", "s1"}: {Type: "delta", MachineID: "m2", SessionID: "s1", Text: "machine 2 in progress"},
 			// m1/s2 has no active live text
 		},
 	}
@@ -197,7 +197,7 @@ func TestForgetLiveTextClearsSubscribers(t *testing.T) {
 	if _, ok := h.deltas[[2]string{"m1", "s1"}]; ok {
 		t.Error("m1/s1 delta was not removed from h.deltas")
 	}
-	if text := h.deltas[[2]string{"m2", "s1"}]; text != "machine 2 in progress" {
+	if text := h.deltas[[2]string{"m2", "s1"}].Text; text != "machine 2 in progress" {
 		t.Errorf("m2/s1 delta changed: got %q, want %q", text, "machine 2 in progress")
 	}
 }

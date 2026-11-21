@@ -5,6 +5,7 @@ vi.mock("./store", () => {
     outbox: {} as Record<string, import("./outbox").OutboxEntry[]>,
     assistant: null as null | { machine_id: string; main?: string; conversations: unknown[] },
     features: [] as string[], // a hub without start receipts: the start goes as it always did (lib/assistant-start.ts)
+    sessions: { m: [{ machine_id: "m", session_id: "s", agent: "codex" }] },
   };
   return {
     getState: () => state,
@@ -18,8 +19,10 @@ vi.mock("./store", () => {
 vi.mock("./router", () => ({ navigate: vi.fn() }));
 vi.mock("../ui/atoms", async (actual) => ({ ...(await actual<typeof import("../ui/atoms")>()), toast: vi.fn() }));
 
-import { acceptOutgoing, arrived, checkOutbox, forgetOutgoing, askPersona, discardOutbox, inSendOrder, keepFailed, keepOutgoing, noteSent, noteWritten, outboxMessage, placeFailed, queueToSession, registerOutboxRecheck, resetOutboxClaimsForTests, resetRestoredForTests, restoreOutbox, retryOutbox, sendToSession, settle, settleOutbox, SENT_GRACE_MS, type OutboxEntry } from "./outbox";
+import { acceptOutgoing, arrived, checkOutbox, forgetOutgoing, askPersona, discardOutbox, inSendOrder, keepFailed, keepOutgoing, noteSent, noteWritten, outboxMessage, placeFailed, queueToSession, registerOutboxRecheck, resetOutboxClaimsForTests, resetRestoredForTests, restoreOutbox, retryOutbox, sendToSession, settle, settleOutbox, type OutboxEntry } from "./outbox";
 import { messageFeedback, resetMessageFeedback } from "./message-send";
+import { askPersonaOf } from "./outbox-manager";
+import { conversationManager } from "./manager-choice";
 import type { ChatLine } from "./turns";
 import { ApiError } from "./api";
 import { pickedLauncher, pickedModel, pickLauncher, pickModel } from "./assistant-chat";
@@ -33,6 +36,7 @@ function response(body: unknown, status = 200) {
   return { ok: status < 400, status, text: async () => JSON.stringify(body) };
 }
 const outbox = () => getState().outbox as Record<string, OutboxEntry[]>;
+const SENT_GRACE_MS = 60_000; // Regression boundary of the removed expiry, not a delivery deadline.
 const entry = (patch: Partial<OutboxEntry> = {}): OutboxEntry => ({ id: "e1", text: "你好", images: [], at: 1000, state: "sent", ...patch });
 const recheckRegistrations: (() => void)[] = [];
 const mountedRecheck = (mid: string, sid: string, recheck: () => void) => {
@@ -64,10 +68,10 @@ describe("which bubbles stay", () => {
     expect(arrived(entry({ text: '<persona-context kind="context" title="t" url="">x</persona-context>\n\n说说' }), [{ text: "说说", images: [] }])).toBe(true);
   });
 
-  it("keeps failed ones, and sent ones only for a while", () => {
+  it("keeps accepted messages until an echo, regardless of elapsed time", () => {
     const users = [{ text: "别的", images: [] }];
     const list = [entry({ id: "a" }), entry({ id: "b", state: "failed" }), entry({ id: "c", state: "sending" }), entry({ id: "d", at: 1000 - SENT_GRACE_MS })];
-    expect(settle(list, users, 1000).map((e) => e.id)).toEqual(["a", "b", "c"]);
+    expect(settle(list, users, 1000).map((e) => e.id)).toEqual(["a", "b", "c", "d"]);
     const copies = ["u1", "u2", "u3"].map((id) => ({ id, text: "你好", images: [] }));
     expect(settle(list, copies, 1000).map((e) => e.id)).toEqual(["b"]);
   });
@@ -486,6 +490,32 @@ describe("checking an uncertain send", () => {
 });
 
 describe("问 Persona", () => {
+  it("keeps an inbox handoff's owner and immediate request, with the same shared delivery recovery", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ machine_id: "hub", main: "owned-main" }))
+      .mockResolvedValueOnce(response({ error: "refused" }, 400));
+    vi.stubGlobal("fetch", fetcher);
+    const handoff = askPersonaOf("inbox-owner", "Fixture handoff");
+    expect(fetcher).toHaveBeenCalledOnce(); // no new asynchronous module-load boundary before the request
+    expect(fetcher.mock.calls[0][0]).toBe("/api/v1/assistant");
+    expect(new Headers(fetcher.mock.calls[0][1].headers).get("X-Persona-Manager")).toBe("inbox-owner");
+    const { sent } = await handoff;
+    expect(navigate).toHaveBeenCalledWith({ name: "persona", sid: "owned-main" }); // the fixture has one roster entry
+    expect(await sent).toBe(false);
+    expect(outbox()["hub/owned-main"][0]).toMatchObject({ text: "Fixture handoff", state: "failed", newId: true });
+    expect(conversationManager("owned-main")).toBe("inbox-owner");
+    // Session sends let the hub route to the session's owner; they must not use the page's manager pick.
+    expect(new Headers(fetcher.mock.calls[1][1].headers).get("X-Persona-Manager")).toBeNull();
+  });
+
+  it("does not navigate or leave a sent bubble when the inbox owner's lookup fails", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ error: "refused" }, 400));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(askPersonaOf("inbox-owner", "Fixture handoff")).rejects.toThrow("refused");
+    expect(navigate).not.toHaveBeenCalled();
+    expect(Object.keys(outbox())).toHaveLength(0);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("opens the main conversation at once and sends there, with its picked launcher", async () => {
     (getState() as { assistant: unknown }).assistant = { machine_id: "hub", main: "main1", conversations: [] };
     pickLauncher("hub/main1", "codex");
@@ -554,6 +584,7 @@ describe("messages kept across a reload", () => {
     setItem: (k: string, v: string) => void store.set(k, v),
     removeItem: (k: string) => void store.delete(k),
   };
+  const keptMessages = () => [...store.keys()].filter((key) => key.startsWith("outbox-msg:")).length;
   const reload = () => {
     delete outbox()["m/s"];
     resetOutboxClaimsForTests();
@@ -565,6 +596,20 @@ describe("messages kept across a reload", () => {
     resetOutboxClaimsForTests();
     resetRestoredForTests();
     vi.stubGlobal("localStorage", fakeStorage);
+  });
+
+  it("persists the delivery envelope without originals or in-memory reload fields", () => {
+    const e = entry({ images: [{ mime: "image/png", data: "private-fixture-image" }], imageCount: 2, restored: true,
+      acceptedAt: 1500, queued: true, queueReceipt: { state: "queued" }, echoExcluded: ["older-user"],
+      wordsOnly: true, launcher: "codex", model: "fixture-model", clearable: "draft", newId: false, inDoubt: false });
+    keepOutgoing("m/s", e);
+    const saved = JSON.parse(store.get("outbox-msg:m/s/e1")!);
+    const { images: _images, imageCount: _count, restored: _restored, ...envelope } = e;
+    expect(saved).toEqual({ ...envelope, images: 2 });
+    expect(JSON.stringify(saved)).not.toContain("private-fixture-image");
+    reload(); restoreOutbox("m", "s");
+    expect(outbox()["m/s"][0]).toMatchObject({ id: e.id, images: [], imageCount: 2, restored: true, queued: true,
+      queueReceipt: e.queueReceipt, echoExcluded: e.echoExcluded });
   });
 
   it.each(retryPrompts)("restores $kind after a reload, and Retry preserves the same identity and payload", async ({ text }) => {
@@ -581,7 +626,7 @@ describe("messages kept across a reload", () => {
     expect(splitSkillDraft(retried.text)).toEqual(splitSkillDraft(text));
     expect(store.size).toBe(1); // accepted, still waiting for its transcript copy
     settleOutbox("m", "s", [{ id: "accepted-retry", client_msg_id: "a1", text: "accepted", images: [] }]);
-    expect(store.size).toBe(0);
+    expect(keptMessages()).toBe(0);
   });
 
   // A send refused because a dialog had the terminal (#7343) lights the terminal button by its code: the code comes
@@ -617,7 +662,7 @@ describe("messages kept across a reload", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     settleOutbox("m", "s", [{ id: "accepted-copy", client_msg_id: id, text: "Is the museum open?", images: [] }]);
     expect(outbox()["m/s"]).toBeUndefined();
-    expect(store.size).toBe(0);
+    expect(keptMessages()).toBe(0);
     reload();
     restoreOutbox("m", "s");
     expect(outbox()["m/s"]).toBeUndefined();
@@ -668,10 +713,10 @@ describe("messages kept across a reload", () => {
     expect(outbox()["m/s"]).toMatchObject([{ id: "slow", at, state: "sent" }]);
     settleOutbox("m", "s", [{ id: "slow-copy", text: "A slow reply", images: [], ts: new Date(at).toISOString() }]);
     expect(outbox()["m/s"]).toBeUndefined();
-    expect(store.size).toBe(0);
+    expect(keptMessages()).toBe(0);
   });
 
-  it("expires accepted copies without extending their grace on reload, leaving unconfirmed sends alone", () => {
+  it("keeps accepted copies across reloads beyond sixty seconds without resending", () => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(1000);
     try {
       keepOutgoing("m/s", entry({ id: "accepted", state: "sending" }));
@@ -681,10 +726,10 @@ describe("messages kept across a reload", () => {
       restoreOutbox("m", "s");
       expect(outbox()["m/s"]).toMatchObject([{ id: "accepted", at: 1000, state: "sent" }, { id: "unconfirmed", state: "failed" }]);
       reload();
-      clock.mockReturnValue(1000 + SENT_GRACE_MS);
+      clock.mockReturnValue(1000 + 10 * SENT_GRACE_MS);
       restoreOutbox("m", "s");
-      expect(outbox()["m/s"]).toMatchObject([{ id: "unconfirmed", state: "failed" }]);
-      expect(store.has("outbox-msg:m/s/accepted")).toBe(false);
+      expect(outbox()["m/s"]).toMatchObject([{ id: "accepted", at: 1000, state: "sent" }, { id: "unconfirmed", state: "failed" }]);
+      expect(store.has("outbox-msg:m/s/accepted")).toBe(true);
       expect(store.has("outbox-msg:m/s/unconfirmed")).toBe(true);
     } finally {
       clock.mockRestore();
@@ -696,7 +741,7 @@ describe("messages kept across a reload", () => {
     restoreOutbox("m", "s");
     settleOutbox("m", "s", [{ id: "early-copy", client_msg_id: "early", text: "copy", images: [] }]);
     acceptOutgoing("m/s", "early");
-    expect(store.size).toBe(0);
+    expect(keptMessages()).toBe(0);
 
     noteSent("m", "s", { text: "Accepted in this tab" });
     const accepted = outbox()["m/s"][0];
@@ -721,7 +766,111 @@ describe("messages kept across a reload", () => {
     expect(outbox()["m/s"]).toMatchObject([{ state: "sent", wordsOnly: true }]);
     settleOutbox("m", "s", [{ id: "start-copy", client_msg_id: "hub-generated", text: "Start a conversation", images: [] }]);
     expect(outbox()["m/s"]).toBeUndefined();
-    expect(store.size).toBe(1); // only the other conversation
+    expect(keptMessages()).toBe(1); // only the other conversation; echo identities hold no message text
+  });
+
+  it.each(["failed", "cancelled"])("reconciles a queued message's %s receipt without resending, and keeps its terminal state on reload", async (state) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ queued: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const job = queueToSession("m", "s", { text: "Queued request" });
+    await job.sent;
+    expect(outbox()["m/s"][0]).toMatchObject({ queued: true, state: "sent" });
+    fetcher.mockResolvedValueOnce(response({ codex_desktop_queue: { version: 1, messages: [{ client_msg_id: job.id, state, delivered: "none", at: "2026-11-21T10:00:00.000000001Z" }] } }));
+    expect(await checkOutbox("m", "s", job.id)).toBe("not_applied");
+    expect(outbox()["m/s"][0]).toMatchObject({ state: "failed", inDoubt: false, newId: true, queued: false });
+    expect(fetcher.mock.calls[1][0]).toBe("/api/v1/sessions/m/s/info");
+    reload(); restoreOutbox("m", "s");
+    expect(outbox()["m/s"][0]).toMatchObject({ state: "failed", inDoubt: false, newId: true, queued: false });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([{}, { codex_desktop_queue: { version: 1, messages: [] } }])("keeps a dropped queue record uncertain and never retries it as a new send: %j", async (info) => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ queued: true })).mockResolvedValue(response(info));
+    vi.stubGlobal("fetch", fetcher);
+    const job = queueToSession("m", "s", { text: "Unknown queued request" }); await job.sent;
+    expect(await checkOutbox("m", "s", job.id)).toBe("unknown");
+    expect(outbox()["m/s"][0]).toMatchObject({ state: "failed", queued: false, inDoubt: true, newId: false });
+    expect(await retryOutbox("m", "s", job.id)).toBe(false);
+    expect(fetcher.mock.calls.filter(([, init]) => init.method === "POST")).toHaveLength(1);
+    reload(); restoreOutbox("m", "s");
+    expect(outbox()["m/s"][0]).toMatchObject({ state: "failed", inDoubt: true, newId: false });
+  });
+
+  it("an early echo wins over a late failed queue lookup, with concurrent Checks sharing one read", async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce(response({ queued: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const job = queueToSession("m", "s", { text: "A late queue receipt" }); await job.sent;
+    let release!: (value: unknown) => void;
+    fetcher.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const first = checkOutbox("m", "s", job.id), second = checkOutbox("m", "s", job.id);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    settleOutbox("m", "s", [{ id: "queue-echo", client_msg_id: job.id, text: "copy", images: [] }]);
+    release(response({ codex_desktop_queue: { version: 1, messages: [{ client_msg_id: job.id, state: "failed", delivered: "none", at: "2026-11-21T11:00:00Z" }] } }));
+    expect(await Promise.all([first, second])).toEqual(["stale", "stale"]);
+    expect(outbox()["m/s"]).toBeUndefined();
+    reload(); restoreOutbox("m", "s");
+    expect(outbox()["m/s"]).toBeUndefined();
+  });
+
+  it("merges a queued batch only when its exact real user echo is visible, also after reload", async () => {
+    const fetcher = vi.fn().mockResolvedValue(response({ queued: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const first = queueToSession("m", "s", { text: "First queued request" }); await first.sent;
+    const second = queueToSession("m", "s", { text: "Second queued request" }); await second.sent;
+    fetcher.mockResolvedValue(response({ codex_desktop_queue: { version: 1, messages: [first, second].map(({ id }) => ({ client_msg_id: id, state: "delivered", at: "2026-11-21T11:00:00Z", echo_line: "history:batch:user" })) } }));
+    expect(await checkOutbox("m", "s", first.id)).toBe("applied");
+    expect(outbox()["m/s"]).toHaveLength(2); // A delivery or line hint without the item is not an echo.
+    reload(); restoreOutbox("m", "s");
+    settleOutbox("m", "s", [], [], [
+      { id: "history:batch:user#0", seq: 9, role: "system", kind: "notice" },
+      { id: "history:batch:user-other#0", seq: 9, role: "user", kind: "text", text: "Other" },
+    ]);
+    expect(outbox()["m/s"]).toHaveLength(2);
+    const text = "First queued request\n\nSecond queued request";
+    const echo = { id: "history:batch:user#0", seq: 10, role: "user", kind: "text", text, client_msg_id: first.id } as const;
+    settleOutbox("m", "s", [{ ...echo, images: [] }], [], [echo]);
+    expect(outbox()["m/s"]).toBeUndefined();
+    expect(keptMessages()).toBe(0);
+    reload(); restoreOutbox("m", "s");
+    settleOutbox("m", "s", [{ ...echo, images: [] }], [], [{ ...echo, seq: 11 }]);
+    expect(outbox()["m/s"]).toBeUndefined();
+  });
+
+  it.each(["queued", "delivered", "unknown"])("does not consume a %s Codex message when another device writes new same-text input", async (state) => {
+    const fetcher = vi.fn().mockResolvedValue(response({ queued: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const job = queueToSession("m", "s", { text: "Identical input" }); await job.sent;
+    const { refreshCodexQueue } = await import("./codex-queue");
+    fetcher.mockResolvedValue(response({ codex_desktop_queue: { version: 1, messages: [{ client_msg_id: job.id, state, at: "2026-11-21T10:00:00Z" }] } }));
+    await refreshCodexQueue("m", "s");
+    reload(); restoreOutbox("m", "s");
+    settleOutbox("m", "s", [{ id: "different-device#0", text: "Identical input", images: [], ts: new Date().toISOString() }]);
+    expect(outbox()["m/s"]).toHaveLength(1);
+    fetcher.mockResolvedValue(response({ codex_desktop_queue: { version: 1, messages: [{ client_msg_id: job.id, state: "delivered", at: "2026-11-21T11:00:00Z", echo_line: "real-copy" }] } }));
+    await refreshCodexQueue("m", "s");
+    settleOutbox("m", "s", [], [], [{ id: "real-copy#0", seq: 2, role: "user", kind: "text", text: "Identical input" }]);
+    expect(outbox()["m/s"]).toBeUndefined();
+  });
+
+  it("restores a photo-only queued placeholder without retaining bytes or allowing a missing-photo retry", async () => {
+    const fetcher = vi.fn().mockResolvedValue(response({ queued: true }));
+    vi.stubGlobal("fetch", fetcher);
+    const job = queueToSession("m", "s", { text: "", images: [{ mime: "image/png", data: "synthetic-image-bytes" }] }); await job.sent;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10 * SENT_GRACE_MS);
+    reload(); restoreOutbox("m", "s");
+    clock.mockRestore();
+    expect(outbox()["m/s"]).toHaveLength(1);
+    expect(outbox()["m/s"][0]).toMatchObject({ id: job.id, state: "sent", queued: true, images: [], imageCount: 1 });
+    expect([...store.values()].join(" ")).not.toContain("synthetic-image-bytes");
+    expect(outboxMessage(outbox()["m/s"][0]).text).toBeTruthy();
+    expect(outbox()["m/s"][0].text).toBe(""); // Display-only metadata never becomes a message payload.
+    expect(outboxMessage(outbox()["m/s"][0]).images).toEqual([]);
+    fetcher.mockResolvedValue(response({ codex_desktop_queue: { version: 1, messages: [{ client_msg_id: job.id, state: "failed", delivered: "none", at: "2026-11-21T11:00:00Z" }] } }));
+    await checkOutbox("m", "s", job.id);
+    reload(); restoreOutbox("m", "s");
+    expect(outbox()["m/s"][0]).toMatchObject({ state: "failed", imageCount: 1, images: [] });
+    expect(await retryOutbox("m", "s", job.id)).toBe(false);
+    expect(fetcher.mock.calls.filter(([, init]) => init.method === "POST")).toHaveLength(1);
   });
 
   it("a restored uncertain send keeps its reason and Check, never a new id", () => {
@@ -810,7 +959,7 @@ describe("messages kept across a reload", () => {
       { id: "u2", text: "第二条消息内容", images: [], ts: new Date(3000).toISOString() },
     ]);
     expect(outbox()["m/s"]).toBeUndefined();
-    expect(store.size).toBe(0);
+    expect(keptMessages()).toBe(0);
   });
 
   it("keeps Clear and send available after a reload", async () => {
@@ -834,7 +983,7 @@ describe("messages kept across a reload", () => {
   it("forgets a deleted message", () => {
     keepFailed("m", "s", { id: "a5", text: "别发了", images: [], at: 1000 }, new TypeError("network"));
     discardOutbox("m", "s", "a5");
-    expect(store.size).toBe(0);
+    expect(keptMessages()).toBe(0);
   });
 
   it("puts a deleted message back where it was on Undo, kept for reloads again (#4626)", () => {

@@ -338,7 +338,7 @@ func (f *File) findTurn(fh *os.File, w *window, at int, end, floor int64) int {
 
 // startsTurn says whether a Codex rollout's line starts a task (a turn).
 func (f *File) startsTurn(_ int, line []byte, _ bool) bool {
-	return bytes.Contains(line, []byte(`"type":"task_started"`))
+	return bytes.Contains(line, []byte(`"type":"task_started"`)) || bytes.Contains(line, []byte(`"type":"persona_history_snapshot"`))
 }
 
 // seeded is the parser state for a window starting at line b whose bytes are window: what the earlier lines leave
@@ -602,6 +602,7 @@ func (f *File) loadOlder() int64 {
 		older = withoutLines(older, f.tree.hidden)
 		f.items = withoutLines(f.items, f.tree.hidden)
 	}
+	older = olderCodexHistory(older, pre, f.tree)
 	f.items = append(older, f.items...)
 	f.base = b - 1
 	if f.base == 0 && !f.partialMeta {
@@ -677,6 +678,13 @@ func (f *File) findOlder(id string) (proto.Item, bool) {
 	}
 	defer fh.Close()
 	stem := uuidOf(id)
+	if rest, ok := strings.CutPrefix(stem, "history:"); ok {
+		// Projection IDs add the turn namespace; only the original item stem is
+		// present verbatim in the source JSON. The final lookup still verifies id.
+		if _, source, found := strings.Cut(rest, ":"); found {
+			stem = source
+		}
+	}
 	if rest, ok := strings.CutPrefix(stem, "line"); ok {
 		if n, err := strconv.Atoi(rest); err == nil && n > 0 && strconv.Itoa(n) == rest {
 			if n <= f.base && !f.win.codex && claudeLineUUID(fh, f.win.starts, n) != "" {

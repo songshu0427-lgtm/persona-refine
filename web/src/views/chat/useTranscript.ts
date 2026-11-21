@@ -12,6 +12,7 @@ import type { Item, ItemsPage } from "../../lib/types";
 import { createTextThrottle, type TextThrottle } from "../../ui/stream/throttle";
 import { unlandedLive } from "../../lib/live-text";
 import { clearLive } from "../../lib/live";
+import { assistantStream, assistantStreamText, type DeltaIdentity } from "../../lib/assistant-stream";
 
 const PAGE = "turns=2&fold_work=1&lazy_images=1";
 /** How often a page checks whether it is behind (a pure comparison; nothing is asked unless it is, lib/stale-page.ts). */
@@ -110,6 +111,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [earlierPage, setEarlierPage] = useState<symbol>();
   const [streaming, setStreaming] = useState("");
+  const [streamingTurn, setStreamingTurn] = useState("");
   const [nonce, setNonce] = useState(0);
   const [notLive, setNotLive] = useState(false);
   const cacheScope = opts.cache?.scope;
@@ -208,6 +210,8 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
     revWatch.current = revs;
     const pullKey = `${mid}/${sid}`;
     let latest = cached?.items ?? [];
+    const mainStream = assistantStream();
+    mainStream.items(latest, []);
     let latestMore = cached?.hasMore ?? false;
     let pendingItems: Item[] = []; // pushes after the HTTP request started win over its answer
     let pendingHistory = "";
@@ -248,6 +252,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
     };
     const rewritten = () => {
       dead = true;
+      if (assistant) deltas.current.flush("");
       disownReads(); // invalidate in-flight reads before React runs the next effect
       if (cacheScope) discardFeedCache(cacheScope);
       else discardMemoryPage(memoryScope, mid, sid);
@@ -260,7 +265,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
     // its reply's item; an agent's shows what of its message the latest one does not hold (lib/live-text.ts).
     const showLive = (batch?: Item[]) => {
       if (assistant) {
-        if (batch?.some((i) => i.role === "assistant" && i.kind === "text")) deltas.current.flush("");
+        if (mainStream.items(latest, batch ?? [])) deltas.current.flush("");
         return;
       }
       const want = liveRaw.current && unlandedLive(liveRaw.current, latest);
@@ -270,8 +275,15 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
       if (!want || batch) deltas.current.flush(want); // the end, and what items took off, at once
       else deltas.current.push(want);
     };
-    const onDelta = (text: string) => {
-      if (assistant) return applyDelta(deltas.current, text);
+    const onDelta = (text: string, identity?: DeltaIdentity) => {
+      if (dead) return;
+      if (assistant) {
+        if (mainStream.delta(text, identity, latest)) {
+          setStreamingTurn(identity?.turn_id ?? "");
+          applyDelta(deltas.current, identity?.turn_done ? "" : text);
+        }
+        return;
+      }
       liveRaw.current = text;
       showLive();
     };
@@ -393,6 +405,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
       // nothing: a subscribe without since_seq has the hub read and send that whole page again, while the read
       // below is on its way (a page load opens the socket and reads at once). The read subscribes when it is done.
       reconnected: () => {
+        if (assistant) deltas.current.flush("");
         if (ready) subscribe();
       },
     });
@@ -533,5 +546,5 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
     [mid, sid, apply],
   );
 
-  return { items, history: history.current, loading, firstRead, error, hasMore, loadingEarlier, earlierPage, loadEarlier, expandFold, streaming, notLive, reload: () => setNonce((x) => x + 1) };
+  return { items, history: history.current, loading, firstRead, error, hasMore, loadingEarlier, earlierPage, loadEarlier, expandFold, streaming: assistant ? assistantStreamText(streaming, streamingTurn, items) : streaming, notLive, reload: () => setNonce((x) => x + 1) };
 }

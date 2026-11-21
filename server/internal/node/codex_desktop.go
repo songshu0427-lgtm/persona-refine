@@ -168,6 +168,9 @@ func (n *Node) startCodexDesktopTurn(ctx context.Context, src codexSource, input
 			"context": map[string]any{},
 		},
 	}
+	if dispatch, ok := ctx.Value(codexDesktopDispatchKey{}).(func()); ok {
+		dispatch()
+	}
 	if _, err := c.request("thread-follower-start-turn", turn, owner.HandledByClient); err != nil {
 		// The owner took the request: whether the turn started is not known.
 		return uncertain(err)

@@ -72,6 +72,9 @@ func TestMain(m *testing.M) {
 	codexDebugModels = func(context.Context, *Node, string) ([]byte, error) { return nil, errors.New("no codex in tests") }
 	// Nor the ChatGPT app's bundled codex: a test that wants one sets its own (codex_bundled_test.go).
 	bundledCodexCLI = func() string { return "" }
+	// App discovery also falls back to the user's PATH. Only explicit temporary CLI
+	// fixtures may start an app-server in tests (codex_desktop_effort_test.go).
+	codexAppCLI = func() (string, error) { return "", errors.New("no installed Codex CLI in tests") }
 	// Nor the user's Paseo: its home points nowhere (a test that wants one sets its own).
 	os.Setenv("PASEO_HOME", "/tmp/persona-test-no-paseo")
 	// Nor the user's Cindy: its home points nowhere (a test that wants one sets its own).

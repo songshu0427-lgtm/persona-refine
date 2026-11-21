@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PERSONA_SERVERS } from "./compatibility";
 import { chatLines, freshWords, humanizeTool, isLoopTick, mcpServerName, mergeItems, withoutFolded, parseUserText, pickSubject, segments, openRecap, personaToolVerb, supervisionTool, supervisionVisible, toolChip, toolDisplayName, toolLabel, formatDuration } from "./turns";
 import type { Item } from "./types";
+import { codexSnapshot } from "./testdata/codex-snapshot";
 
 const u = (seq: number, text: string, extra: Partial<Item> = {}): Item => ({ id: `u${seq}#0`, seq, role: "user", kind: "text", text, ...extra });
 const a = (seq: number, text: string): Item => ({ id: `a${seq}#0`, seq, role: "assistant", kind: "text", text });
@@ -69,6 +70,30 @@ describe("freshWords", () => {
 });
 
 describe("mergeItems", () => {
+  it("updates Codex snapshots by stable ID in numeric block order, including completion and replay", () => {
+    let page = mergeItems([], codexSnapshot(10));
+    expect(page).toHaveLength(4);
+    const ids = page.map((i) => i.id);
+    expect(chatLines(page, { live: true }).filter((l) => l.kind === "segment").every((l) => l.live)).toBe(true);
+    page = mergeItems(page, codexSnapshot(11, "updated").reverse());
+    expect(page).toHaveLength(5);
+    expect(page.slice(0, 4).map((i) => i.id)).toEqual(ids);
+    expect(page.map((i) => i.seq)).toEqual([11, 11, 11, 11, 11]);
+    expect(segments(page)[0]).toMatchObject({ user: { text: "Check the export" }, answer: { text: "The tool returned." }, tools: 1 });
+    page = mergeItems(page, codexSnapshot(12, "final"));
+    const final = page;
+    for (let replay = 0; replay < 3; replay++) page = mergeItems(page, codexSnapshot(12, "final"));
+    expect(page).toEqual(final);
+    expect(mergeItems(page, codexSnapshot(10))).toEqual(final); // stale overlapping history cannot undo a newer revision
+    expect(chatLines(page).filter((l) => l.kind === "segment").every((l) => !l.live)).toBe(true);
+  });
+
+  it("marks an interrupted snapshot's answer incomplete even when the notice shares its seq", () => {
+    const lines = chatLines(codexSnapshot(12, "interrupted"));
+    const last = lines.findLast((l) => l.kind === "segment");
+    expect(last?.kind === "segment" && last.seg.cut).toBe(true);
+    expect(lines.at(-1)?.kind).toBe("notice");
+  });
   it("drops a fold once the steps of its range arrive", () => {
     const f: Item = { id: "fold:t3#0", seq: 3, role: "assistant", kind: "fold", fold: { items: 2, tools: 1, thoughts: 0, through_seq: 4 } };
     const have = mergeItems([], [u(1, "go"), f, a(5, "ok")]);

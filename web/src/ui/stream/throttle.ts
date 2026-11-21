@@ -109,5 +109,6 @@ export function useThrottledText(value: string, enabled: boolean): string {
     fresh.current = !enabled;
   }, [value, enabled]);
   useEffect(() => () => throttle.current?.cancel(), []);
-  return enabled && !fresh.current ? shown : value;
+  // A reused slot can receive another message before its effect runs. Only a prefix of this value is its frame.
+  return enabled && !fresh.current && value.startsWith(shown) ? shown : value;
 }

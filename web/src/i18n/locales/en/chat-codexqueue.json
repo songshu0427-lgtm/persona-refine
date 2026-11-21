@@ -1,0 +1,5 @@
+{
+  "cancelled": "The queued message was cancelled. Your text is kept",
+  "failed": "The queued message couldn't be sent. Your text is kept",
+  "unknown": "Can't confirm the queued message. Check the chat before sending again"
+}

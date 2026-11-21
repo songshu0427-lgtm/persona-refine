@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -111,7 +112,7 @@ func TestTraexHistoryRevisionKeepsUnchangedThreads(t *testing.T) {
 				!beforeB.ModTime().Equal(afterB.ModTime()) || beforeB.Size() != afterB.Size() {
 				t.Fatal("an unrelated thread write rebuilt B's transcript")
 			}
-			if after, _ := readCodexHistoryMark(paths[threadOld]); after != markB {
+			if after, _ := readCodexHistoryMark(paths[threadOld]); !reflect.DeepEqual(after, markB) {
 				t.Fatalf("an unrelated thread write changed B's mark: before %+v, after %+v", markB, after)
 			}
 		})

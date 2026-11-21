@@ -152,7 +152,7 @@
  "web/src/views/chat/ModelChangeDivider.tsx": 1,
  "web/src/views/chat/ModelFallbackCard.tsx": 1,
  "web/src/views/chat/ModelPill.tsx": 2,
- "web/src/views/chat/OutboxBubbles.tsx": 1,
+ "web/src/views/chat/OutboxFailure.tsx": 1,
  "web/src/views/chat/PermissionCard.tsx": 7,
  "web/src/views/chat/PermissionPicker.tsx": 1,
  "web/src/views/chat/PlanCard.tsx": 2,

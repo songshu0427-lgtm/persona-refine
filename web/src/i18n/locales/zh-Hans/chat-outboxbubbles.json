@@ -1,4 +1,7 @@
 {
+  "queued": "已排队，等待当前轮次结束",
+  "awaiting_echo": "已接收，等待同步",
+  "images_not_kept": "图片（{count} 张）— 此页面未保存原图，再次发送需重新添加",
   "failed": "没发出去：{error}",
   "clear_and_send": "清空并发送",
   "retry": "重试",
