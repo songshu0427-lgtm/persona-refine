@@ -1,1 +1,16 @@
-{ "modules": ["./register.ts"] }
+{
+  "modules": ["./register.ts"],
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/permission-request.sh\"",
+            "timeout": 86400
+          }
+        ]
+      }
+    ]
+  }
+}

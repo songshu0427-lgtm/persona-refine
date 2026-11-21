@@ -1,13 +1,11 @@
-import type { PermissionRequestDecision } from 'claude-code'
-
 // Protocol 1 between this plugin and the local Persona node (README.md): where the node's socket is, what a poll's
-// answer holds, which messages may go in as the person's words, session-scoped model / effort overrides, bypass-mode
-// preview server pre-start helpers, and remote permission approval parsing. Pure functions; register.ts does the I/O.
+// answer holds, which messages may go in as the person's words, session-scoped model / effort overrides, and
+// bypass-mode preview server pre-start helpers. Pure functions; register.ts does the I/O.
 
 /** The base of the node's endpoints; the host name is not used (the request goes over the socket). */
 export const BASE = 'http://persona/claude-plugin/v1'
 
-/** Optional protocol capabilities this plugin version serves on /poll. */
+/** Optional protocol capabilities this plugin version serves. */
 export const CAPABILITIES = ['settings', 'busy_input', 'interrupt', 'permission_bridge'] as const
 
 /** How long deliver waits for $.prompt.submit to reject or drop before treating a mid-turn call as queued. */
@@ -37,10 +35,6 @@ const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
 export type EffortChoice = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto'
 
 const EFFORTS: ReadonlySet<string> = new Set<EffortChoice>(['low', 'medium', 'high', 'xhigh', 'max', 'auto'])
-
-const PERMISSION_MODES = new Set(['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'] as const)
-const PERMISSION_BEHAVIORS = new Set(['allow', 'deny', 'ask'] as const)
-const PERMISSION_DESTINATIONS = new Set(['userSettings', 'projectSettings', 'localSettings', 'session', 'cliArg'] as const)
 
 export function validModel(model: unknown): model is string {
   return typeof model === 'string' && MODEL.test(model) && !model.startsWith('-')
@@ -104,12 +98,6 @@ export type PreviewLaunchConfig = {
   cwd?: string
   env?: Record<string, string>
 }
-
-/** Answer returned by `/claude-plugin/v1/permission`. */
-export type PermissionPollAnswer =
-  | { kind: 'pending' }
-  | { kind: 'passthrough' }
-  | { kind: 'decided'; decision: PermissionRequestDecision }
 
 /** What a poll came to. */
 export type PollAnswer =
@@ -243,91 +231,6 @@ export function buildPreviewShellCommand(cfg: PreviewLaunchConfig, baseDir: stri
   const cmdParts = [shellQuote(cfg.runtimeExecutable), ...cfg.runtimeArgs.map(shellQuote)]
   const execLine = envParts.length > 0 ? `env ${envParts.join(' ')} ${cmdParts.join(' ')}` : cmdParts.join(' ')
   return `cd ${shellQuote(targetDir)} && exec ${execLine}`
-}
-
-type PermissionUpdatesList = NonNullable<Extract<PermissionRequestDecision, { behavior: 'allow' }>['updatedPermissions']>
-
-function readPermissionUpdates(raw: unknown): PermissionUpdatesList | undefined {
-  if (!Array.isArray(raw)) return undefined
-  const out: PermissionUpdatesList = []
-  for (const item of raw) {
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) return undefined
-    const rec = item as Record<string, unknown>
-    const dest = rec.destination
-    if (typeof dest !== 'string' || !PERMISSION_DESTINATIONS.has(dest as never)) return undefined
-    const destination = dest as PermissionUpdatesList[number]['destination']
-    if (rec.type === 'setMode') {
-      if (typeof rec.mode !== 'string' || !PERMISSION_MODES.has(rec.mode as never)) return undefined
-      out.push({
-        type: 'setMode',
-        mode: rec.mode as Extract<PermissionUpdatesList[number], { type: 'setMode' }>['mode'],
-        destination,
-      })
-      continue
-    }
-    if (rec.type === 'addRules' || rec.type === 'replaceRules' || rec.type === 'removeRules') {
-      if (typeof rec.behavior !== 'string' || !PERMISSION_BEHAVIORS.has(rec.behavior as never)) return undefined
-      if (!Array.isArray(rec.rules)) return undefined
-      const rules: { toolName: string; ruleContent?: string }[] = []
-      for (const r of rec.rules) {
-        if (typeof r !== 'object' || r === null || Array.isArray(r)) return undefined
-        const rr = r as Record<string, unknown>
-        if (typeof rr.toolName !== 'string' || rr.toolName === '') return undefined
-        if (rr.ruleContent !== undefined && typeof rr.ruleContent !== 'string') return undefined
-        rules.push({
-          toolName: rr.toolName,
-          ...(typeof rr.ruleContent === 'string' ? { ruleContent: rr.ruleContent } : {}),
-        })
-      }
-      out.push({
-        type: rec.type,
-        rules,
-        behavior: rec.behavior as 'allow' | 'deny' | 'ask',
-        destination,
-      })
-      continue
-    }
-    return undefined
-  }
-  return out
-}
-
-/** Reads `/claude-plugin/v1/permission` responses into a typed permission poll answer. */
-export function readPermissionPoll(status: number, body: string): PermissionPollAnswer {
-  if (status !== 200) return { kind: 'passthrough' }
-  const answer = parse(body)
-  if (answer === undefined) return { kind: 'passthrough' }
-  if (answer.status === 'pending') return { kind: 'pending' }
-  if (answer.status !== 'decided') return { kind: 'passthrough' }
-  const raw = answer.decision
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { kind: 'passthrough' }
-  const dec = raw as Record<string, unknown>
-  if (dec.behavior === 'allow') {
-    const updatedInput =
-      typeof dec.updatedInput === 'object' && dec.updatedInput !== null && !Array.isArray(dec.updatedInput)
-        ? (dec.updatedInput as Record<string, unknown>)
-        : undefined
-    const updatedPermissions = dec.updatedPermissions !== undefined ? readPermissionUpdates(dec.updatedPermissions) : undefined
-    return {
-      kind: 'decided',
-      decision: {
-        behavior: 'allow',
-        ...(updatedInput !== undefined ? { updatedInput } : {}),
-        ...(updatedPermissions !== undefined ? { updatedPermissions } : {}),
-      },
-    }
-  }
-  if (dec.behavior === 'deny') {
-    return {
-      kind: 'decided',
-      decision: {
-        behavior: 'deny',
-        ...(typeof dec.message === 'string' && dec.message !== '' ? { message: dec.message } : {}),
-        ...(dec.interrupt === true ? { interrupt: true } : {}),
-      },
-    }
-  }
-  return { kind: 'passthrough' }
 }
 
 /** Merges a new settings update into the active session override. */

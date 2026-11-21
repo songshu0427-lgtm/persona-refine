@@ -1,10 +1,13 @@
 package node
 
 import (
+	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -19,16 +22,20 @@ import (
 )
 
 // Remote permission cards for Claude sessions outside Persona's terminals (Claude Desktop, external CLI) running
-// Persona's Claude Code plugin (`classic.PermissionRequest` -> `POST /claude-plugin/v1/permission`).
+// Persona's Claude Code plugin (`hooks/hooks.json` `PermissionRequest` -> `persona-node hook --persona-plugin-permission`
+// -> `POST /claude-plugin/v1/permission`).
 //
-// Each open permission request is held across repeated 25 s long-polls (under Claude Code's 30 s fetch timeout),
-// surfaced alongside `outsideAskCards` on `codex.interactions` with `clp_` ids, and answered from mobile / web / Feishu
-// via `codex.answer`. If the user answers on the computer or interrupts the turn, the plugin cancels the request (or
-// stops re-polling past `ccPluginPermGrace`) and the remote card disappears automatically.
+// Each open permission request is held across repeated 25 s long-polls, surfaced alongside `outsideAskCards` on
+// `codex.interactions` with `clp_` ids, and answered from mobile / web / Feishu via `codex.answer`. If the user answers
+// on the computer or interrupts the turn, the node detects `sessions/<pid>.json` leaving `"waiting"` or transcript
+// advancement (or receives an explicit `cancel: true`) and retires both the remote card and the waiting hook at once.
 
 const outsidePermPrefix = "clp_"
 
-var ccPluginPermGrace = 5 * time.Second
+var (
+	ccPluginPermGrace     = 5 * time.Second
+	ccPluginPermWatchStep = 250 * time.Millisecond
+)
 
 type ccPluginPermInput struct {
 	SessionID      string          `json:"session_id"`
@@ -44,15 +51,18 @@ type ccPluginPermInput struct {
 }
 
 type ccPluginPermEntry struct {
-	sessionID string
-	pid       int
-	requestID string
-	ix        proto.Interaction
-	lastSeen  time.Time
-	decided   bool
-	reply     map[string]any
-	replyCh   chan map[string]any
-	doneCh    chan struct{}
+	sessionID        string
+	pid              int
+	requestID        string
+	ix               proto.Interaction
+	transcriptPath   string
+	transcriptOffset int64
+	sawWaiting       bool
+	lastSeen         time.Time
+	decided          bool
+	reply            map[string]any
+	replyCh          chan map[string]any
+	doneCh           chan struct{}
 }
 
 type ccPluginPermRegistry struct {
@@ -105,6 +115,9 @@ func (r *ccPluginPermRegistry) polled(
 	pid int,
 	requestID string,
 	ix proto.Interaction,
+	transcriptPath string,
+	transcriptOffset int64,
+	waiting bool,
 ) (replyCh chan map[string]any, doneCh chan struct{}, immediate map[string]any, added bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -122,13 +135,18 @@ func (r *ccPluginPermRegistry) polled(
 	}
 	if e == nil || e.pid != pid {
 		e = &ccPluginPermEntry{
-			sessionID: sessionID,
-			pid:       pid,
-			requestID: requestID,
-			ix:        ix,
+			sessionID:        sessionID,
+			pid:              pid,
+			requestID:        requestID,
+			ix:               ix,
+			transcriptPath:   transcriptPath,
+			transcriptOffset: transcriptOffset,
+			sawWaiting:       waiting,
 		}
 		r.items[id] = e
 		added = true
+	} else if waiting {
+		e.sawWaiting = true
 	}
 	if e.doneCh != nil {
 		close(e.doneCh)
@@ -225,6 +243,19 @@ func (r *ccPluginPermRegistry) decide(sessionID string, pid int, id string, repl
 	return true
 }
 
+func (r *ccPluginPermRegistry) observeStatus(id string, pid int, status string) (sawWaiting bool, tpath string, toffset int64, open bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e := r.items[id]
+	if e == nil || e.pid != pid || e.decided {
+		return false, "", 0, false
+	}
+	if status == "waiting" {
+		e.sawWaiting = true
+	}
+	return e.sawWaiting, e.transcriptPath, e.transcriptOffset, true
+}
+
 func (r *ccPluginPermRegistry) cards(live map[string]int, now time.Time) (out []proto.Interaction, expired bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -266,21 +297,107 @@ func (r *ccPluginPermRegistry) attentionReason(sessionID string, pid int, now ti
 	return "等待确认：" + latest.ix.ToolName
 }
 
+// liveClaudeAncestorOf finds the nearest live claude process at pid or among its ancestors (lineage): direct plugin
+// requests arrive from claude itself, while `hooks/hooks.json` command hooks connect from a child hook process.
+func (n *Node) liveClaudeAncestorOf(pid int) (claudeProc, bool) {
+	claudes := n.liveClaudes()
+	byPID := make(map[int]claudeProc, len(claudes))
+	for _, c := range claudes {
+		byPID[c.pid] = c
+	}
+	for _, anc := range lineage(pid, parentPID) {
+		if c, ok := byPID[anc]; ok {
+			return c, true
+		}
+	}
+	return claudeProc{}, false
+}
+
+// permSettledOnComputer reports whether a permission prompt was already resolved (or ended) on the computer while a
+// `PermissionRequest` command hook is still waiting (#3563): either the owning claude process exited / switched
+// sessions, left `"waiting"` after entering it, returned to idle/shell, or appended a main-chain `tool_result` /
+// `assistant` row to its transcript.
+func (n *Node) permSettledOnComputer(sessionID string, claudePID int, cardID string) bool {
+	cur, live := n.liveClaudeOf(claudePID)
+	if !live || cur.SessionID != sessionID {
+		return true
+	}
+	sawWaiting, tpath, toffset, open := n.ccPerms.observeStatus(cardID, claudePID, cur.Status)
+	if !open {
+		return false
+	}
+	if cur.Status == "waiting" {
+		return false
+	}
+	if sawWaiting || cur.Status == "idle" || cur.Status == "shell" {
+		return true
+	}
+	return transcriptMovedPastPerm(tpath, toffset)
+}
+
+func transcriptMovedPastPerm(path string, offset int64) bool {
+	if path == "" || offset < 0 {
+		return false
+	}
+	st, err := os.Stat(path)
+	if err != nil || st.Size() <= offset {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return false
+	}
+	sc := bufio.NewScanner(io.LimitReader(f, 512<<10))
+	sc.Buffer(make([]byte, 0, 16<<10), 512<<10)
+	for sc.Scan() {
+		line := sc.Bytes()
+		var row struct {
+			Type        string          `json:"type"`
+			IsSidechain bool            `json:"isSidechain"`
+			Message     json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(line, &row) != nil || row.IsSidechain {
+			continue
+		}
+		if row.Type == "assistant" {
+			return true
+		}
+		if row.Type == "user" && bytes.Contains(row.Message, []byte(`"tool_result"`)) {
+			return true
+		}
+	}
+	return false
+}
+
+func fileSizeOrZero(path string) int64 {
+	if path == "" {
+		return 0
+	}
+	if st, err := os.Stat(path); err == nil {
+		return st.Size()
+	}
+	return 0
+}
+
 func (n *Node) ccPluginPermission(ctx context.Context, c net.Conn, body []byte) (int, any) {
 	var in ccPluginPermInput
 	if json.Unmarshal(body, &in) != nil || !validID(in.SessionID) || !validPermRequestID(in.RequestID) {
 		return http.StatusBadRequest, map[string]any{"error": "invalid"}
 	}
-	pid, err := ccPluginPeerPID(c)
-	if err != nil || pid <= 0 {
+	peerPID, err := ccPluginPeerPID(c)
+	if err != nil || peerPID <= 0 {
 		return http.StatusForbidden, map[string]any{"error": "peer_unknown", "retry_ms": ccPluginOtherRetry.Milliseconds()}
 	}
-	claude, ok := n.liveClaudeOf(pid)
+	claude, ok := n.liveClaudeAncestorOf(peerPID)
 	if !ok || claude.SessionID != in.SessionID {
 		return http.StatusForbidden, map[string]any{"error": "not_this_session", "retry_ms": ccPluginStrangerRetry.Milliseconds()}
 	}
 	if in.Cancel {
-		if n.ccPerms.cancel(in.SessionID, pid, in.RequestID) {
+		if n.ccPerms.cancel(in.SessionID, claude.pid, in.RequestID) {
 			n.notifySessions()
 			go n.syncCodexCards(context.Background())
 		}
@@ -296,7 +413,16 @@ func (n *Node) ccPluginPermission(ctx context.Context, c net.Conn, body []byte) 
 	}
 	in.ToolName = toolName
 	ix := n.buildOutsidePermCard(claude, in)
-	replyCh, doneCh, immediate, added := n.ccPerms.polled(in.SessionID, pid, in.RequestID, ix)
+	tpath := cmp.Or(n.transcriptPath(in.SessionID), strings.TrimSpace(in.TranscriptPath))
+	replyCh, doneCh, immediate, added := n.ccPerms.polled(
+		in.SessionID,
+		claude.pid,
+		in.RequestID,
+		ix,
+		tpath,
+		fileSizeOrZero(tpath),
+		claude.Status == "waiting",
+	)
 	if added {
 		n.notifySessions()
 		go n.syncCodexCards(context.Background())
@@ -304,19 +430,42 @@ func (n *Node) ccPluginPermission(ctx context.Context, c net.Conn, body []byte) 
 	if immediate != nil {
 		return http.StatusOK, immediate
 	}
+	if !added && n.permSettledOnComputer(in.SessionID, claude.pid, ix.ID) {
+		if n.ccPerms.cancel(in.SessionID, claude.pid, in.RequestID) {
+			n.notifySessions()
+			go n.syncCodexCards(context.Background())
+		}
+		return http.StatusOK, map[string]any{"status": "passthrough"}
+	}
 	wait := time.Duration(in.WaitMS) * time.Millisecond
 	if wait <= 0 || wait > ccPluginPollMost {
 		wait = ccPluginPollMost
 	}
 	t := time.NewTimer(wait)
 	defer t.Stop()
-	select {
-	case reply := <-replyCh:
-		return http.StatusOK, reply
-	case <-doneCh:
-	case <-t.C:
-	case <-ctx.Done():
+	watch := time.NewTicker(ccPluginPermWatchStep)
+	defer watch.Stop()
+	for {
+		select {
+		case reply := <-replyCh:
+			return http.StatusOK, reply
+		case <-doneCh:
+			goto done
+		case <-t.C:
+			goto done
+		case <-ctx.Done():
+			goto done
+		case <-watch.C:
+			if n.permSettledOnComputer(in.SessionID, claude.pid, ix.ID) {
+				if n.ccPerms.cancel(in.SessionID, claude.pid, in.RequestID) {
+					n.notifySessions()
+					go n.syncCodexCards(context.Background())
+				}
+				return http.StatusOK, map[string]any{"status": "passthrough"}
+			}
+		}
 	}
+done:
 	if reply := n.ccPerms.pollEnded(ix.ID, replyCh); reply != nil {
 		return http.StatusOK, reply
 	}

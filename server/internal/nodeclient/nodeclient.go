@@ -14,9 +14,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nwverse/persona/server/internal/identity"
@@ -242,4 +245,61 @@ func NewAttempt() string {
 	b[6] = b[6]&0x0f | 0x40
 	b[8] = b[8]&0x3f | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// DialPluginHTTPAt sends one JSON POST request to `/claude-plugin/v1/<endpoint>` over the node's Unix socket at path
+// and returns the HTTP status code and response body. Cancelling ctx closes the connection immediately.
+func DialPluginHTTPAt(ctx context.Context, path, endpoint string, payload any) (int, []byte, error) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, err
+	}
+	var d net.Dialer
+	c, err := d.DialContext(ctx, "unix", path)
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: %v", ErrNoNode, err)
+	}
+	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(dl)
+	}
+	head := fmt.Sprintf(
+		"POST /claude-plugin/v1/%s HTTP/1.1\r\nHost: persona\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+		endpoint, len(b),
+	)
+	if _, err := io.WriteString(c, head); err != nil {
+		return 0, nil, err
+	}
+	if _, err := c.Write(b); err != nil {
+		return 0, nil, err
+	}
+	br := bufio.NewReader(c)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		return 0, nil, err
+	}
+	parts := strings.Fields(statusLine)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/1.") {
+		return 0, nil, errors.New("not an HTTP response")
+	}
+	code, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, nil, err
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return 0, nil, err
+		}
+		if line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(br, 256<<10))
+	if err != nil {
+		return 0, nil, err
+	}
+	return code, body, nil
 }

@@ -3,14 +3,21 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/acceptloop"
+	"github.com/nwverse/persona/server/internal/nodeclient"
 	"github.com/nwverse/persona/server/internal/nodeproto"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/screen"
@@ -169,6 +176,141 @@ func TestOutsideClaudePermissionBridgeAllowDenyPlanAndCancel(t *testing.T) {
 	if st != 200 || pass["status"] != "passthrough" {
 		t.Fatalf("tmux outside session should passthrough, got status=%d body=%+v", st, pass)
 	}
+
+	// 5. `--persona-plugin-permission` command hook: mobile decision prints PermissionRequest hookSpecificOutput, and
+	// computer-side resolution (`status` leaving `"waiting"`) retires the card and unblocks the hook immediately.
+	oldWatch := ccPluginPermWatchStep
+	ccPluginPermWatchStep = 15 * time.Millisecond
+	t.Cleanup(func() { ccPluginPermWatchStep = oldWatch })
+
+	shortHome, err := os.MkdirTemp("", "ccperm")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortHome) })
+	t.Setenv("PERSONA_HOME", shortHome)
+	sockPath := nodeclient.SocketPath()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", sockPath, err)
+	}
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	go acceptloop.Run(serveCtx, ln, t.Logf, func(c net.Conn) { go n.serveSock(serveCtx, c) })
+	t.Cleanup(func() { stopServe(); _ = ln.Close() })
+
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "waiting", inbox, nil)
+
+	// Subprocess ancestry check: a child process spawned under this PID authenticates to this live claude session.
+	childCmd := exec.Command("python3", "-I", "-c", `
+import json, os, socket, sys
+sock_path, sid = sys.argv[1], sys.argv[2]
+body = json.dumps({"session_id": sid, "request_id": "req_child_1", "tool_name": "Bash", "tool_input": {"command": "pwd"}, "wait_ms": 20}).encode()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.sendall(f"POST /claude-plugin/v1/permission HTTP/1.1\r\nHost: persona\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+resp = b""
+while chunk := s.recv(4096):
+    resp += chunk
+sys.stdout.write(resp.decode("utf-8", "replace"))
+`, nodeclient.SocketPath(), sidA)
+	rawChild, err := childCmd.CombinedOutput()
+	if err != nil || !bytes.Contains(rawChild, []byte(`"status":"pending"`)) {
+		t.Fatalf("child hook ancestor auth failed: err=%v out=%s", err, rawChild)
+	}
+	_, _ = pluginPost(t, client, "permission", map[string]any{"session_id": sidA, "request_id": "req_child_1", "cancel": true})
+
+	// RunHook mobile Allow -> PermissionRequest hookSpecificOutput JSON.
+	hookOutCh := make(chan string, 1)
+	go func() {
+		var out bytes.Buffer
+		inJSON, _ := json.Marshal(map[string]any{
+			"session_id":      sidA,
+			"hook_event_name": "PermissionRequest",
+			"tool_name":       "Bash",
+			"tool_input":      map[string]any{"command": "go test ./..."},
+			"cwd":             home,
+			"permission_mode": "default",
+		})
+		nodeclient.RunHook(context.Background(), []string{nodeclient.PluginPermissionFlag}, bytes.NewReader(inJSON), &out)
+		hookOutCh <- out.String()
+	}()
+	var cliCard proto.Interaction
+	waitFor(t, "RunHook permission card", func() bool {
+		if cs := n.outsidePermCards(); len(cs) == 1 {
+			cliCard = cs[0]
+			return true
+		}
+		return false
+	})
+	if _, err := request(t, n, "codex.answer", map[string]any{
+		"session_id": sidA,
+		"id":         cliCard.ID,
+		"resolution": proto.Resolution{Allow: &allow},
+	}); err != nil {
+		t.Fatalf("codex.answer for RunHook: %v", err)
+	}
+	select {
+	case line := <-hookOutCh:
+		var parsed struct {
+			HookSpecificOutput struct {
+				HookEventName string         `json:"hookEventName"`
+				Decision      map[string]any `json:"decision"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &parsed); err != nil {
+			t.Fatalf("unmarshal RunHook stdout %q: %v", line, err)
+		}
+		if parsed.HookSpecificOutput.HookEventName != "PermissionRequest" ||
+			parsed.HookSpecificOutput.Decision["behavior"] != "allow" {
+			t.Fatalf("unexpected RunHook stdout: %+v", parsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RunHook mobile decision")
+	}
+
+	// RunHook computer UI resolution: flipping status from waiting -> busy retires card and exits hook with empty stdout.
+	compDone := make(chan string, 1)
+	go func() {
+		var out bytes.Buffer
+		inJSON, _ := json.Marshal(map[string]any{
+			"session_id":      sidA,
+			"hook_event_name": "PermissionRequest",
+			"tool_name":       "Write",
+			"tool_input":      map[string]any{"file_path": filepath.Join(home, "out.txt")},
+			"cwd":             home,
+			"permission_mode": "default",
+		})
+		nodeclient.RunHook(context.Background(), []string{nodeclient.PluginPermissionFlag}, bytes.NewReader(inJSON), &out)
+		compDone <- out.String()
+	}()
+	waitFor(t, "computer-resolution permission card", func() bool {
+		return len(n.outsidePermCards()) == 1
+	})
+	// Simulate user clicking Allow in Claude Desktop: status leaves "waiting" -> "busy".
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "busy", inbox, nil)
+	select {
+	case line := <-compDone:
+		if line != "" {
+			t.Fatalf("expected empty stdout when answered on computer, got %q", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for computer-resolved RunHook to exit")
+	}
+	if left := n.outsidePermCards(); len(left) != 0 {
+		t.Fatalf("card should be retired after computer resolution, got %+v", left)
+	}
+	// Verify permission-request.sh has clean LF endings and valid POSIX sh syntax.
+	shPath := filepath.Join("..", "..", "..", "integrations", "claude-code-plugin", "hooks", "permission-request.sh")
+	shBytes, err := os.ReadFile(shPath)
+	if err != nil {
+		t.Fatalf("read permission-request.sh: %v", err)
+	}
+	if bytes.Contains(shBytes, []byte("\r")) {
+		t.Fatal("permission-request.sh contains CR characters")
+	}
+	if out, err := exec.Command("sh", "-n", shPath).CombinedOutput(); err != nil {
+		t.Fatalf("sh -n permission-request.sh: %v (%s)", err, out)
+	}
 }
 
 func TestStalledDesktopHostMCPAllowsRemoteInterruptAndSteer(t *testing.T) {
@@ -207,7 +349,7 @@ func TestStalledDesktopHostMCPAllowsRemoteInterruptAndSteer(t *testing.T) {
 		for ctx.Err() == nil {
 			st, out, ok := postCtx("poll", map[string]any{
 				"session_id":     sidA,
-				"plugin_version": "0.4.0",
+				"plugin_version": "0.4.1",
 				"engine_version": "2.1.326",
 				"capabilities":   []string{"settings", "busy_input", "interrupt", "permission_bridge"},
 				"wait_ms":        500,

@@ -31,6 +31,10 @@ const (
 // (node/globalhooks.go): `<binary> hook --persona-global`.
 const GlobalHookFlag = "--persona-global"
 
+// PluginPermissionFlag marks the classic `PermissionRequest` command hook bundled in `integrations/claude-code-plugin`
+// (`hooks/hooks.json` -> `hooks/permission-request.sh`): `<binary> hook --persona-plugin-permission`.
+const PluginPermissionFlag = "--persona-plugin-permission"
+
 // HomeFlag names the data directory, and so the node, of a hook in exec form (`<binary> hook --persona-home <dir>`,
 // the live replies plugin's: node/doctor.go displayHooks). Claude Code starts that one without a shell, so it cannot
 // have PERSONA_HOME in front as the shell-form hooks do.
@@ -75,6 +79,14 @@ func RunHook(ctx context.Context, args []string, stdin io.Reader, stdout io.Writ
 	}
 	if len(args) > 0 && args[0] == GlobalHookFlag { // an entry in the user's settings.json: report only
 		ReportHook(ctx, input, HookPane(os.Getenv))
+		return
+	}
+	if len(args) > 0 && args[0] == PluginPermissionFlag {
+		out := PluginPermissionHook(ctx, input, HookPane(os.Getenv))
+		if len(out) == 0 {
+			return
+		}
+		_, _ = stdout.Write(append(out, '\n'))
 		return
 	}
 	if len(args) > 0 && args[0] == CuaOnlyFlag && !runsCua(input) {
@@ -131,6 +143,118 @@ func Hook(ctx context.Context, input json.RawMessage, pane string) json.RawMessa
 		return nil
 	}
 	return resp.Output
+}
+
+const (
+	pluginPermWaitMS      = 25_000
+	pluginPermHTTPTimeout = 30 * time.Second
+	pluginPermCancelWait  = time.Second
+)
+
+// PluginPermissionHook bridges a `PermissionRequest` command hook from `persona-claude-code-plugin` (`hooks/hooks.json`)
+// over `POST /claude-plugin/v1/permission` for Claude sessions outside Persona's terminals. Inside a Persona pane, for
+// `AskUserQuestion`, or when no node socket is present, it returns nil immediately so Claude Code falls through cleanly.
+func PluginPermissionHook(ctx context.Context, input json.RawMessage, pane string) json.RawMessage {
+	if pane != "" {
+		return nil
+	}
+	var in struct {
+		SessionID      string          `json:"session_id"`
+		AgentID        string          `json:"agent_id"`
+		ToolName       string          `json:"tool_name"`
+		ToolInput      json.RawMessage `json:"tool_input"`
+		Cwd            string          `json:"cwd"`
+		TranscriptPath string          `json:"transcript_path"`
+		PermissionMode string          `json:"permission_mode"`
+	}
+	if json.Unmarshal(input, &in) != nil || !ValidSessionID(in.SessionID) {
+		return nil
+	}
+	toolName := strings.TrimSpace(in.ToolName)
+	if toolName == "" || toolName == "AskUserQuestion" {
+		return nil
+	}
+	sock := SocketPath()
+	if _, err := os.Stat(sock); err != nil {
+		return nil
+	}
+	requestID := "perm_" + NewAttempt()
+	sent := false
+	settled := false
+	defer func() {
+		if !sent || settled {
+			return
+		}
+		cctx, cancel := context.WithTimeout(context.Background(), pluginPermCancelWait)
+		defer cancel()
+		_, _, _ = DialPluginHTTPAt(cctx, sock, "permission", map[string]any{
+			"session_id": in.SessionID,
+			"request_id": requestID,
+			"cancel":     true,
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, HookTimeout)
+	defer cancel()
+	payload := map[string]any{
+		"session_id":      in.SessionID,
+		"request_id":      requestID,
+		"agent_id":        in.AgentID,
+		"tool_name":       toolName,
+		"tool_input":      in.ToolInput,
+		"cwd":             in.Cwd,
+		"transcript_path": in.TranscriptPath,
+		"permission_mode": in.PermissionMode,
+		"wait_ms":         pluginPermWaitMS,
+	}
+	for ctx.Err() == nil {
+		reqCtx, reqCancel := context.WithTimeout(ctx, pluginPermHTTPTimeout)
+		sent = true
+		code, body, err := DialPluginHTTPAt(reqCtx, sock, "permission", payload)
+		reqCancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			settled = true
+			return nil
+		}
+		if code != 200 {
+			settled = true
+			return nil
+		}
+		var resp struct {
+			Status   string          `json:"status"`
+			Decision json.RawMessage `json:"decision"`
+		}
+		if json.Unmarshal(body, &resp) != nil {
+			settled = true
+			return nil
+		}
+		switch resp.Status {
+		case "pending":
+			continue
+		case "decided":
+			settled = true
+			if len(resp.Decision) == 0 || string(resp.Decision) == "null" {
+				return nil
+			}
+			out, err := json.Marshal(map[string]any{
+				"hookSpecificOutput": map[string]any{
+					"hookEventName": "PermissionRequest",
+					"decision":      resp.Decision,
+				},
+			})
+			if err != nil {
+				return nil
+			}
+			return out
+		default:
+			settled = true
+			return nil
+		}
+	}
+	return nil
 }
 
 // reportTimeout is how long a report-only hook waits for the node; it asks for nothing, so a node that does not

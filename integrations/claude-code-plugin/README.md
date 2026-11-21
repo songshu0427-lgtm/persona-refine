@@ -31,8 +31,13 @@ when no node is running.
   `/reload-plugins` in a running session (or its next start), picks the new version up. A user-scope plugin installed
   from a terminal also loads in the local sessions Claude's desktop app starts.
 - Files: `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json`, `hooks/hooks.json`, `hooks/register.ts`,
-  `hooks/bridge.ts`; `tests/` is for `claude plugin test` only. A node in standby (Persona Link while its manager is
-  away) or an older node gives no HTTP answer; the plugin backs off and tries again.
+  `hooks/bridge.ts`, `hooks/permission-request.sh`; `tests/` is for `claude plugin test` only. `register.ts` registers
+  only native module hooks (`session.start`, `turn.start`, `turn.complete`, `turn.step`, `tool.call`) and probes bypass
+  mode via `$.tool.check`, while `hooks/hooks.json` registers `PermissionRequest` as a classic command hook
+  (`permission-request.sh` -> `<persona-bin> hook --persona-plugin-permission`) so Claude Desktop's built-in
+  `cc-plugin-sec-default` guard never skips `classic.*` module hooks or blocks remote permission approvals. A node in
+  standby (Persona Link while its manager is away) or an older node gives no HTTP answer; the plugin backs off and tries
+  again.
 - Needs a Claude Code with function hooks and `$.prompt.submit`'s `asUser` (measured on 2.1.291, 2.1.299 and 2.1.308).
   An older Claude Code does not load the module; the node then keeps using the peer inbox.
 
@@ -52,7 +57,7 @@ another session, gets `403`.
 `POST /claude-plugin/v1/poll`
 
 ```json
-{"session_id": "<uuid>", "plugin_version": "0.4.0", "engine_version": "2.1.326", "capabilities": ["settings", "busy_input", "interrupt", "permission_bridge"], "wait_ms": 25000}
+{"session_id": "<uuid>", "plugin_version": "0.4.1", "engine_version": "2.1.326", "capabilities": ["settings", "busy_input", "interrupt", "permission_bridge"], "wait_ms": 25000}
 ```
 
 - Held until work comes or `wait_ms` passes (at most 25 s; Claude Code's fetch gives up at 30 s), then asked
@@ -81,13 +86,15 @@ The plugin submits a message only before its `deadline_ms`; after that the node 
 {"session_id": "<uuid>", "request_id": "<id>", "tool_name": "Bash", "tool_input": {"command": "npm test"}, "permission_mode": "default", "wait_ms": 25000}
 ```
 
-- Used by `classic.PermissionRequest` (except `AskUserQuestion`) over repeated 25 s long-polls while the local dialog is
-  open (`next.signal` cancels with `{"session_id": "<uuid>", "request_id": "<id>", "cancel": true}`).
+- Used by `hooks/hooks.json`'s `PermissionRequest` command hook (`permission-request.sh` -> `<persona-bin> hook
+  --persona-plugin-permission`, except `AskUserQuestion`) over repeated 25 s long-polls while the local dialog is open
+  (authenticated by ancestor PID lineage back to the session's `claude` process; signals send `{"session_id": "<uuid>",
+  "request_id": "<id>", "cancel": true}`, and the node also auto-retires the card if the computer UI settles the prompt).
 - `200 {"status": "passthrough"}`: the node does not bridge permissions for this session (e.g. a Persona-managed or tmux
-  session); the plugin calls `next(e)` at once.
-- `200 {"status": "pending"}`: still awaiting an answer; the plugin re-polls immediately.
-- `200 {"status": "decided", "decision": {...}}`: the owner answered from a Persona app (`allow` or `deny`), resolving
-  the permission request directly.
+  session, or the prompt was already resolved on the computer); the hook exits `0` with empty stdout.
+- `200 {"status": "pending"}`: still awaiting an answer; the hook re-polls immediately.
+- `200 {"status": "decided", "decision": {...}}`: the owner answered from a Persona app (`allow` or `deny`), printed as
+  `{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{...}}}`.
 
 Registration is the poll itself: a session counts as having the plugin while its claude process lives and a poll from
 that process waits, or ended less than 90 s ago. The node lists such a session with `capabilities.plugin_input: true`.

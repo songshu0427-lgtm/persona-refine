@@ -15,7 +15,6 @@ import {
   nextBackoff,
   parsePreviewLaunchConfig,
   previewTaskDescription,
-  readPermissionPoll,
   readPoll,
   socketPath,
   verdict,
@@ -29,9 +28,10 @@ import {
 } from './bridge'
 
 // Persona's plugin (README.md): while this session lives it asks the local Persona node for the owner's own messages,
-// session-scoped model / effort picks, owner turn interrupts, and remote permission approvals from the Persona apps,
-// and pre-starts configured `.claude/launch.json` preview servers under `bypassPermissions` so Claude Desktop opens
-// previews without blocking on a host shell confirmation card.
+// session-scoped model / effort picks, and owner turn interrupts, and pre-starts configured `.claude/launch.json`
+// preview servers under `bypassPermissions` so Claude Desktop opens previews without blocking on a host shell
+// confirmation card. Remote `PermissionRequest` approvals run via `hooks/hooks.json` (`permission-request.sh`) so this
+// module registers zero `classic.*` hooks and is never skipped by `cc-plugin-sec-default`.
 
 type Engine = EngineInterface
 
@@ -41,40 +41,7 @@ export const register: Register = on => {
   let loop = 0
   let override: SessionOverride | undefined
   let activeTurn: ActiveTurn | undefined
-  let permissionMode: string | undefined
-  let permSeq = 0
   const prestartedPreviews = new Map<string, number>()
-
-  const trackMode = (agentId: string | undefined, mode: string | undefined) => {
-    if (agentId === undefined && typeof mode === 'string' && mode !== '') {
-      permissionMode = mode
-    }
-  }
-
-  on('classic.SessionStart', (_$, e, next) => {
-    trackMode(e.agent_id, e.permission_mode)
-    return next(e)
-  })
-
-  on('classic.UserPromptSubmit', (_$, e, next) => {
-    trackMode(e.agent_id, e.permission_mode)
-    return next(e)
-  })
-
-  on('classic.PostToolUse', (_$, e, next) => {
-    trackMode(e.agent_id, e.permission_mode)
-    return next(e)
-  })
-
-  on('classic.PostToolUseFailure', (_$, e, next) => {
-    trackMode(e.agent_id, e.permission_mode)
-    return next(e)
-  })
-
-  on('classic.ConfigChange', (_$, e, next) => {
-    trackMode(e.agent_id, e.permission_mode)
-    return next(e)
-  })
 
   on('turn.start', async ($, e, next) => {
     if (e.agentId === undefined) {
@@ -105,66 +72,11 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__Claude_Browser__preview_start' }, async ($, e, next) => {
-    if (e.agentId !== undefined || permissionMode !== 'bypassPermissions') return next(e)
+    if (e.agentId !== undefined) return next(e)
     const name = typeof e.name === 'string' ? e.name.trim() : ''
     if (name === '') return next(e)
     await prestartPreviewServer($, name, prestartedPreviews, next.signal)
     return next(e)
-  })
-
-  on('classic.PermissionRequest', async ($, e, next) => {
-    trackMode(e.agent_id, e.permission_mode)
-    if (e.tool_name === 'AskUserQuestion') return next(e)
-    const sock = await resolveSocket($)
-    if (sock === undefined) return next(e)
-    const requestId = `perm_${++permSeq}_${await $.clock.now()}`
-    let settled = false
-    const notifyCancel = () => {
-      if (settled) return
-      void $.http
-        .fetch(`${BASE}/permission`, post(sock, { session_id: e.session_id, request_id: requestId, cancel: true }))
-        .catch(() => undefined)
-    }
-    next.signal.addEventListener('abort', notifyCancel, { once: true })
-    try {
-      while (!next.signal.aborted) {
-        let status = 0
-        let text = ''
-        try {
-          const res = await $.http.fetch(
-            `${BASE}/permission`,
-            post(sock, {
-              session_id: e.session_id,
-              request_id: requestId,
-              agent_id: e.agent_id ?? '',
-              tool_name: e.tool_name,
-              tool_input: e.tool_input,
-              cwd: e.cwd,
-              transcript_path: e.transcript_path,
-              permission_mode: e.permission_mode ?? '',
-              wait_ms: POLL_WAIT_MS,
-            }),
-          )
-          status = res.status
-          text = res.text
-        } catch {
-          return next(e)
-        }
-        const answer = readPermissionPoll(status, text)
-        if (answer.kind === 'passthrough') {
-          settled = true
-          return next(e)
-        }
-        if (answer.kind === 'decided') {
-          settled = true
-          return { decision: answer.decision }
-        }
-      }
-      return next(e)
-    } finally {
-      next.signal.removeEventListener('abort', notifyCancel)
-      if (!settled) notifyCancel()
-    }
   })
 
   on('session.start', async ($, e, next) => {
@@ -202,6 +114,24 @@ async function prestartPreviewServer(
     if (loaded === undefined) return
     const { cfg, baseDir } = loaded
     if (isWindowsPath(baseDir) || (cfg.cwd !== undefined && isWindowsPath(cfg.cwd))) return
+    const command = buildPreviewShellCommand(cfg, baseDir)
+    const description = previewTaskDescription(cfg.name)
+    // Probe the engine's own permission decision first: in bypassPermissions mode (and no matching rule/hook),
+    // `decision` is `'allow'` with `rule === undefined`. Any other mode or explicit rule leaves preview_start untouched.
+    const check = await $.tool
+      .check({
+        tool: 'Bash',
+        input: { command, description, run_in_background: true },
+      })
+      .catch(() => undefined)
+    if (
+      check?.decision !== 'allow' ||
+      check.rule !== undefined ||
+      check.hook !== undefined ||
+      check.plugin !== undefined
+    ) {
+      return
+    }
     if (await isLocalHttpListening($, cfg.port)) return
     const session = await $.session.id().catch(() => '')
     const key = `${session}:${cfg.name}:${cfg.port}`
@@ -211,8 +141,8 @@ async function prestartPreviewServer(
     prestarted.set(key, now)
     const launched = await $.tool.call({
       tool: 'Bash',
-      command: buildPreviewShellCommand(cfg, baseDir),
-      description: previewTaskDescription(cfg.name),
+      command,
+      description,
       run_in_background: true,
     })
     if ('deny' in launched) {
