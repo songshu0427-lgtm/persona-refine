@@ -714,7 +714,7 @@ func (n *Node) ccPluginSend(ctx context.Context, c claudeProc, id, text string) 
 // Returns true when the plugin confirmed the abort (or the turn settled while the abort was in flight); false when no
 // interrupt-capable plugin answered or it declined, leaving interruptOutside to fall back to the peer inbox.
 func (n *Node) ccPluginInterrupt(ctx context.Context, c claudeProc, id string) bool {
-	if c.Status != "busy" || !n.ccPlugins.interruptCapable(id, c.pid) {
+	if (c.Status != "busy" && c.Status != "waiting") || !n.ccPlugins.interruptCapable(id, c.pid) {
 		return false
 	}
 	req := ccPluginInterrupt{
@@ -728,7 +728,7 @@ func (n *Node) ccPluginInterrupt(ctx context.Context, c claudeProc, id string) b
 	}
 	deadline := time.Now().Add(ccPluginSubmitWait)
 	for {
-		if now, ok := n.outsideClaude(id); !ok || now.Status != "busy" {
+		if now, ok := n.outsideClaude(id); !ok || (now.Status != "busy" && now.Status != "waiting") {
 			log.Printf("interrupt %s: claude %d settled after Persona's plugin took the stop", id, c.pid)
 			return true
 		}

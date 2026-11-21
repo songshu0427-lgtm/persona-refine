@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -241,6 +242,44 @@ func (r *ccPluginPermRegistry) decide(sessionID string, pid int, id string, repl
 		delete(r.items, id)
 	}
 	return true
+}
+
+func (r *ccPluginPermRegistry) interrupt(sessionID string, pid int, reply map[string]any) (cardIDs []string, waitingReconnect bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for id, e := range r.items {
+		if e.sessionID != sessionID || e.pid != pid || e.decided {
+			continue
+		}
+		if e.replyCh == nil && now.Sub(e.lastSeen) > ccPluginPermGrace {
+			delete(r.items, id)
+			continue
+		}
+		e.decided = true
+		e.reply = reply
+		e.lastSeen = now
+		cardIDs = append(cardIDs, id)
+		if e.replyCh != nil {
+			e.replyCh <- reply
+			e.replyCh, e.doneCh = nil, nil
+			delete(r.items, id)
+		} else {
+			waitingReconnect = true
+		}
+	}
+	return cardIDs, waitingReconnect
+}
+
+func (r *ccPluginPermRegistry) pendingDecided(sessionID string, pid int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.items {
+		if e.sessionID == sessionID && e.pid == pid && e.decided {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *ccPluginPermRegistry) observeStatus(id string, pid int, status string) (sawWaiting bool, tpath string, toffset int64, open bool) {
@@ -613,6 +652,51 @@ func (n *Node) outsidePermAnswer(_ context.Context, session, id string, r proto.
 	n.notifySessions()
 	go n.syncCodexCards(context.Background())
 	return nil
+}
+
+// outsidePermInterrupt settles any open PermissionRequest cards on session with `{behavior: "deny", interrupt: true}` so
+// an owner-authenticated mobile Stop dismisses the desktop confirmation dialog and aborts the turn in one step without
+// triggering an extra model round.
+func (n *Node) outsidePermInterrupt(ctx context.Context, session string, pid int) bool {
+	reply := map[string]any{
+		"status": "decided",
+		"decision": map[string]any{
+			"behavior":  "deny",
+			"message":   "用户在手机上停止了这一轮。",
+			"interrupt": true,
+		},
+	}
+	cardIDs, waitingReconnect := n.ccPerms.interrupt(session, pid, reply)
+	if len(cardIDs) == 0 {
+		return false
+	}
+	for _, id := range cardIDs {
+		n.cx.hold(session, id)
+	}
+	n.notifySessions()
+	go n.syncCodexCards(context.Background())
+	if !waitingReconnect {
+		log.Printf("interrupt %s: claude %d aborted pending permission request via Persona's hook", session, pid)
+		return true
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		if !n.ccPerms.pendingDecided(session, pid) {
+			log.Printf("interrupt %s: claude %d picked up permission abort on reconnect", session, pid)
+			return true
+		}
+		if now, ok := n.outsideClaude(session); !ok || (now.Status != "busy" && now.Status != "waiting") {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 const outsidePermGone = "Claude 已经不在等这次确认了（可能在电脑上处理过了，或者这一轮已结束），这次没有重复提交。"

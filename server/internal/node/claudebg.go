@@ -199,6 +199,7 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 		s.Capabilities, s.ReadOnlyReason = outsideCapabilities(c)
 		if permReason != "" && s.Capabilities != nil {
 			s.Capabilities.Approve = true
+			s.Capabilities.Interrupt = true
 		}
 		if s.Capabilities != nil && s.Capabilities.Send && n.ccPluginInput(id, c.pid) {
 			s.Capabilities.PluginInput = true // the owner's messages go in as their input (ccplugin.go)
@@ -207,7 +208,7 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 				s.Efforts = slices.Clone(proto.EffortLevels)
 			}
 		}
-		if s.Capabilities != nil && c.Status == "busy" && n.ccPlugins.interruptCapable(id, c.pid) {
+		if s.Capabilities != nil && (c.Status == "busy" || c.Status == "waiting") && n.ccPlugins.interruptCapable(id, c.pid) {
 			s.Capabilities.Interrupt = true
 		}
 		// A claude in a tmux pane says where it runs ("tmux":"orc:@11.%11") and no hooks of Persona's run there: the
@@ -519,8 +520,13 @@ func (n *Node) interruptOutside(ctx context.Context, id string) (handled bool, e
 	if !ok || outsidePane(c) != "" {
 		return false, nil
 	}
-	if ownerDeliveryOf(ctx) != nil && c.Status == "busy" && n.ccPluginInterrupt(ctx, c, id) {
-		return true, nil
+	if ownerDeliveryOf(ctx) != nil {
+		if n.outsidePermInterrupt(ctx, id, c.pid) {
+			return true, nil
+		}
+		if (c.Status == "busy" || c.Status == "waiting") && n.ccPluginInterrupt(ctx, c, id) {
+			return true, nil
+		}
 	}
 	p, has := peerOf(c)
 	if !has {

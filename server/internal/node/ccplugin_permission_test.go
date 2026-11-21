@@ -419,3 +419,152 @@ func TestStalledDesktopHostMCPAllowsRemoteInterruptAndSteer(t *testing.T) {
 		t.Fatal("timed out waiting for plugin interrupt")
 	}
 }
+
+func TestWaitingOutsideClaudeOwnerInterruptAbortsCleanly(t *testing.T) {
+	n, f, home := herdrNode(t)
+	noPaneEnv(t)
+	f.reply("session.snapshot", snapshot(nil, nil, nil, nil))
+	p := bgTranscript(t, home, home, sidA, "deploy check")
+	inbox := newFakeInbox(t, p)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "waiting", inbox, nil)
+
+	shortHome, err := os.MkdirTemp("", "ccwaitint")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortHome) })
+	t.Setenv("PERSONA_HOME", shortHome)
+	sockPath := nodeclient.SocketPath()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", sockPath, err)
+	}
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	go acceptloop.Run(serveCtx, ln, t.Logf, func(c net.Conn) { go n.serveSock(serveCtx, c) })
+	t.Cleanup(func() { stopServe(); _ = ln.Close() })
+
+	// 1. Waiting on a PermissionRequest hook: OwnerInterrupt resolves the hook with {behavior: "deny", interrupt: true},
+	// retires the card, and touches no peer inbox.
+	hookOutCh := make(chan string, 1)
+	go func() {
+		var out bytes.Buffer
+		inJSON, _ := json.Marshal(map[string]any{
+			"session_id":      sidA,
+			"hook_event_name": "PermissionRequest",
+			"tool_name":       "Bash",
+			"tool_input":      map[string]any{"command": "git push"},
+			"cwd":             home,
+			"permission_mode": "default",
+		})
+		nodeclient.RunHook(context.Background(), []string{nodeclient.PluginPermissionFlag}, bytes.NewReader(inJSON), &out)
+		hookOutCh <- out.String()
+	}()
+	waitFor(t, "open permission card before OwnerInterrupt", func() bool {
+		return len(n.outsidePermCards()) == 1
+	})
+	if s := byID(listSessions(t, n))[sidA]; s.Capabilities == nil || !s.Capabilities.Interrupt {
+		t.Fatalf("expected Interrupt capability while permission card is open, got %+v", s.Capabilities)
+	}
+	if _, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA}); err != nil {
+		t.Fatalf("OwnerInterrupt with open permission card: %v", err)
+	}
+	select {
+	case line := <-hookOutCh:
+		var parsed struct {
+			HookSpecificOutput struct {
+				HookEventName string         `json:"hookEventName"`
+				Decision      map[string]any `json:"decision"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &parsed); err != nil {
+			t.Fatalf("unmarshal RunHook interrupt stdout %q: %v", line, err)
+		}
+		if parsed.HookSpecificOutput.HookEventName != "PermissionRequest" ||
+			parsed.HookSpecificOutput.Decision["behavior"] != "deny" ||
+			parsed.HookSpecificOutput.Decision["interrupt"] != true {
+			t.Fatalf("expected deny+interrupt decision, got %+v", parsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RunHook interrupt output")
+	}
+	if left := n.outsidePermCards(); len(left) != 0 {
+		t.Fatalf("permission card should be retired on OwnerInterrupt, got %+v", left)
+	}
+	if got := len(inbox.users()); got != 0 {
+		t.Fatalf("expected 0 peer inbox messages when permission hook aborted, got %d", got)
+	}
+
+	// 2. Waiting on a non-PermissionRequest dialog (e.g. AskUserQuestion) with an active plugin: OwnerInterrupt aborts via
+	// the plugin's $.turn.abort (waiting for ack rather than misreading status=="waiting" as settled) without peer inbox fallback.
+	client := pluginSocket(t, n)
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-loopDone })
+	ackMode := make(chan bool, 4)
+	interrupted := make(chan string, 2)
+	postCtx := func(what string, body map[string]any) (int, map[string]any, bool) {
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://persona/claude-plugin/v1/"+what, strings.NewReader(string(b)))
+		req.Header.Set("Content-Type", "application/json")
+		res, err := client.Do(req)
+		if err != nil {
+			return 0, nil, false
+		}
+		defer res.Body.Close()
+		out := map[string]any{}
+		_ = json.NewDecoder(res.Body).Decode(&out)
+		return res.StatusCode, out, true
+	}
+	go func() {
+		defer close(loopDone)
+		for ctx.Err() == nil {
+			st, out, ok := postCtx("poll", map[string]any{
+				"session_id":     sidA,
+				"plugin_version": "0.4.1",
+				"engine_version": "2.1.326",
+				"capabilities":   []string{"settings", "busy_input", "interrupt", "permission_bridge"},
+				"wait_ms":        500,
+			})
+			if !ok || st != 200 {
+				return
+			}
+			if rawInt, ok := out["interrupt"].(map[string]any); ok && rawInt["id"] != nil {
+				id, _ := rawInt["id"].(string)
+				submit := <-ackMode
+				ackBody := map[string]any{"session_id": sidA, "id": id, "submitted": submit}
+				if !submit {
+					ackBody["reason"] = "no_turn"
+				}
+				_, _, _ = postCtx("ack", ackBody)
+				interrupted <- id
+			}
+		}
+	}()
+	waitFor(t, "plugin interrupt capability while waiting", func() bool {
+		s := byID(listSessions(t, n))[sidA]
+		return s.Capabilities != nil && s.Capabilities.Interrupt
+	})
+	ackMode <- true
+	if _, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA}); err != nil {
+		t.Fatalf("OwnerInterrupt while waiting with plugin: %v", err)
+	}
+	select {
+	case <-interrupted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for plugin interrupt ack while waiting")
+	}
+	if got := len(inbox.users()); got != 0 {
+		t.Fatalf("expected 0 peer inbox messages when plugin aborted waiting turn, got %d", got)
+	}
+
+	// 3. If the plugin declines (e.g. no active turn), OwnerInterrupt still falls back cleanly to the peer inbox.
+	shortPeerWait(t, 3*time.Second)
+	ackMode <- false
+	if _, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA}); err != nil {
+		t.Fatalf("OwnerInterrupt fallback when plugin declines: %v", err)
+	}
+	<-interrupted
+	if got := len(inbox.users()); got != 1 {
+		t.Fatalf("expected 1 peer inbox fallback message when plugin declined, got %d", got)
+	}
+}
