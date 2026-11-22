@@ -98,6 +98,9 @@ func (n *Node) sendThroughDesktopApp(ctx context.Context, id, text string, image
 // sendOpened sends to the claude the app started for session id; the refusal says why when there is none to send to.
 func (n *Node) sendOpened(ctx context.Context, id, text string, images []proto.Image) (bool, error) {
 	log.Printf("send %s: opened in the desktop app", id)
+	if ownerDeliveryOf(ctx) != nil && n.desktopPluginReady() {
+		n.awaitDesktopPlugin(ctx, id, 2*time.Second)
+	}
 	if handled, err := n.sendOutside(ctx, id, text, images); handled {
 		return true, err
 	}
@@ -105,6 +108,23 @@ func (n *Node) sendOpened(ctx context.Context, id, text string, images []proto.I
 		return true, refusal(peerUnreachable, peerUnreachMsg, nil) // it was there, and is gone
 	}
 	return true, refusal(peerUnsupported, peerNoInboxMsg, nil)
+}
+
+func (n *Node) awaitDesktopPlugin(ctx context.Context, id string, wait time.Duration) {
+	deadline := time.Now().Add(wait)
+	for {
+		if c, ok := n.outsideClaude(id); ok && n.ccPluginInput(id, c.pid) {
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 // desktopTranscript is the transcript the app's session local runs now, by its entry; id when no entry names it.

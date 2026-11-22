@@ -152,8 +152,9 @@ const (
 )
 
 // PluginPermissionHook bridges a `PermissionRequest` command hook from `persona-claude-code-plugin` (`hooks/hooks.json`)
-// over `POST /claude-plugin/v1/permission` for Claude sessions outside Persona's terminals. Inside a Persona pane, for
-// `AskUserQuestion`, or when no node socket is present, it returns nil immediately so Claude Code falls through cleanly.
+// over `POST /claude-plugin/v1/permission` for Claude sessions outside Persona's terminals (including `AskUserQuestion`,
+// `ExitPlanMode`, and tool approvals). Inside a Persona pane or when no node socket is present, it returns nil
+// immediately so Claude Code falls through cleanly.
 func PluginPermissionHook(ctx context.Context, input json.RawMessage, pane string) json.RawMessage {
 	if pane != "" {
 		return nil
@@ -171,7 +172,7 @@ func PluginPermissionHook(ctx context.Context, input json.RawMessage, pane strin
 		return nil
 	}
 	toolName := strings.TrimSpace(in.ToolName)
-	if toolName == "" || toolName == "AskUserQuestion" {
+	if toolName == "" {
 		return nil
 	}
 	sock := SocketPath()

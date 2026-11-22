@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/screen"
 )
@@ -244,12 +245,37 @@ func (r *ccPluginPermRegistry) decide(sessionID string, pid int, id string, repl
 	return true
 }
 
-func (r *ccPluginPermRegistry) interrupt(sessionID string, pid int, reply map[string]any) (cardIDs []string, waitingReconnect bool) {
+func (r *ccPluginPermRegistry) hasOpen(sessionID string, pid int) bool {
+	return r.hasOpenKind(sessionID, pid, "")
+}
+
+func (r *ccPluginPermRegistry) hasOpenKind(sessionID string, pid int, kind string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for _, e := range r.items {
+		if e.sessionID != sessionID || e.pid != pid || e.decided {
+			continue
+		}
+		if e.replyCh == nil && now.Sub(e.lastSeen) > ccPluginPermGrace {
+			continue
+		}
+		if kind == "" || e.ix.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *ccPluginPermRegistry) interrupt(sessionID string, pid int, kind string, reply map[string]any) (cardIDs []string, waitingReconnect bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	now := time.Now()
 	for id, e := range r.items {
 		if e.sessionID != sessionID || e.pid != pid || e.decided {
+			continue
+		}
+		if kind != "" && e.ix.Kind != kind {
 			continue
 		}
 		if e.replyCh == nil && now.Sub(e.lastSeen) > ccPluginPermGrace {
@@ -326,6 +352,9 @@ func (r *ccPluginPermRegistry) attentionReason(sessionID string, pid int, now ti
 	}
 	if latest == nil {
 		return ""
+	}
+	if latest.ix.Kind == proto.IxQuestion {
+		return proto.AttentionClaudeAnswer
 	}
 	if latest.ix.Kind == proto.IxPlan {
 		return "等待确认计划"
@@ -446,12 +475,16 @@ func (n *Node) ccPluginPermission(ctx context.Context, c net.Conn, body []byte) 
 		return http.StatusOK, map[string]any{"status": "passthrough"}
 	}
 	toolName := strings.TrimSpace(in.ToolName)
-	if toolName == "" || len(toolName) > 256 || toolName == askTool ||
+	if toolName == "" || len(toolName) > 256 ||
 		toolName == proto.SecretRunTool || toolName == proto.SecretHandoffTool {
 		return http.StatusOK, map[string]any{"status": "passthrough"}
 	}
 	in.ToolName = toolName
-	ix := n.buildOutsidePermCard(claude, in)
+	n.ccPlugins.clearAborted(in.SessionID, claude.pid)
+	ix, ok := n.buildOutsidePermCard(claude, in)
+	if !ok {
+		return http.StatusOK, map[string]any{"status": "passthrough"}
+	}
 	tpath := cmp.Or(n.transcriptPath(in.SessionID), strings.TrimSpace(in.TranscriptPath))
 	replyCh, doneCh, immediate, added := n.ccPerms.polled(
 		in.SessionID,
@@ -511,7 +544,7 @@ done:
 	return http.StatusOK, map[string]any{"status": "pending"}
 }
 
-func (n *Node) buildOutsidePermCard(c claudeProc, in ccPluginPermInput) proto.Interaction {
+func (n *Node) buildOutsidePermCard(c claudeProc, in ccPluginPermInput) (proto.Interaction, bool) {
 	now := time.Now().UTC()
 	cwd := strings.TrimSpace(in.Cwd)
 	if cwd == "" {
@@ -528,7 +561,19 @@ func (n *Node) buildOutsidePermCard(c claudeProc, in ccPluginPermInput) proto.In
 		CreatedAt: now,
 		ExpiresAt: now.Add(24 * time.Hour),
 	}
-	if in.ToolName == "ExitPlanMode" {
+	switch in.ToolName {
+	case askTool:
+		if !questionInteraction(hookInput{ToolInput: in.ToolInput}, &ix) || proto.HasDuplicateQuestionText(ix.Questions) {
+			return proto.Interaction{}, false
+		}
+		for i, q := range ix.Questions {
+			if q.Options == nil {
+				ix.Questions[i].Options = []proto.QuestionOption{}
+			}
+		}
+		ix.Kind = proto.IxQuestion
+		ix.CanCancel = true
+	case "ExitPlanMode":
 		var p struct {
 			Plan string `json:"plan"`
 		}
@@ -536,7 +581,7 @@ func (n *Node) buildOutsidePermCard(c claudeProc, in ccPluginPermInput) proto.In
 		ix.Kind = proto.IxPlan
 		ix.Plan = p.Plan
 		ix.PlanThen = n.planThen(in.SessionID)
-	} else {
+	default:
 		ix.Kind = proto.IxPermission
 		ix.Summary = toolSummary(in.ToolName, in.ToolInput)
 		ix.AlwaysLabel = "本会话都允许 " + in.ToolName
@@ -556,7 +601,7 @@ func (n *Node) buildOutsidePermCard(c claudeProc, in ccPluginPermInput) proto.In
 	if ix.SessionTitle == "" && ix.Cwd != "" {
 		ix.SessionTitle = filepath.Base(ix.Cwd)
 	}
-	return ix
+	return ix, true
 }
 
 func (n *Node) outsidePermCards() []proto.Interaction {
@@ -574,9 +619,6 @@ func (n *Node) outsidePermCards() []proto.Interaction {
 }
 
 func (n *Node) outsidePermAnswer(_ context.Context, session, id string, r proto.Resolution) error {
-	if r.Cancel {
-		return fmt.Errorf("question cancellation is unavailable for permission prompts")
-	}
 	c, live := n.outsideClaude(session)
 	if r.Dismiss {
 		n.cx.dismiss(session, id)
@@ -588,14 +630,44 @@ func (n *Node) outsidePermAnswer(_ context.Context, session, id string, r proto.
 		return nil
 	}
 	if !live {
+		if r.Cancel {
+			return fmt.Errorf("question cancellation is unavailable for permission prompts")
+		}
 		return refusal(screen.PromptChanged, outsidePermGone, nil)
 	}
 	ix, ok := n.ccPerms.lookup(session, c.pid, id)
 	if !ok {
+		if r.Cancel {
+			return fmt.Errorf("question cancellation is unavailable for permission prompts")
+		}
 		return refusal(screen.PromptChanged, outsidePermGone, nil)
+	}
+	if r.Cancel && ix.Kind != proto.IxQuestion {
+		return fmt.Errorf("question cancellation is unavailable for permission prompts")
 	}
 	var decision map[string]any
 	switch ix.Kind {
+	case proto.IxQuestion:
+		if r.Cancel {
+			decision = map[string]any{"behavior": "deny", "message": prompts.RenderQuestionCancelled()}
+		} else {
+			answers := map[string]string{}
+			for k, v := range r.Answers {
+				if s := strings.TrimSpace(v); s != "" {
+					answers[k] = s
+				}
+			}
+			if len(answers) == 0 {
+				return fmt.Errorf("没有回答任何一道题")
+			}
+			var input map[string]any
+			_ = json.Unmarshal(ix.ToolInput, &input)
+			if input == nil {
+				input = map[string]any{}
+			}
+			input["answers"] = answers
+			decision = map[string]any{"behavior": "allow", "updatedInput": input}
+		}
 	case proto.IxPlan:
 		if r.Approve == nil {
 			return fmt.Errorf("missing plan decision")
@@ -666,13 +738,14 @@ func (n *Node) outsidePermInterrupt(ctx context.Context, session string, pid int
 			"interrupt": true,
 		},
 	}
-	cardIDs, waitingReconnect := n.ccPerms.interrupt(session, pid, reply)
+	cardIDs, waitingReconnect := n.ccPerms.interrupt(session, pid, "", reply)
 	if len(cardIDs) == 0 {
 		return false
 	}
 	for _, id := range cardIDs {
 		n.cx.hold(session, id)
 	}
+	n.ccPlugins.markAborted(session, pid, fileSizeOrZero(n.transcriptPath(session)))
 	n.notifySessions()
 	go n.syncCodexCards(context.Background())
 	if !waitingReconnect {
@@ -695,6 +768,44 @@ func (n *Node) outsidePermInterrupt(ctx context.Context, session string, pid int
 		case <-ctx.Done():
 			return false
 		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+// outsideQuestionInterrupt closes any open AskUserQuestion PermissionRequest card on session with `{behavior: "deny",
+// interrupt: true}` right before delivering a free-text owner prompt via Persona's plugin.
+func (n *Node) outsideQuestionInterrupt(ctx context.Context, session string, pid int) bool {
+	reply := map[string]any{
+		"status": "decided",
+		"decision": map[string]any{
+			"behavior":  "deny",
+			"message":   prompts.RenderQuestionCancelled(),
+			"interrupt": true,
+		},
+	}
+	cardIDs, _ := n.ccPerms.interrupt(session, pid, proto.IxQuestion, reply)
+	if len(cardIDs) == 0 {
+		return false
+	}
+	for _, id := range cardIDs {
+		n.cx.hold(session, id)
+	}
+	n.notifySessions()
+	go n.syncCodexCards(context.Background())
+	deadline := time.Now().Add(150 * time.Millisecond)
+	for {
+		if !n.ccPerms.pendingDecided(session, pid) {
+			if now, ok := n.outsideClaude(session); !ok || now.Status != "waiting" {
+				return true
+			}
+		}
+		if time.Now().After(deadline) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(15 * time.Millisecond):
 		}
 	}
 }

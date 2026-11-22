@@ -494,8 +494,10 @@ func TestWaitingOutsideClaudeOwnerInterruptAbortsCleanly(t *testing.T) {
 		t.Fatalf("expected 0 peer inbox messages when permission hook aborted, got %d", got)
 	}
 
-	// 2. Waiting on a non-PermissionRequest dialog (e.g. AskUserQuestion) with an active plugin: OwnerInterrupt aborts via
+	// 2. A subsequent turn waiting on a non-PermissionRequest dialog with an active plugin: OwnerInterrupt aborts via
 	// the plugin's $.turn.abort (waiting for ack rather than misreading status=="waiting" as settled) without peer inbox fallback.
+	appendLines(t, p, `{"type":"user","uuid":"u-turn2","timestamp":"2026-11-22T01:10:00Z","sessionId":"`+sidA+`","message":{"role":"user","content":"second turn"}}`)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "waiting", inbox, nil)
 	client := pluginSocket(t, n)
 	ctx, cancel := context.WithCancel(context.Background())
 	loopDone := make(chan struct{})
@@ -556,15 +558,267 @@ func TestWaitingOutsideClaudeOwnerInterruptAbortsCleanly(t *testing.T) {
 	if got := len(inbox.users()); got != 0 {
 		t.Fatalf("expected 0 peer inbox messages when plugin aborted waiting turn, got %d", got)
 	}
+	// Even though `sessions/<pid>.json` still says `"waiting"`, the session immediately reads as idle after plugin abort.
+	if s := byID(listSessions(t, n))[sidA]; s.Status != proto.StatusIdle || (s.Capabilities != nil && s.Capabilities.Interrupt) {
+		t.Fatalf("expected post-abort stale status overridden to idle without Interrupt, got status=%s caps=%+v", s.Status, s.Capabilities)
+	}
 
-	// 3. If the plugin declines (e.g. no active turn), OwnerInterrupt still falls back cleanly to the peer inbox.
-	shortPeerWait(t, 3*time.Second)
+	// 3. A new user prompt clears the post-abort override; if the plugin later reports `no_turn` on Stop while
+	// `sessions/<pid>.json` is stuck at `"busy"`, OwnerInterrupt settles it to idle and NEVER falls back to Peer Inbox.
+	appendLines(t, p, `{"type":"user","uuid":"u-next","timestamp":"2026-11-22T01:14:14Z","sessionId":"`+sidA+`","message":{"role":"user","content":"next question"}}`)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "busy", inbox, nil)
+	if s := byID(listSessions(t, n))[sidA]; s.Status != proto.StatusWorking {
+		t.Fatalf("expected new user prompt to resume working status, got %s", s.Status)
+	}
 	ackMode <- false
 	if _, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA}); err != nil {
-		t.Fatalf("OwnerInterrupt fallback when plugin declines: %v", err)
+		t.Fatalf("OwnerInterrupt when plugin reports no_turn: %v", err)
 	}
 	<-interrupted
-	if got := len(inbox.users()); got != 1 {
-		t.Fatalf("expected 1 peer inbox fallback message when plugin declined, got %d", got)
+	if got := len(inbox.users()); got != 0 {
+		t.Fatalf("expected 0 peer inbox messages on no_turn (must never wake idle session), got %d", got)
+	}
+	if s := byID(listSessions(t, n))[sidA]; s.Status != proto.StatusIdle {
+		t.Fatalf("expected no_turn ack to mark stale busy session idle, got %s", s.Status)
+	}
+}
+
+func TestOutsideClaudePluginQuestionAnswersAndFreeTextWithoutInbox(t *testing.T) {
+	n, f, home := herdrNode(t)
+	noPaneEnv(t)
+	shortPeerWait(t, 2*time.Second)
+	shortPluginWaits(t)
+	f.reply("session.snapshot", snapshot(nil, nil, nil, nil))
+	p := bgTranscript(t, home, home, sidA, "configure alerts")
+	appendLines(t, p, askCall(sidA, "toolu_plugin_q1", multiAsk))
+	inbox := newFakeInbox(t, p)
+	inbox.setMode(peerModeBypass)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "waiting", inbox, nil)
+
+	shortHome, err := os.MkdirTemp("", "ccqhook")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortHome) })
+	t.Setenv("PERSONA_HOME", shortHome)
+	sockPath := nodeclient.SocketPath()
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("listen %s: %v", sockPath, err)
+	}
+	serveCtx, stopServe := context.WithCancel(context.Background())
+	go acceptloop.Run(serveCtx, ln, t.Logf, func(c net.Conn) { go n.serveSock(serveCtx, c) })
+	t.Cleanup(func() { stopServe(); _ = ln.Close() })
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", sockPath)
+			},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-loopDone })
+	deliveredTexts := make(chan string, 4)
+	rejectNext := make(chan bool, 1)
+	go func() {
+		defer close(loopDone)
+		for ctx.Err() == nil {
+			b, _ := json.Marshal(map[string]any{
+				"session_id":     sidA,
+				"plugin_version": "0.4.1",
+				"engine_version": "2.1.330",
+				"capabilities":   []string{"settings", "busy_input", "interrupt", "permission_bridge"},
+				"wait_ms":        500,
+			})
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://persona/claude-plugin/v1/poll", strings.NewReader(string(b)))
+			req.Header.Set("Content-Type", "application/json")
+			res, err := client.Do(req)
+			if err != nil {
+				continue
+			}
+			var out struct {
+				Messages []map[string]any `json:"messages"`
+			}
+			_ = json.NewDecoder(res.Body).Decode(&out)
+			res.Body.Close()
+			for _, m := range out.Messages {
+				id, _ := m["id"].(string)
+				txt, _ := m["text"].(string)
+				shouldReject := false
+				select {
+				case shouldReject = <-rejectNext:
+				default:
+				}
+				if shouldReject {
+					pluginPost(t, client, "ack", map[string]any{"session_id": sidA, "id": id, "submitted": false, "reason": "failed"})
+					continue
+				}
+				line, _ := json.Marshal(map[string]any{
+					"type":      "user",
+					"uuid":      newUUID(),
+					"sessionId": sidA,
+					"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+					"message":   map[string]any{"role": "user", "content": txt},
+					"origin":    map[string]any{"kind": "plugin", "name": "persona", "asUser": true},
+				})
+				appendLines(t, p, string(line))
+				pluginPost(t, client, "ack", map[string]any{"session_id": sidA, "id": id, "submitted": true})
+				deliveredTexts <- txt
+			}
+		}
+	}()
+	waitPolling(t, n, sidA)
+
+	// With `permission_bridge` active, legacy transcript-based `outsideAskCards()` (`clq_`) is suppressed so no duplicate card appears.
+	if legacy := n.outsideAskCards(); len(legacy) != 0 {
+		t.Fatalf("expected 0 legacy clq_ cards when permission_bridge plugin is active, got %+v", legacy)
+	}
+
+	// 1. AskUserQuestion via `RunHook --persona-plugin-permission` -> structured `updatedInput.answers` decision, zero Peer Inbox.
+	hookOutCh := make(chan string, 1)
+	go func() {
+		var out bytes.Buffer
+		inJSON, _ := json.Marshal(map[string]any{
+			"session_id":      sidA,
+			"hook_event_name": "PermissionRequest",
+			"tool_name":       "AskUserQuestion",
+			"tool_input":      json.RawMessage(multiAsk),
+			"cwd":             home,
+			"permission_mode": "auto",
+		})
+		nodeclient.RunHook(context.Background(), []string{nodeclient.PluginPermissionFlag}, bytes.NewReader(inJSON), &out)
+		hookOutCh <- out.String()
+	}()
+	var qCard proto.Interaction
+	waitFor(t, "AskUserQuestion permission card", func() bool {
+		if cs := n.outsidePermCards(); len(cs) == 1 {
+			qCard = cs[0]
+			return true
+		}
+		return false
+	})
+	if qCard.Kind != proto.IxQuestion || !qCard.CanCancel || len(qCard.Questions) != 4 {
+		t.Fatalf("unexpected AskUserQuestion card: %+v", qCard)
+	}
+	if s := byID(listSessions(t, n))[sidA]; s.AttentionReason != proto.AttentionClaudeAnswer || s.Capabilities == nil || !s.Capabilities.Approve {
+		t.Fatalf("unexpected session row while AskUserQuestion open: %+v caps=%+v", s, s.Capabilities)
+	}
+	answers := map[string]string{
+		"Which setting wins?":      "Account",
+		"How are long rows shown?": "Fold",
+		"Which counts show?":       "Unread, Mentions",
+		"Alert on a mention?":      "Never",
+	}
+	if _, err := request(t, n, nodeproto.OwnerCardAnswer, map[string]any{
+		"session_id": sidA,
+		"id":         qCard.ID,
+		"resolution": proto.Resolution{Answers: answers},
+	}); err != nil {
+		t.Fatalf("OwnerCardAnswer for AskUserQuestion: %v", err)
+	}
+	select {
+	case line := <-hookOutCh:
+		var parsed struct {
+			HookSpecificOutput struct {
+				HookEventName string `json:"hookEventName"`
+				Decision      struct {
+					Behavior     string `json:"behavior"`
+					UpdatedInput struct {
+						Answers map[string]string `json:"answers"`
+					} `json:"updatedInput"`
+				} `json:"decision"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &parsed); err != nil {
+			t.Fatalf("unmarshal AskUserQuestion hook stdout %q: %v", line, err)
+		}
+		if parsed.HookSpecificOutput.Decision.Behavior != "allow" ||
+			parsed.HookSpecificOutput.Decision.UpdatedInput.Answers["Which setting wins?"] != "Account" ||
+			parsed.HookSpecificOutput.Decision.UpdatedInput.Answers["Which counts show?"] != "Unread, Mentions" {
+			t.Fatalf("unexpected AskUserQuestion hook decision: %+v", parsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AskUserQuestion hook stdout")
+	}
+	if got := len(inbox.users()); got != 0 {
+		t.Fatalf("expected 0 peer inbox messages for AskUserQuestion card answer, got %d", got)
+	}
+
+	// 2. Free-text owner reply (`session.send` with `owner_input: true`) while AskUserQuestion is open:
+	// closes the waiting AskUserQuestion hook with `{behavior: "deny", interrupt: true}` and submits the user's words via plugin.
+	hookOutCh2 := make(chan string, 1)
+	go func() {
+		var out bytes.Buffer
+		inJSON, _ := json.Marshal(map[string]any{
+			"session_id":      sidA,
+			"hook_event_name": "PermissionRequest",
+			"tool_name":       "AskUserQuestion",
+			"tool_input":      json.RawMessage(multiAsk),
+			"cwd":             home,
+			"permission_mode": "auto",
+		})
+		nodeclient.RunHook(context.Background(), []string{nodeclient.PluginPermissionFlag}, bytes.NewReader(inJSON), &out)
+		hookOutCh2 <- out.String()
+	}()
+	waitFor(t, "second AskUserQuestion card", func() bool {
+		return len(n.outsidePermCards()) == 1
+	})
+	sendRes, err := request(t, n, "session.send", map[string]any{
+		"session_id":  sidA,
+		"text":        "这些都需要吗",
+		"owner_input": true,
+	})
+	if err != nil {
+		t.Fatalf("free-text session.send during AskUserQuestion: %v", err)
+	}
+	if sendRes["delivered_as"] != "user_input" || sendRes["queued"] == true {
+		t.Fatalf("expected direct user_input delivery (not queued), got %+v", sendRes)
+	}
+	select {
+	case line := <-hookOutCh2:
+		var parsed struct {
+			HookSpecificOutput struct {
+				Decision map[string]any `json:"decision"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &parsed); err != nil {
+			t.Fatalf("unmarshal interrupted AskUserQuestion stdout %q: %v", line, err)
+		}
+		if parsed.HookSpecificOutput.Decision["behavior"] != "deny" || parsed.HookSpecificOutput.Decision["interrupt"] != true {
+			t.Fatalf("expected AskUserQuestion hook aborted with deny+interrupt, got %+v", parsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AskUserQuestion hook abort on free-text reply")
+	}
+	select {
+	case txt := <-deliveredTexts:
+		if txt != "这些都需要吗" {
+			t.Fatalf("unexpected plugin text: %q", txt)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for plugin prompt delivery")
+	}
+	if got := len(inbox.users()); got != 0 {
+		t.Fatalf("expected 0 peer inbox messages on free-text reply during AskUserQuestion, got %d", got)
+	}
+
+	// 3. When a modern (`busy_input`) plugin rejects a send, sendOutside returns an error instead of falling back to Peer Inbox.
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "idle", inbox, nil)
+	rejectNext <- true
+	if _, err := request(t, n, "session.send", map[string]any{
+		"session_id":  sidA,
+		"text":        "do not relay to peer inbox",
+		"owner_input": true,
+	}); err == nil {
+		t.Fatal("expected error when modern plugin rejects send")
+	}
+	if got := len(inbox.users()); got != 0 {
+		t.Fatalf("expected 0 peer inbox messages when modern plugin rejected send, got %d", got)
 	}
 }

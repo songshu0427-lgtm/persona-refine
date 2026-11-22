@@ -37,6 +37,9 @@ func (n *Node) outsideAskCards() []proto.Interaction {
 		if c.Status != "waiting" || seen[c.SessionID] || n.outsideSource(c) == "" || outsidePane(c) != "" {
 			continue
 		}
+		if n.ccPlugins.permissionBridgeCapable(c.SessionID, c.pid) || n.ccPerms.hasOpen(c.SessionID, c.pid) {
+			continue // Persona's plugin bridges AskUserQuestion directly via PermissionRequest (ccplugin_permission.go)
+		}
 		if p, has := peerOf(c); !has || !peerReachable(p) {
 			continue // nothing could answer it from the phone: the row says to answer on the computer
 		}
@@ -140,6 +143,19 @@ func (n *Node) outsideAnswer(ctx context.Context, session, id string, r proto.Re
 	text := outsideAnswerText(*card, r)
 	if text == "" {
 		return fmt.Errorf("没有回答任何一道题")
+	}
+	if c, ok := n.outsideClaude(session); ok && n.ccPlugins.busyInputCapable(session, c.pid) {
+		if n.ccPlugins.interruptCapable(session, c.pid) {
+			_, _ = n.ccPluginInterrupt(ctx, c, session)
+		}
+		cIdle := c
+		cIdle.Status = "idle"
+		okSend, why := n.ccPluginSend(ctx, cIdle, session, text)
+		if !okSend {
+			return uncertain(fmt.Errorf("Persona 插件未能提交问题回答（%s）", why))
+		}
+		n.cx.hold(session, id)
+		return nil
 	}
 	handled, err := n.sendOutsidePriority(ctx, session, text, nil, peerNow)
 	if !handled {

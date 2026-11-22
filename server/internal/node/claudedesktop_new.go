@@ -219,7 +219,8 @@ func (n *Node) newDesktopSession(ctx context.Context, p runtimeStartParams, name
 	}
 	log.Printf("new desktop session %s in %s: imported by the app", id, dir)
 	if strings.TrimSpace(p.Prompt) != "" {
-		go n.firstDesktopMessage(id, p.Prompt)
+		owner := ownerDeliveryOf(ctx) != nil
+		go n.firstDesktopMessage(id, p.Prompt, owner)
 	}
 	go n.notifySessions()
 	return &proto.Session{SessionID: id, Cwd: dir, Title: title, Agent: "claude", Status: proto.StatusIdle,
@@ -293,9 +294,15 @@ func stampDesktopMode(path, mode string) error {
 
 // firstDesktopMessage sends a new session's first message, as any message to a session of the app goes. A failure is
 // logged: the session is there, in the app and the list, for the message to be sent again.
-func (n *Node) firstDesktopMessage(id, text string) {
+func (n *Node) firstDesktopMessage(id, text string, owner bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), desktopFirstSendWait)
 	defer cancel()
+	if owner {
+		ctx, _ = withOwnerDelivery(ctx)
+		if n.desktopPluginReady() {
+			n.awaitDesktopPlugin(ctx, id, 2*time.Second)
+		}
+	}
 	if err := n.send(ctx, id, text, nil, sendOpts{}); err != nil {
 		log.Printf("new desktop session %s: the first message did not go in: %v", id, err)
 		return

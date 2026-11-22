@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -159,7 +160,10 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 		}
 		listed[id] = true
 		m := n.meta(p, st)
-		status, ok := claudeBgStatus[c.Status]
+		effStatus := n.effectiveOutsideStatus(c, p, st.Size())
+		cEff := c
+		cEff.Status = effStatus
+		status, ok := claudeBgStatus[effStatus]
 		if !ok {
 			status = proto.StatusUnknown
 		}
@@ -174,7 +178,7 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 			}
 		}
 		var hostStallReason string
-		if source == proto.SourceClaudeDesktop && c.Status == "busy" && outsidePane(c) == "" {
+		if source == proto.SourceClaudeDesktop && effStatus == "busy" && outsidePane(c) == "" {
 			if why := desktopHostStallReason(m.openTools, time.Now()); why != "" {
 				status = proto.StatusBlocked
 				hostStallReason = why
@@ -196,19 +200,21 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 			Model: n.shownModel(id, m.model), LastText: snippet(m.lastText), UpdatedAt: lastUsed(m, st), Rev: st.Size(), AgentSurface: m.surface,
 			AttentionReason: attention,
 		}
-		s.Capabilities, s.ReadOnlyReason = outsideCapabilities(c)
+		s.Capabilities, s.ReadOnlyReason = outsideCapabilities(cEff)
 		if permReason != "" && s.Capabilities != nil {
 			s.Capabilities.Approve = true
 			s.Capabilities.Interrupt = true
 		}
-		if s.Capabilities != nil && s.Capabilities.Send && n.ccPluginInput(id, c.pid) {
+		if s.Capabilities != nil && n.ccPluginInput(id, c.pid) {
+			s.Capabilities.Send = true
 			s.Capabilities.PluginInput = true // the owner's messages go in as their input (ccplugin.go)
+			s.ReadOnlyReason = ""
 			if n.ccPluginSettingsCapable(id, c.pid) {
 				s.Capabilities.Model = proto.Bool(true)
 				s.Efforts = slices.Clone(proto.EffortLevels)
 			}
 		}
-		if s.Capabilities != nil && (c.Status == "busy" || c.Status == "waiting") && n.ccPlugins.interruptCapable(id, c.pid) {
+		if s.Capabilities != nil && (effStatus == "busy" || effStatus == "waiting") && n.ccPlugins.interruptCapable(id, c.pid) {
 			s.Capabilities.Interrupt = true
 		}
 		// A claude in a tmux pane says where it runs ("tmux":"orc:@11.%11") and no hooks of Persona's run there: the
@@ -239,7 +245,7 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 		}
 		if status == proto.StatusBlocked && s.AttentionReason == "" {
 			s.AttentionReason = proto.AttentionClaudeComputer // no dialog read from a pane (yet)
-			if s.Capabilities != nil && s.Capabilities.Send && s.PaneID == "" && asking(c, m) {
+			if s.Capabilities != nil && s.Capabilities.Send && s.PaneID == "" && asking(cEff, m) {
 				s.AttentionReason = proto.AttentionClaudeAnswer // a message answers it (sendOutside)
 				// Its question is a card the apps answer (claudeoutside_ask.go): the answer goes as that message.
 				s.Capabilities.Approve = true
@@ -354,17 +360,57 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 	if forced == "" && pane != "" && ownerDeliveryOf(ctx) != nil {
 		return false, nil // the owner's own words go through send's ordinary tmux-pane checks and confirmation (#5965)
 	}
+	if strings.HasPrefix(strings.TrimSpace(text), "/") {
+		// Neither the plugin's prompt submit nor the inbox runs local TUI slash commands (/exit, /model, /clear).
+		if _, has := peerOf(c); has || (ownerDeliveryOf(ctx) != nil && n.ccPluginInput(id, c.pid)) {
+			return true, refusal(peerCommand, peerCommandMsg, nil)
+		}
+	}
+	path := n.transcriptPath(id)
+	var offset int64
+	var meta quickMeta
+	if path != "" {
+		if st, err := os.Stat(path); err == nil {
+			offset = st.Size()
+			meta = n.metaNow(path, st)
+		}
+	}
+	cEff := c
+	cEff.Status = n.effectiveOutsideStatus(c, path, offset)
+	// When Persona's modern plugin (`busy_input`) is connected, all owner messages — idle, busy, or replying in free text
+	// to an open AskUserQuestion — go exclusively through the plugin without ever falling back to the peer inbox.
+	if owner := ownerDeliveryOf(ctx); owner != nil && forced == "" && pane == "" && n.ccPlugins.busyInputCapable(id, c.pid) {
+		if len(images) > 0 {
+			paths, err := n.saveImages(images)
+			if err != nil {
+				return true, err
+			}
+			text = attachImages(text, paths)
+		}
+		if n.ccPerms.hasOpenKind(id, c.pid, proto.IxQuestion) {
+			n.outsideQuestionInterrupt(ctx, id, c.pid)
+			cEff.Status = "idle"
+		} else if asking(cEff, meta) && n.ccPlugins.interruptCapable(id, c.pid) {
+			_, _ = n.ccPluginInterrupt(ctx, cEff, id)
+			cEff.Status = "idle"
+		}
+		ok, why := n.ccPluginSend(ctx, cEff, id, text)
+		if !ok {
+			return true, uncertain(fmt.Errorf("Persona 插件未能提交这条消息（%s），请稍后重试", why))
+		}
+		log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
+		if cEff.Status == "busy" || cEff.Status == "waiting" {
+			markSendQueued(ctx)
+		}
+		owner.as, owner.reason = deliveredUserInput, ""
+		return true, nil
+	}
 	p, has := peerOf(c)
 	if !has {
 		if pane != "" {
 			return true, refusal(peerUnsupported, peerNoInboxMsg, nil) // nobody else's words may be typed into the pane
 		}
 		return false, nil
-	}
-	if strings.HasPrefix(strings.TrimSpace(text), "/") {
-		// The inbox runs no commands (Claude Code takes a peer's message with skipSlashCommands): /exit, /model or
-		// /clear would reach the model as words. Refused, so nothing looks done that was not.
-		return true, refusal(peerCommand, peerCommandMsg, nil)
 	}
 	if len(images) > 0 {
 		paths, err := n.saveImages(images)
@@ -377,27 +423,17 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 	// question's call ends unanswered) and runs the message; queued, it would wait behind the question until someone
 	// answered it on the computer. One waiting on a permission prompt or another dialog gets it queued as before: at
 	// now it would decline the prompt, which is the computer's to approve.
-	var offset int64
 	priority := forced
 	if priority == "" {
 		priority = peerNext
-	}
-	if path := n.transcriptPath(id); path != "" {
-		if st, err := os.Stat(path); err == nil {
-			offset = st.Size()
-			if forced == "" && asking(c, n.metaNow(path, st)) {
-				priority = peerNow
-			}
+		if asking(cEff, meta) {
+			priority = peerNow
 		}
 	}
-	// The owner's own message goes in as their input through Persona's plugin when the session has it (ccplugin.go),
-	// whether idle or queued behind a running turn; otherwise, and when the plugin does not take it, through the inbox.
+	// Legacy 0.1.0 plugins (no `busy_input`) accept idle owner messages and fall back to the inbox otherwise.
 	if owner := ownerDeliveryOf(ctx); owner != nil && forced == "" && priority == peerNext {
-		if ok, why := n.ccPluginSend(ctx, c, id, text); ok {
+		if ok, why := n.ccPluginSend(ctx, cEff, id, text); ok {
 			log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
-			if c.Status == "busy" {
-				markSendQueued(ctx)
-			}
 			owner.as, owner.reason = deliveredUserInput, ""
 			return true, nil
 		} else {
@@ -524,8 +560,8 @@ func (n *Node) interruptOutside(ctx context.Context, id string) (handled bool, e
 		if n.outsidePermInterrupt(ctx, id, c.pid) {
 			return true, nil
 		}
-		if (c.Status == "busy" || c.Status == "waiting") && n.ccPluginInterrupt(ctx, c, id) {
-			return true, nil
+		if handled, err := n.ccPluginInterrupt(ctx, c, id); handled {
+			return true, err
 		}
 	}
 	p, has := peerOf(c)

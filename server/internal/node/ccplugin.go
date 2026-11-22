@@ -140,6 +140,9 @@ type ccPluginSession struct {
 	version, engine string
 	caps            ccPluginCaps
 	seen            time.Time
+	// abortedRev is the transcript byte size when an owner interrupt (or `no_turn` ack) settled the turn while
+	// `sessions/<pid>.json` remained `"busy"` / `"waiting"`; -1 when not overridden.
+	abortedRev int64
 	// poll is the waiting poll's hand-off, nil while none waits; done ends it early (a newer poll).
 	poll chan ccPluginDelivery
 	done chan struct{}
@@ -176,7 +179,7 @@ func (r *ccPluginRegistry) polled(id string, pid int, version, engine string, ca
 	s := r.sessions[id]
 	isNew := false
 	if s == nil || s.pid != pid {
-		s = &ccPluginSession{pid: pid, acks: map[string]chan ccPluginAck{}}
+		s = &ccPluginSession{pid: pid, abortedRev: -1, acks: map[string]chan ccPluginAck{}}
 		r.sessions[id] = s
 		isNew = true
 	}
@@ -246,6 +249,51 @@ func (r *ccPluginRegistry) interruptCapable(id string, pid int) bool {
 	defer r.mu.Unlock()
 	s := r.sessions[id]
 	return s != nil && s.pid == pid && s.caps.interrupt && (s.poll != nil || time.Since(s.seen) < ccPluginStale)
+}
+
+// permissionBridgeCapable reports whether session id's polling plugin bridges PermissionRequest dialogs via hooks.json.
+func (r *ccPluginRegistry) permissionBridgeCapable(id string, pid int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.sessions[id]
+	return s != nil && s.pid == pid && s.caps.permissionBridge && (s.poll != nil || time.Since(s.seen) < ccPluginStale)
+}
+
+// markAborted records the transcript byte size at which session id's turn was aborted so a stale `"busy"` / `"waiting"`
+// status in `sessions/<pid>.json` reads as `"idle"` until a new user prompt starts another turn.
+func (r *ccPluginRegistry) markAborted(id string, pid int, rev int64) {
+	if rev < 0 {
+		rev = 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sessions == nil {
+		r.sessions = map[string]*ccPluginSession{}
+	}
+	s := r.sessions[id]
+	if s == nil || s.pid != pid {
+		s = &ccPluginSession{pid: pid, abortedRev: rev, seen: time.Now(), acks: map[string]chan ccPluginAck{}}
+		r.sessions[id] = s
+		return
+	}
+	s.abortedRev = rev
+}
+
+func (r *ccPluginRegistry) clearAborted(id string, pid int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s := r.sessions[id]; s != nil && s.pid == pid {
+		s.abortedRev = -1
+	}
+}
+
+func (r *ccPluginRegistry) abortedRev(id string, pid int) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s := r.sessions[id]; s != nil && s.pid == pid {
+		return s.abortedRev
+	}
+	return -1
 }
 
 // queueSettings stores desired model/effort settings for session id so the next settings-capable poll receives them
@@ -652,18 +700,104 @@ func ownerDeliveryOf(ctx context.Context) *ownerDelivery {
 	return d
 }
 
+// effectiveOutsideStatus returns c.Status unless a recent plugin abort settled the turn while `sessions/<pid>.json`
+// stayed stuck at `"busy"` / `"waiting"` without any new user prompt arriving in the transcript.
+func (n *Node) effectiveOutsideStatus(c claudeProc, transcriptPath string, rev int64) string {
+	if c.Status != "busy" && c.Status != "waiting" {
+		n.ccPlugins.clearAborted(c.SessionID, c.pid)
+		return c.Status
+	}
+	aborted := n.ccPlugins.abortedRev(c.SessionID, c.pid)
+	if aborted < 0 {
+		return c.Status
+	}
+	if transcriptPath == "" {
+		transcriptPath = n.transcriptPath(c.SessionID)
+	}
+	if rev <= 0 && transcriptPath != "" {
+		rev = fileSizeOrZero(transcriptPath)
+	}
+	if rev > aborted && transcriptHasNewTurnSince(transcriptPath, aborted) {
+		n.ccPlugins.clearAborted(c.SessionID, c.pid)
+		return c.Status
+	}
+	return "idle"
+}
+
+func transcriptHasNewTurnSince(path string, offset int64) bool {
+	if path == "" || offset < 0 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return false
+	}
+	sc := bufio.NewScanner(io.LimitReader(f, 512<<10))
+	sc.Buffer(make([]byte, 0, 16<<10), 512<<10)
+	for sc.Scan() {
+		var row struct {
+			Type        string          `json:"type"`
+			Operation   string          `json:"operation"`
+			IsSidechain bool            `json:"isSidechain"`
+			Message     json.RawMessage `json:"message"`
+		}
+		if json.Unmarshal(sc.Bytes(), &row) != nil || row.IsSidechain {
+			continue
+		}
+		if row.Type == "queue-operation" && row.Operation == "enqueue" {
+			return true
+		}
+		if row.Type == "user" && isUserPromptMessage(row.Message) {
+			return true
+		}
+	}
+	return false
+}
+
+func isUserPromptMessage(raw json.RawMessage) bool {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &m) != nil || len(m.Content) == 0 {
+		return false
+	}
+	trimmed := bytes.TrimLeft(m.Content, " \t\r\n")
+	if len(trimmed) == 0 {
+		return false
+	}
+	if trimmed[0] == '"' {
+		return true
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(trimmed, &blocks) != nil || len(blocks) == 0 {
+		return false
+	}
+	for _, b := range blocks {
+		if b.Type != "tool_result" {
+			return true
+		}
+	}
+	return false
+}
+
 // ccPluginSend hands text, the owner's own message, to the plugin in claude c, which has session id open. true when the
 // session took it as the person's input: the transcript shows the prompt (or its queue entry), or the plugin said it
-// submitted it. false with why it did not, nothing submitted (the caller sends it through the inbox).
+// submitted it. false with why it did not, nothing submitted.
 func (n *Node) ccPluginSend(ctx context.Context, c claudeProc, id, text string) (bool, string) {
 	if n.ccPlugins.session(id, c.pid) == nil {
 		return false, relayNoPlugin
 	}
 	switch {
 	case claudeBgStatus[c.Status] == proto.StatusIdle:
-	case c.Status == "busy" && n.ccPlugins.busyInputCapable(id, c.pid):
+	case (c.Status == "busy" || c.Status == "waiting") && n.ccPlugins.busyInputCapable(id, c.pid):
 	default:
-		return false, relayBusy // behind a dialog, or an older plugin that awaits turn completion on submit
+		return false, relayBusy // behind a dialog on a 0.1.0 plugin that awaits turn completion on submit
 	}
 	path := n.transcriptPath(id)
 	var offset int64
@@ -684,13 +818,16 @@ func (n *Node) ccPluginSend(ctx context.Context, c claudeProc, id, text string) 
 			path = n.transcriptPath(id)
 		}
 		if path != "" && ccPluginSeen(path, offset, needle) {
+			n.ccPlugins.clearAborted(id, c.pid)
 			return true, ""
 		}
-		if submitted && c.Status == "busy" {
+		if submitted && (c.Status == "busy" || c.Status == "waiting") {
+			n.ccPlugins.clearAborted(id, c.pid)
 			return true, "" // queued via $.prompt.submit while a turn runs; ack confirmed acceptance
 		}
 		if time.Now().After(deadline) {
 			if submitted {
+				n.ccPlugins.clearAborted(id, c.pid)
 				return true, "" // its turn started with it (the plugin's submit resolves then); the line is late
 			}
 			log.Printf("send %s: the plugin took it and nothing showed it went in within %s", id, ccPluginConfirmWait)
@@ -711,11 +848,19 @@ func (n *Node) ccPluginSend(ctx context.Context, c claudeProc, id, text string) 
 }
 
 // ccPluginInterrupt asks Persona's plugin in claude c to abort the running main-loop turn via $.turn.abort.
-// Returns true when the plugin confirmed the abort (or the turn settled while the abort was in flight); false when no
-// interrupt-capable plugin answered or it declined, leaving interruptOutside to fall back to the peer inbox.
-func (n *Node) ccPluginInterrupt(ctx context.Context, c claudeProc, id string) bool {
-	if (c.Status != "busy" && c.Status != "waiting") || !n.ccPlugins.interruptCapable(id, c.pid) {
-		return false
+// When an interrupt-capable plugin is connected to session id, handled is always true so interruptOutside never falls
+// back to the peer inbox (which would wake an idle session if `sessions/<pid>.json` had a stale `"busy"` status).
+func (n *Node) ccPluginInterrupt(ctx context.Context, c claudeProc, id string) (handled bool, err error) {
+	if !n.ccPlugins.interruptCapable(id, c.pid) {
+		return false, nil
+	}
+	if c.Status != "busy" && c.Status != "waiting" {
+		n.ccPlugins.clearAborted(id, c.pid)
+		return true, nil
+	}
+	tpath := n.transcriptPath(id)
+	if n.effectiveOutsideStatus(c, tpath, fileSizeOrZero(tpath)) == "idle" {
+		return true, nil
 	}
 	req := ccPluginInterrupt{
 		ID:         strings.ReplaceAll(newUUID(), "-", ""),
@@ -724,27 +869,35 @@ func (n *Node) ccPluginInterrupt(ctx context.Context, c claudeProc, id string) b
 	acks := n.ccPlugins.expect(id, req.ID)
 	defer n.ccPlugins.settle(id, req.ID)
 	if !n.ccPlugins.handOver(ctx, id, c.pid, ccPluginDelivery{Messages: []ccPluginMessage{}, Interrupt: &req}, ccPluginPickupWait) {
-		return false
+		return true, uncertain(fmt.Errorf("Persona 插件未能在 %s 内接收停止指令", ccPluginPickupWait))
 	}
 	deadline := time.Now().Add(ccPluginSubmitWait)
 	for {
 		if now, ok := n.outsideClaude(id); !ok || (now.Status != "busy" && now.Status != "waiting") {
+			n.ccPlugins.clearAborted(id, c.pid)
+			n.notifySessions()
 			log.Printf("interrupt %s: claude %d settled after Persona's plugin took the stop", id, c.pid)
-			return true
+			return true, nil
 		}
 		if time.Now().After(deadline) {
-			return false
+			return true, uncertain(fmt.Errorf("Persona 插件停止指令等待确认超时"))
 		}
 		select {
 		case a := <-acks:
-			if a.Submitted {
-				log.Printf("interrupt %s: claude %d aborted its turn through Persona's plugin", id, c.pid)
-				return true
+			if a.Submitted || a.Reason == "no_turn" {
+				n.ccPlugins.markAborted(id, c.pid, fileSizeOrZero(n.transcriptPath(id)))
+				n.notifySessions()
+				if a.Submitted {
+					log.Printf("interrupt %s: claude %d aborted its turn through Persona's plugin", id, c.pid)
+				} else {
+					log.Printf("interrupt %s: claude %d plugin reported no active turn; marking stale %s status idle", id, c.pid, c.Status)
+				}
+				return true, nil
 			}
-			log.Printf("interrupt %s: the plugin did not abort (%s); falling back to inbox", id, a.Reason)
-			return false
+			log.Printf("interrupt %s: the plugin did not abort (%s)", id, a.Reason)
+			return true, uncertain(fmt.Errorf("Persona 插件未能停止当前轮次（%s）", a.Reason))
 		case <-ctx.Done():
-			return false
+			return true, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
