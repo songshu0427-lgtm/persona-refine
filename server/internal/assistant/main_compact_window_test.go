@@ -23,7 +23,7 @@ func TestMainCompactWindowGoesWithTheMainConversation(t *testing.T) {
 		set  *int
 		want int
 	}{
-		{"unset", nil, 400_000},
+		{"unset", nil, 200_000},
 		{"off", ptr(0), 0},
 		{"saved", ptr(250_000), 250_000},
 	} {
@@ -132,7 +132,7 @@ func TestMainCompactWindowSetting(t *testing.T) {
 	for _, o := range s.ownSettings() {
 		if o.Key == "assistant.main_compact_window" {
 			key = o.Key
-			if got, _ := o.get(ctx); got != "400000" {
+			if got, _ := o.get(ctx); got != "200000" {
 				t.Fatalf("get while unset: %s", got)
 			}
 		}
@@ -140,12 +140,12 @@ func TestMainCompactWindowSetting(t *testing.T) {
 	if key == "" || settingTitles[key] != "title_main_compact_window" {
 		t.Fatal("assistant.main_compact_window is not offered with its title")
 	}
-	for _, bad := range []string{`99999`, `10000001`, `-1`, `"400000"`, `1.5`, `null`} {
+	for _, bad := range []string{`99999`, `10000001`, `-1`, `"200000"`, `1.5`, `null`} {
 		if _, err := s.setMainCompactWindow(ctx, json.RawMessage(bad)); err == nil {
 			t.Fatalf("%s accepted", bad)
 		}
 	}
-	if c, err := s.setMainCompactWindow(ctx, json.RawMessage(`400000`)); err != nil || c.apply != nil {
+	if c, err := s.setMainCompactWindow(ctx, json.RawMessage(`200000`)); err != nil || c.apply != nil {
 		t.Fatalf("the default again: %+v %v", c, err)
 	}
 	c, err := s.setMainCompactWindow(ctx, json.RawMessage(`0`))
@@ -154,9 +154,9 @@ func TestMainCompactWindowSetting(t *testing.T) {
 	}
 	for _, l := range []i18n.Lang{i18n.En, i18n.ZhHans, i18n.Ja} {
 		want := i18n.T(l, "assistant-settings_tool.change_main_compact_window", i18n.Args{
-			"before": i18n.T(l, "assistant-settings_tool.main_compact_window_tokens", i18n.Args{"tokens": 400_000}),
+			"before": i18n.T(l, "assistant-settings_tool.main_compact_window_tokens", i18n.Args{"tokens": 200_000}),
 			"after":  i18n.T(l, "assistant-settings_tool.main_compact_window_launcher")})
-		if got := c.card(l); got != want || strings.Contains(got, "{") || !strings.Contains(got, "400000") {
+		if got := c.card(l); got != want || strings.Contains(got, "{") || !strings.Contains(got, "200000") {
 			t.Fatalf("%s card: %q", l, got)
 		}
 	}
@@ -178,5 +178,20 @@ func TestMainCompactWindowSetting(t *testing.T) {
 	// A saved value out of range (written by hand) is not sent on: the default is.
 	if got := mainCompactWindowOf(Settings{MainCompactWindow: ptr(5)}); got != defaultMainCompactWindow {
 		t.Fatalf("an out-of-range saved value: %d", got)
+	}
+}
+
+func TestSpillDigestText(t *testing.T) {
+	shortText := "All checks passed; PR merged."
+	if got := spillDigestText(shortText, digestSpillRunes); got != shortText {
+		t.Fatalf("short text modified: %q", got)
+	}
+	longText := strings.Repeat("头", 600) + strings.Repeat("尾", 600)
+	got := spillDigestText(longText, digestSpillRunes)
+	if len([]rune(got)) > digestSpillRunes {
+		t.Fatalf("spillDigestText length %d exceeds budget %d", len([]rune(got)), digestSpillRunes)
+	}
+	if !strings.HasPrefix(got, "头头头") || !strings.HasSuffix(got, "尾尾尾") || !strings.Contains(got, "agent_read") {
+		t.Fatalf("unexpected spilled text: %q", got)
 	}
 }

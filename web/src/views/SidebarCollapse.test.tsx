@@ -256,7 +256,13 @@ describe("folding a block of the sidebar", () => {
     expect(button("新建 Agent")).toBeDefined();
   });
 
-  it("offers the groupings as segments above the quick filter, 按待办 first and the default (#2812)", async () => {
+  it("tucks the grouping bar away under urgency default, showing segments once a non-state grouping is chosen", async () => {
+    act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
+    await flush();
+    expect(host.querySelector('[role="radiogroup"][aria-label="Agent 分组"]')).toBeNull();
+    localStorage.setItem("persona.agentGrouping", "todo");
+    act(() => root.unmount());
+    root = createRoot(host);
     act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
     await flush();
     const bar = host.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Agent 分组"]')!;
@@ -269,15 +275,15 @@ describe("folding a block of the sidebar", () => {
     expect(localStorage.getItem("persona.agentGrouping")).toBe("machine");
     expect(segs[1].getAttribute("aria-checked")).toBe("true");
     expect(segs[0].getAttribute("aria-checked")).toBe("false");
-    // no dropdown on the title row any more
-    expect(host.querySelector('button[aria-haspopup="menu"][aria-label^="Agent 分组"]')).toBeNull();
   });
 
-  it("keeps a grouping chosen before", async () => {
+  it("keeps a grouping chosen before in the list menu", async () => {
     localStorage.setItem("persona.agentGrouping", "state");
     act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
     await flush();
-    expect(host.querySelector('[role="radio"][aria-label="按状态"]')!.getAttribute("aria-checked")).toBe("true");
+    act(() => button("Agent 列表选项")!.click());
+    const stateItem = [...document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')].find((el) => el.textContent?.includes("按状态"))!;
+    expect(stateItem.getAttribute("aria-checked")).toBe("true");
   });
 
   it("starts as it was left", async () => {
@@ -302,26 +308,29 @@ describe("folding a block of the sidebar", () => {
 describe("ordering the Agents list (G099)", () => {
   const item = (label: string) => [...document.querySelectorAll<HTMLElement>('[role^="menuitem"]')].find((el) => el.textContent?.includes(label));
 
-  it("offers 状态优先 / 最近更新 under the grouping and keeps the choice", async () => {
+  it("offers 状态优先 / 最近更新 under non-state groupings and keeps the choice", async () => {
+    localStorage.setItem("persona.agentGrouping", "machine");
     act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
     await flush();
     act(() => button("Agent 列表选项")!.click());
     expect(item("状态优先")).toBeDefined();
-    expect(item("按机器")).toBeUndefined(); // the groupings are the segments now (#2812)
+    expect(item("按机器")).toBeDefined();
     act(() => item("最近更新")!.click());
     await flush();
     expect(localStorage.getItem("persona.agentSort")).toBe("updated");
     expect(button("Agent 列表选项：最近更新")).toBeDefined();
   });
 
-  it("is not offered under 按状态, whose sections are the states, and a menu with nothing left is not there (#6447)", async () => {
+  it("omits sorts under 按状态 while keeping grouping choices in the list menu", async () => {
     localStorage.setItem("persona.agentGrouping", "state");
     localStorage.setItem("persona.agentSort", "updated");
     await withAgent();
     act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
     await flush();
-    expect(host.querySelector('[role="radio"][aria-label="按状态"]')!.getAttribute("aria-checked")).toBe("true");
-    expect(host.querySelector('[aria-label^="Agent 列表选项"]')).toBeNull();
+    expect(host.querySelector('[aria-label^="Agent 列表选项"]')).not.toBeNull();
+    act(() => button("Agent 列表选项")!.click());
+    expect(item("状态优先")).toBeUndefined();
+    expect(item("按状态")).toBeDefined();
     expect(host.querySelector("[data-sidebar-agents-controls] [data-testid=agents-fold-all]")).not.toBeNull();
   });
 });
@@ -334,7 +343,7 @@ describe("the Agents fold-all button (#3027, #6447)", () => {
     act(() => menu.click());
     await flush();
     const item = (label: string) => [...document.querySelectorAll<HTMLElement>("[role=menuitem], [role=menuitemradio], [role=menuitemcheckbox]")].find((el) => el.textContent?.includes(label));
-    expect(item("状态优先")).toBeDefined();
+    expect(item("按状态")).toBeDefined();
     expect(item("全部折叠")).toBeUndefined();
     expect(item("全部展开")).toBeUndefined();
   });

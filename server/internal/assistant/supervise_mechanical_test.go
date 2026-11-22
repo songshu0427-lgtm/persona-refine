@@ -304,7 +304,11 @@ func TestSendDigestRoutesOpenReviewForSupervision(t *testing.T) {
 	f.hello.Assistant.MachineID = "server"
 	f.setSessions("server", proto.Session{SessionID: "conv1", MachineID: "server", Assistant: true, Status: proto.StatusIdle})
 	f.known["conv1"] = true
-	setSettings(t, s, func(v *Settings) { v.Main, v.MachineID, v.MainMachineID = "conv1", "server", "server" })
+	setSettings(t, s, func(v *Settings) {
+		off := false
+		v.MainSupervisesOwnTasks = &off
+		v.Main, v.MachineID, v.MainMachineID = "conv1", "server", "server"
+	})
 	b := &s.supervise
 	b.mu.Lock()
 	b.init()

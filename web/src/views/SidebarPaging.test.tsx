@@ -103,38 +103,39 @@ afterEach(() => {
 for (const paged of [false, true]) {
   describe(`sidebar with paging ${paged ? "supported" : "unavailable"}`, () => {
     it("keeps session pins beyond the first page in their own section", async () => {
-      await render(paged, { sessions: ["computer/Beyond first page"], spaces: [] });
+      await render(paged, { sessions: ["computer/Beyond first page"], spaces: [] }, "todo");
       expect(grouping()).not.toBeNull();
       expect(host.textContent).toContain("置顶");
       expect(host.textContent).toContain(tail.title);
       expect(host.querySelectorAll('a[href*="Beyond%20first%20page"]')).toHaveLength(1);
     });
     it("keeps pinned workspaces", async () => {
-      await render(paged, { sessions: [], spaces: ["computer/Demo project"] });
+      await render(paged, { sessions: [], spaces: ["computer/Demo project"] }, "todo");
       expect(grouping()).not.toBeNull();
       expect(host.textContent).toContain(tail.title);
     });
-    it.each(["machine", "space", "repo", "state", "todo"])("honors saved %s grouping under the same bar", async (saved) => {
+    it.each(["machine", "space", "repo", "state", "todo"])("honors saved %s grouping", async (saved) => {
       const { fetch } = await render(paged, emptyPins, saved);
-      expect(chosen()).toBe({ todo: "待办", machine: "机器", repo: "仓库", space: "项目", state: "状态" }[saved]);
+      if (saved !== "state") expect(chosen()).toBe({ todo: "待办", machine: "机器", repo: "仓库", space: "项目" }[saved]);
+      else expect(grouping()).toBeNull();
       expect(localStorage.getItem("persona.agentGrouping")).toBe(saved);
-      // every grouping but By repository is paged where the hub pages (#6662)
-      const complete = !paged || saved === "repo";
+      // urgency (state) and By repository read the complete list so dispatched Workers and worktrees separate cleanly
+      const complete = !paged || saved === "repo" || saved === "state";
       expect(Boolean(pagedList())).toBe(!complete);
       expect(completeReads(fetch).length > 0).toBe(complete);
       if (complete) expect(host.textContent).toContain(tail.title);
     });
-    it("opens on By to-do, paged where the hub pages, with the same bar either way", async () => {
+    it("opens on urgency (state) by default without the grouping bar", async () => {
       const { fetch } = await render(paged);
-      expect(chosen()).toBe("待办");
-      expect(Boolean(pagedList())).toBe(paged);
-      expect(completeReads(fetch).length > 0).toBe(!paged);
+      expect(grouping()).toBeNull();
+      expect(Boolean(pagedList())).toBe(false);
+      expect(completeReads(fetch).length > 0).toBe(true);
     });
   });
 }
 
 it("reacts to pins saved while the paged list is mounted, then releases the fallback, the bar unchanged", async () => {
-  await render(true);
+  await render(true, emptyPins, "todo");
   expect(pagedList()).not.toBeNull();
   expect(chosen()).toBe("待办");
   await act(async () => savePins({ sessions: ["computer/Beyond first page"], spaces: [] }));
@@ -149,7 +150,7 @@ it("reacts to pins saved while the paged list is mounted, then releases the fall
 });
 
 it("honors the grouping shortcut while the paged list is mounted", async () => {
-  await render(true);
+  await render(true, emptyPins, "todo");
   act(() => { cycleGrouping(); });
   await flush();
   expect(localStorage.getItem("persona.agentGrouping")).toBe("machine");
@@ -158,7 +159,7 @@ it("honors the grouping shortcut while the paged list is mounted", async () => {
 });
 
 it("has no search field of its own: ⌘K's words are the paged list's search, a chip whose × takes them off (#6589)", async () => {
-  const { fetch } = await render(true);
+  const { fetch } = await render(true, emptyPins, "todo");
   expect(pagedList()).not.toBeNull();
   expect(host.querySelector("[data-sidebar-agents] input")).toBeNull();
   act(() => filterAgentList("review"));
@@ -174,7 +175,7 @@ it("has no search field of its own: ⌘K's words are the paged list's search, a 
 });
 
 it("scopes sidebar pages, counts and deltas while keeping the shared session list complete", async () => {
-  const { fetch, moveToAssistant } = await render(true);
+  const { fetch, moveToAssistant } = await render(true, emptyPins, "todo");
   expect(runtimeAgents.getSnapshot().rows.map((s) => s.title)).toEqual([first.title]);
   expect(runtimeAgents.getSnapshot().total).toBe(2);
   expect(runtimeAgents.getSnapshot().counts?.state).toEqual({ working: 2 });
@@ -194,7 +195,7 @@ it("scopes sidebar pages, counts and deltas while keeping the shared session lis
 });
 
 it("uses the complete Agents list when the hub supports paging without the Agents filter", async () => {
-  const { fetch } = await render(true, emptyPins, undefined, false);
+  const { fetch } = await render(true, emptyPins, "todo", false);
   expect(grouping()).not.toBeNull();
   expect(host.textContent).toContain(tail.title);
   expect(host.textContent).toContain(first.title);

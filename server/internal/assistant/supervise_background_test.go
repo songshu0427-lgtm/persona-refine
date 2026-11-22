@@ -24,6 +24,8 @@ func newBackgroundService(t *testing.T) (*Service, *fakeHub, Todo) {
 	t.Helper()
 	s, f, todo := newSupervisedService(t)
 	s.noBackground = false
+	off := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 	f.mu.Lock()
 	f.made = 100
 	f.mu.Unlock()
@@ -274,10 +276,14 @@ func TestBackgroundSupervisorIsAnnouncedOnce(t *testing.T) {
 // made and the main conversation gets the message. Switched on later, the signals raised from then on go to the main
 // conversation at once, and the task keeps its ledger.
 func TestMainSupervisesOwnTasksSetting(t *testing.T) {
-	s, f, todo := newBackgroundService(t)
+	s, f, todo := newSupervisedService(t)
+	s.noBackground = false
+	f.mu.Lock()
+	f.made = 100
+	f.mu.Unlock()
 	ctx := context.Background()
-	if v := s.view(ctx, false); v.MainSupervisesOwnTasks {
-		t.Fatal("the default is that the main conversation supervises its own tasks")
+	if v := s.view(ctx, false); !v.MainSupervisesOwnTasks || !s.mainSupervisesOwnTasks(ctx) {
+		t.Fatal("the default should be single-brain main-conversation supervision")
 	}
 	on := true
 	w, v := permissionSettingsRequest(t, s, "PUT", "/api/v1/assistant", "", "full", `{"main_supervises_own_tasks":true,"background_supervisor":"conv2"}`)
@@ -500,7 +506,11 @@ func TestAsksOfUnledTasksGoToTheBackgroundSupervisor(t *testing.T) {
 		{SessionID: "bg1", MachineID: "server", Cwd: assistantHome, Assistant: true, Status: proto.StatusIdle}}
 	e.sessions("server", convs...)
 	e.f.setSessions("server", convs...)
-	setSettings(t, e.s, func(v *Settings) { v.BackgroundSupervisor, v.BackgroundSupervisorMachineID = "bg1", "server" })
+	setSettings(t, e.s, func(v *Settings) {
+		off := false
+		v.MainSupervisesOwnTasks = &off
+		v.BackgroundSupervisor, v.BackgroundSupervisorMachineID = "bg1", "server"
+	})
 	// The task is the main conversation's, not the leader's.
 	if _, _, err := e.s.updateSupervision(ctx, e.todo.ID, func(v *Supervision) bool { v.Supervisor = "conv1"; return true }); err != nil {
 		t.Fatal(err)
@@ -565,7 +575,11 @@ func TestAsksOfUnledTasksGoToTheBackgroundSupervisor(t *testing.T) {
 func TestBackgroundSupervisorAloneDoesNotRouteAsks(t *testing.T) {
 	e := newRouteEnv(t, nil, false)
 	e.s.noBackground = false
-	setSettings(t, e.s, func(v *Settings) { v.BackgroundSupervisor, v.BackgroundSupervisorMachineID = "bg1", "server" })
+	setSettings(t, e.s, func(v *Settings) {
+		off := false
+		v.MainSupervisesOwnTasks = &off
+		v.BackgroundSupervisor, v.BackgroundSupervisorMachineID = "bg1", "server"
+	})
 	if _, _, _, ok := e.s.askLadder(context.Background(), "mac", "worker-1"); ok {
 		t.Fatal("a card is routed with no leader conversation")
 	}
@@ -749,6 +763,8 @@ func TestGoldenBackgroundSupervisor(t *testing.T) {
 	s.kb.dir = "<hub>/data"
 	off := s.claudeMD(context.Background(), "server", false)
 	s.noBackground = false
+	bgOn := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &bgOn })
 	on := s.claudeMD(context.Background(), "server", false)
 	golden(t, "assistant_claude_md.background", on)
 	for _, common := range []string{off, on} {

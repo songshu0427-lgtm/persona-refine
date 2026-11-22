@@ -67,7 +67,7 @@ describe("child sessions counted once, under their parent (#5120)", () => {
     const groups = Object.fromEntries(buildAgentGroups(shown, machines, "state", mutes).map((g) => [g.key, keys(g.sessions)]));
     expect(groups["state:needs"]).toEqual(["lead"]);
     expect(groups["state:working"]).toEqual(["orphan"]);
-    expect(groups["state:unread"]).toEqual(["plain"]);
+    expect(groups["state:recent"]).toEqual(["plain"]);
     const filters = filterCounts(splitAgentSessions(shown, machines).live, mutes);
     expect([filters.needs, filters.working, filters.unread]).toEqual([NEEDS, WORKING, UNREAD]);
   });

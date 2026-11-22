@@ -35,6 +35,8 @@ func newRoundService(t *testing.T) (*Service, *fakeHub, Todo, Store) {
 	st := planUpdateStore{&planMemStore{memStore: &memStore{}, plans: map[string]db.TaskPlanRow{}}}
 	s, f, todo := newSupervisedServiceOn(t, st)
 	s.noBackground = false
+	off := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 	f.mu.Lock()
 	f.made = 100
 	f.mu.Unlock()
@@ -349,6 +351,8 @@ func TestBackgroundQueuedWakeAfterManagerRestart(t *testing.T) {
 	var st Store = database
 	s, f, todo := newSupervisedServiceOn(t, st)
 	s.noBackground = false
+	off := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 	f.mu.Lock()
 	f.made = 100
 	f.mu.Unlock()

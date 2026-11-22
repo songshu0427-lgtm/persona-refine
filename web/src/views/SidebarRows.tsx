@@ -407,6 +407,9 @@ export const SessionRow = memo(function SessionRow({ s: row, k, reg, hover, acti
         </span>
       )}
       {host && <span className={cx("shrink-0 rounded bg-hover px-1 text-[10px] leading-4 text-ink-3", aside)}>{host}</span>}
+      {showState && !s.assistant && s.started_by_persona && st === "working" && (
+        <span data-persona-dispatched title={t("sidebar.persona_dispatched")} className={cx("shrink-0 rounded bg-hover px-1 text-[10px] leading-4 text-ink-3", aside)}>Persona</span>
+      )}
       {showTodoTag && s.todo && (
         <span
           className={cx("flex shrink-0 items-center justify-center rounded bg-hover px-1 py-0.5 text-ink-3", aside)}

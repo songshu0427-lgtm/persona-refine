@@ -15,7 +15,7 @@ export function pagedAgentList(o: { bounded: boolean; byTodo: boolean; todosSupp
   const grouping = agentGrouping(o.stored);
   // a hub without todos shows by machine, a by-todo choice kept for when it has them
   const shown = !o.todosSupported && grouping === "todo" ? "machine" : grouping;
-  return o.bounded && !o.several && o.pins.sessions.length === 0 && o.pins.spaces.length === 0 && shown !== "repo" && (shown !== "todo" || o.byTodo);
+  return o.bounded && !o.several && o.pins.sessions.length === 0 && o.pins.spaces.length === 0 && shown !== "repo" && shown !== "state" && (shown !== "todo" || o.byTodo);
 }
 
 // ── fold all / open all ──────────────────────────────────

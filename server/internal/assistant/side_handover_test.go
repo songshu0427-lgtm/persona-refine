@@ -113,6 +113,8 @@ func TestReviewLeftWaitingByASideConversationGoesToTheBackgroundSupervisor(t *te
 	s, f, todo := sideReviewFixture(t)
 	ctx := context.Background()
 	s.noBackground = false
+	off := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 	f.mu.Lock()
 	f.made = 100 // the conversations the fake starts get ids from s101 on, not the agent's
 	f.mu.Unlock()

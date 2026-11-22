@@ -440,6 +440,8 @@ func TestBackgroundRoundAsksTheOwnerWithNeedsUser(t *testing.T) {
 			if bot {
 				s, f, todo, posts, _ = conclusionService(t, false)
 				s.noBackground = false
+				off := false
+				setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 				f.mu.Lock()
 				f.made = 100
 				f.mu.Unlock()

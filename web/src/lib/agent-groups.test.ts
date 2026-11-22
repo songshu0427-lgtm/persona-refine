@@ -16,31 +16,49 @@ const ids = (sessions: Session[]) => sessions.map((s) => s.session_id);
 const mutes: AgentMutes = { spaces: ["machine-a/项目"], sessions: ["machine-a/muted-working", "machine-a/muted-needs", "machine-a/muted-idle", "machine-a/muted-waiting"], allowed: ["machine-a/allowed"] };
 
 describe("Agent 分组偏好", () => {
-  it("没选过的默认按待办，选过的（包括按机器）保持原样，并兼容未知的偏好", () => {
-    expect(agentGrouping(null)).toBe("todo");
-    expect(agentGrouping("invalid")).toBe("todo");
+  it("没选过的默认按紧急度（state），选过的保持原样，并兼容未知的偏好", () => {
+    expect(agentGrouping(null)).toBe("state");
+    expect(agentGrouping("invalid")).toBe("state");
     for (const value of ["repo", "space", "state", "machine", "todo"]) expect(agentGrouping(value)).toBe(value);
   });
 });
 
-describe("iOS 标准的状态分组", () => {
-  it("固定状态顺序，已看默认折叠，未知仍作为 live Agent", () => {
-    const all = [session("idle", "idle"), session("working", "working"), session("unread", "unread"), session("needs", "needs_you"),
-      session("waiting", "unknown", { loop: { kind: "cron" } }), session("unknown", "unknown"), session("muted-working", "working")];
-    const groups = buildAgentGroups(all, machines, "state", mutes);
-    expect(groups.map((g) => g.name)).toEqual(["需要你", "完成未看", "工作中", "待唤醒", "已屏蔽", "已看"]);
-    expect(ids(groups[5].sessions)).toEqual(["idle", "unknown"]);
-    expect(groups[5].folded).toBe(true);
-    expect(groups.slice(0, 5).every((g) => !g.folded)).toBe(true);
+describe("三层紧急度分组与手动会话保留", () => {
+  it("固定三层紧急度顺序（需要你 → 进行中 → 最近），手动会话 100% 展开保留，仅已完成 Persona 临时 Worker 默认折叠", () => {
+    const all = [
+      session("manual-idle", "idle"),
+      session("persona-done", "idle", { started_by_persona: true }),
+      session("persona-unread", "unread", { started_by_persona: true }),
+      session("persona-working", "working", { started_by_persona: true }),
+      session("persona-needs", "needs_you", { started_by_persona: true }),
+      session("manual-working", "working"),
+      session("manual-unread", "unread"),
+      session("waiting", "unknown", { loop: { kind: "cron" } }),
+      session("unknown", "unknown"),
+      session("muted-working", "working"),
+    ];
+    const offline = [
+      session("manual-offline", "offline", { updated_at: date(2) }),
+      session("persona-offline", "offline", { started_by_persona: true, updated_at: date(3) }),
+    ];
+    const groups = buildAgentGroups(all, machines, "state", mutes, offline);
+    expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "最近", "已屏蔽", "已完成的派出任务"]);
+    expect(ids(groups[0].sessions)).toEqual(["persona-needs"]);
+    expect(ids(groups[1].sessions)).toEqual(["manual-working", "persona-working", "waiting"]);
+    expect(ids(groups[2].sessions)).toEqual(["manual-unread", "manual-idle", "unknown", "manual-offline"]);
+    expect(groups.slice(0, 3).every((g) => !g.folded)).toBe(true);
+    expect(groups[3].folded).toBe(true);
+    expect(ids(groups[4].sessions)).toEqual(["persona-offline", "persona-done", "persona-unread"]);
+    expect(groups[4].folded).toBe(true);
   });
 
-  it("屏蔽的需要你仍排第一，普通已看不进入已屏蔽", () => {
+  it("屏蔽的需要你仍排第一，普通手动已看归入最近而不进入已屏蔽", () => {
     const groups = buildAgentGroups([session("muted-needs", "needs_you"), session("muted-idle", "idle"), session("muted-working", "working"),
       session("muted-waiting", "idle", { background: [{ id: "task", kind: "shell" }] })], machines, "state", mutes);
-    expect(groups.map((g) => g.name)).toEqual(["需要你", "已屏蔽", "已看"]);
+    expect(groups.map((g) => g.name)).toEqual(["需要你", "最近", "已屏蔽"]);
     expect(ids(groups[0].sessions)).toEqual(["muted-needs"]);
-    expect(ids(groups[1].sessions)).toEqual(["muted-waiting", "muted-working"]);
-    expect(ids(groups[2].sessions)).toEqual(["muted-idle"]);
+    expect(ids(groups[1].sessions)).toEqual(["muted-idle"]);
+    expect(ids(groups[2].sessions)).toEqual(["muted-waiting", "muted-working"]);
   });
 
   it("项目屏蔽按机器和名称生效，并支持 Agent 单独重新开启通知", () => {
@@ -71,7 +89,7 @@ describe("iOS 标准的状态分组", () => {
 
   it("只显示非空状态组", () => {
     expect(buildAgentGroups([], machines, "state")).toEqual([]);
-    expect(buildAgentGroups([session("working", "working")], machines, "state").map((g) => g.name)).toEqual(["工作中"]);
+    expect(buildAgentGroups([session("working", "working")], machines, "state").map((g) => g.name)).toEqual(["进行中"]);
   });
 });
 
@@ -127,14 +145,14 @@ describe("待你回复（#5096）", () => {
     expect(isQuiet(asking("muted-idle"), mutes)).toBe(true);
   });
 
-  it("按状态：需要你 → 完成未看 → 待你回复 → 工作中 → 待唤醒 → 已屏蔽 → 已看；屏蔽的待你回复归已看", () => {
+  it("按紧急度：待你回复与需要你一并置顶，屏蔽的待你回复归入最近", () => {
     const all = [session("idle", "idle"), asking("reply"), session("working", "working"), session("unread", "unread"), session("needs", "needs_you"),
       session("waiting", "unknown", { loop: { kind: "cron" } }), session("muted-working", "working"), asking("muted-idle")];
     const groups = buildAgentGroups(all, machines, "state", mutes);
-    expect(groups.map((g) => g.name)).toEqual(["需要你", "完成未看", "待你回复", "工作中", "待唤醒", "已屏蔽", "已看"]);
-    expect(ids(groups[2].sessions)).toEqual(["reply"]);
-    expect(groups[2].folded).toBeFalsy();
-    expect(ids(groups[6].sessions)).toEqual(["idle", "muted-idle"]);
+    expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "最近", "已屏蔽"]);
+    expect(ids(groups[0].sessions)).toEqual(["needs", "reply"]);
+    expect(groups[0].folded).toBeFalsy();
+    expect(ids(groups[2].sessions)).toEqual(["unread", "muted-idle", "idle"]);
   });
 
   it("组内排序（byAttention）：待你回复在完成未看之后、工作中之前", () => {
@@ -167,21 +185,21 @@ describe("Just finished (#9751)", () => {
     expect(isQuiet(finished("muted-idle"), mutes)).toBe(true);
   });
 
-  it("By status: its own section after Working and Waiting in the background, before Waiting; a muted one is Seen", () => {
+  it("By status: manual just-finished leads 最近, active/waiting join 进行中", () => {
     const all = [session("idle", "idle"), finished("done"), session("working", "working"), session("sleeping", "working", { background_waiting: true }),
       session("waiting", "unknown", { loop: { kind: "cron" } }), finished("muted-idle"), session("muted-working", "working")];
     const groups = buildAgentGroups(all, machines, "state", mutes);
     expect(groups.map((g) => [g.key, ids(g.sessions)])).toEqual([
-      ["state:working", ["working"]], ["state:bg_waiting", ["sleeping"]], ["state:just_finished", ["done"]], ["state:waiting", ["waiting"]],
-      ["state:muted", ["muted-working"]], ["state:idle", ["idle", "muted-idle"]],
+      ["state:working", ["sleeping", "waiting", "working"]], ["state:recent", ["done", "muted-idle", "idle"]],
+      ["state:muted", ["muted-working"]],
     ]);
-    expect(groups[2]!.name).toBe("刚做完待看");
-    expect(groups[2]!.folded).toBeFalsy();
+    expect(groups[1]!.name).toBe("最近");
+    expect(groups[1]!.folded).toBeFalsy();
   });
 
-  it("one a /loop wakes again is Waiting", () => {
+  it("one a /loop wakes again stays in 进行中", () => {
     const groups = buildAgentGroups([finished("loop", { loop: { kind: "cron" } })], machines, "state", { spaces: [], sessions: [] });
-    expect(groups.map((g) => g.key)).toEqual(["state:waiting"]);
+    expect(groups.map((g) => g.key)).toEqual(["state:working"]);
   });
 
   it("ranks after Working and before the seen ones (byAttention)", () => {
@@ -191,10 +209,9 @@ describe("Just finished (#9751)", () => {
 });
 
 describe("waiting in the background (#6045)", () => {
-  it("has its own group by status, after Working, and leaves Working", () => {
+  it("merges cleanly into 进行中 under urgency grouping", () => {
     const all = [session("busy", "working"), session("sleeping", "working", { background_waiting: true }), session("woken", "idle", { loop: { prompt: "check" } as Session["loop"] })];
     const groups = buildAgentGroups(all, machines, "state", { spaces: [], sessions: [] });
-    expect(groups.map((g) => [g.key, ids(g.sessions)])).toEqual([["state:working", ["busy"]], ["state:bg_waiting", ["sleeping"]], ["state:waiting", ["woken"]]]);
-    expect(groups[1]!.waiting).toBe(true);
+    expect(groups.map((g) => [g.key, ids(g.sessions)])).toEqual([["state:working", ["busy", "sleeping", "woken"]]]);
   });
 });

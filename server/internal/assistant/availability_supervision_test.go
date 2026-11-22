@@ -305,6 +305,8 @@ func superviseRun(t *testing.T, patch string) (run map[string]any, models []map[
 	t.Helper()
 	s, f, todo := newSupervisedServiceOn(t, planUpdateStore{&planMemStore{memStore: &memStore{}, plans: map[string]db.TaskPlanRow{}}})
 	s.noBackground = false
+	off := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 	f.mu.Lock()
 	f.made = 100
 	f.mu.Unlock()

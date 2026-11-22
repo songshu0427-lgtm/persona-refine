@@ -115,7 +115,9 @@ func acceptedPlanTask(t *testing.T, st Store) (*Service, *fakeHub, Todo) {
 func acceptedByBackground(t *testing.T) (s *Service, f *fakeHub, accepted Todo, bg string) {
 	t.Helper()
 	s, f, todo := plannedTask(t, nil)
-	s.noBackground = false // on, as by default (newBackgroundService)
+	s.noBackground = false
+	off := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks = &off })
 	f.mu.Lock()
 	f.made = 100
 	f.mu.Unlock()

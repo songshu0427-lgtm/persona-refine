@@ -7,6 +7,7 @@ import { useCanDeleteConversation } from "../lib/conversation-delete";
 // POST …/directions/{id}/make), 取消常驻 ends it (…/end; the tasks it handed out keep their supervisor).
 import { api, enc, errorText, sessionPath } from "../lib/api";
 import { sessionTitle } from "../lib/format";
+import { navigate } from "../lib/router";
 import { refreshAssistant } from "../lib/store";
 import type { Session } from "../lib/types";
 import { copyText, Dialog, Loading, Menu, toast, type MenuItem, type ToastAction } from "../ui/atoms";
@@ -103,10 +104,13 @@ export function conversationArchiveItem(s: Session, deps: ConversationMenuDeps =
 /** `leader`: the conversation is a leader (常驻) now. `builtIn`: it is the background supervisor, which the hub keeps
  *  listed and running: no 设为常驻, Rename, Archive or End. */
 export function conversationMenuItems(s: Session, o: { main: boolean; leader?: boolean; builtIn?: boolean; canDelete?: boolean; onDelete?: () => void }, deps: ConversationMenuDeps = conversationMenuDeps): MenuItem[] {
-  const copy: MenuItem = { key: "copy", label: t("conversation-menu.copy_id"), icon: "copy", accel: "c", onSelect: () => void deps.copy(s.session_id) };
+  const copy: MenuItem = { key: "copy", label: t("conversation-menu.copy_id"), icon: "copy", accel: "c", divider: o.main, onSelect: () => void deps.copy(s.session_id) };
   if (o.builtIn) return [copy];
   const own: MenuItem[] = o.main
-    ? []
+    ? [
+        { key: "all-chats", label: t("sidebar.all_chats"), icon: "list", onSelect: () => navigate({ name: "history" }) },
+        { key: "new-chat", label: t("sidebar.new_chat"), icon: "plus", onSelect: () => navigate({ name: "persona-new" }) },
+      ]
     : [
         leaderItem(s, !!o.leader, deps),
         {

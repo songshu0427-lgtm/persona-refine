@@ -428,7 +428,9 @@ export async function brotliCopies(dir: string, files: string[]): Promise<{ file
 // Keep the stricter existing limit while combining these changes.
 // Post-interrupt awaiting suppression (persisting stopped unanswered turn IDs per conversation and offering Interrupt
 // during awaiting on plugin-connected outside Claude sessions) measures en 479,509 B, ja 482,614 B, zh-Hans 480,354 B (+31 B room).
-export const FIRST_SCREEN_BUDGET = 482_645;
+// Super-Agent single-main-chat & 3-tier urgency sidebar (dispatched worker badge & folded bucket, main-chat history/new-chat menu,
+// grouping menu items) measures en 479,609 B, ja 482,687 B, zh-Hans 480,438 B (+31 B room).
+export const FIRST_SCREEN_BUDGET = 482_718;
 // The hash in a built file's name: the 8 characters of Rollup's [hash] (url-safe base64) between "-" and the
 // extension, as vite.config.ts names every chunk and asset ("assets/[name]-[hash].js", "[name]-[hash][extname]").
 const NAME_HASH = /-([A-Za-z0-9_-]{8})\.[^./]+$/;

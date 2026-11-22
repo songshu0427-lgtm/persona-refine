@@ -107,12 +107,13 @@ afterEach(() => {
 
 describe("the sidebar's top-level headings (#10637)", () => {
   const cases = [
-    { list: "the complete Agents list", features: [], titles: ["页面", "Persona 对话", "Agents"] },
-    { list: "the paged Agents list", features: ["sessions_list", "sessions_lookup", "sessions_todo", "sessions_agents_only"], titles: ["页面", "Persona 对话", "Agents"] },
-    { list: "Pending in Agents' place", features: ["sessions_dimensions"], titles: ["页面", "Persona 对话", "待处理"] },
+    { list: "the complete Agents list", grouping: "state", features: [], titles: ["页面", "Agents"] },
+    { list: "the paged Agents list", grouping: "todo", features: ["sessions_list", "sessions_lookup", "sessions_todo", "sessions_agents_only"], titles: ["页面", "Agents"] },
+    { list: "Pending in Agents' place", grouping: "state", features: ["sessions_dimensions"], titles: ["页面", "待处理"] },
   ];
-  for (const { list, features, titles } of cases) {
+  for (const { list, grouping, features, titles } of cases) {
     it(`share one heading box, folded and unfolded, with ${list}`, async () => {
+      localStorage.setItem("persona.agentGrouping", grouping);
       await render(features);
       expect(Boolean(host.querySelector("[data-paged-sessions]"))).toBe(features.includes("sessions_list"));
       for (const folded of [false, true]) {

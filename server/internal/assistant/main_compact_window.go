@@ -16,7 +16,7 @@ import (
 // and only on a managed launcher whose declared window is larger (node/assistant_compaction_policy.go capMain). Every
 // other conversation and every Agent keeps its launcher's window.
 const (
-	defaultMainCompactWindow = 400_000
+	defaultMainCompactWindow = 200_000
 	// minMainCompactWindow: the main conversation's fixed part (instructions, tools, the snapshot) is tens of thousands of
 	// tokens and Claude Code compacts about 33K short of the window, so a smaller window would compact every few turns.
 	minMainCompactWindow = 100_000

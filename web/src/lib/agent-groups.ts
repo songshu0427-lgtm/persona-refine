@@ -19,9 +19,9 @@ export const AGENT_GROUPINGS: { key: AgentGrouping; label: string; short: string
   { key: "state", label: t("lib-agent-groups.by_state"), short: t("lib-agent-groups.seg_state") },
 ];
 
-// the grouping this browser chose last (persona.agentGrouping, #1836); by todo until it chooses (#2812, was by machine, #1990)
+// the grouping this browser chose last (persona.agentGrouping, #1836); urgency-first by state until it chooses
 export function agentGrouping(value: string | null): AgentGrouping {
-  return AGENT_GROUPINGS.find((g) => g.key === value)?.key ?? "todo";
+  return AGENT_GROUPINGS.find((g) => g.key === value)?.key ?? "state";
 }
 
 // the host kinds a pane ref may be prefixed with (keep in step with Kinds in server/internal/host/host.go); herdr's ids go bare and may hold a colon
@@ -169,30 +169,32 @@ function byDate(a: Session, b: Session): number {
   return byTime(date(b), date(a)) || a.session_id.localeCompare(b.session_id) || a.machine_id.localeCompare(b.machine_id);
 }
 
-// iOS AgentListOrder (#5096): needs you → unread → awaiting reply → working → waiting in the background (#6045) → just
-// finished (#9751) → waiting → muted → seen; needs you always wins,
-// even when a session or its project is muted. "By status" is the only grouping built here ("By machine" is
-// lib/herdr-tree.ts); the argument stays for the callers that name it.
-export function buildAgentGroups(all: Session[], machines: Machine[], _grouping: "state", mutes: AgentMutes = { spaces: [], sessions: [] }): AgentGroup[] {
+// 3-tier urgency hierarchy: 需要你 → 进行中 → 最近 (100% of manual sessions stay visible), while finished/quiet
+// Persona-dispatched temporary Workers (started_by_persona) fold into 已完成的派出任务 at the bottom.
+export function buildAgentGroups(all: Session[], machines: Machine[], _grouping: "state", mutes: AgentMutes = { spaces: [], sessions: [] }, offlineRecent: Session[] = []): AgentGroup[] {
   const { live } = splitAgentSessions(all, machines);
   const groups: AgentGroup[] = [
     { key: "state:needs", name: stateName("needs_you"), state: "needs_you", sessions: [] },
-    { key: "state:unread", name: stateName("unread"), state: "unread", sessions: [] },
-    { key: "state:reply", name: stateName("awaits_reply"), sessions: [] },
-    { key: "state:working", name: stateName("working"), state: "working", sessions: [] },
-    { key: "state:bg_waiting", name: stateName("bg_waiting"), state: "working", waiting: true, sessions: [] },
-    { key: "state:just_finished", name: stateName("just_finished"), sessions: [] },
-    { key: "state:waiting", name: stateName("waiting"), sessions: [] },
-    { key: "state:muted", name: t("lib-agent-groups.state_muted"), sessions: [] },
-    { key: "state:idle", name: stateName("idle"), state: "idle", sessions: [], folded: true },
+    { key: "state:working", name: t("sidebar.in_progress"), state: "working", sessions: [] },
+    { key: "state:recent", name: t("sidebar.recent_chats"), sessions: [] },
+    { key: "state:muted", name: t("lib-agent-groups.state_muted"), sessions: [], folded: true },
+    { key: "state:dispatched", name: t("sidebar.dispatched_done"), state: "idle", sessions: [], folded: true },
   ];
   for (const s of live) {
     const state = stateOf(s);
     const waiting = isWaiting(s);
-    const index = state === "needs_you" ? 0 : isMuted(s, mutes) && (state === "working" || state === "unread" || waiting) ? 7
-      : state === "unread" ? 1 : awaitsReply(s, mutes) ? 2 : backgroundWaiting(s) ? 4 : state === "working" ? 3 : waiting ? 6
-      : justFinished(s, mutes) ? 5 : 8;
+    const index = state === "needs_you" || awaitsReply(s, mutes) ? 0
+      : isMuted(s, mutes) && (state === "working" || state === "unread" || waiting) ? 3
+      : state === "working" || backgroundWaiting(s) || waiting ? 1
+      : s.started_by_persona ? 4
+      : 2;
     groups[index].sessions.push(s);
   }
-  return groups.filter((g) => g.sessions.length).map((g) => ({ ...g, sessions: g.sessions.sort(byDate) }));
+  for (const s of offlineRecent) {
+    groups[s.started_by_persona ? 4 : 2].sessions.push(s);
+  }
+  return groups.filter((g) => g.sessions.length).map((g) => ({
+    ...g,
+    sessions: g.key === "state:recent" ? g.sessions.sort(byAttention) : g.sessions.sort(byDate),
+  }));
 }

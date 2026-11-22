@@ -190,6 +190,8 @@ func TestMainTaskHandoverKeepsBackgroundSupervision(t *testing.T) {
 		proto.Session{SessionID: "conv2", MachineID: "server", Assistant: true, Status: proto.StatusIdle},
 		proto.Session{SessionID: "bg1", MachineID: "server", Assistant: true, Status: proto.StatusIdle})
 	setSettings(t, s, func(v *Settings) {
+		off := false
+		v.MainSupervisesOwnTasks = &off
 		v.BackgroundSupervisor = "bg1"
 		v.BackgroundSupervisorMachineID = "server"
 	})

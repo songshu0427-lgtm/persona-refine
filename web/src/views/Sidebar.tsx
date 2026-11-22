@@ -312,8 +312,8 @@ export function Sidebar({ route, onSearch, onNewAgent, onNavigate, workspaceActi
   const directionNames = useDirectionNames(directions.map((c) => `${c.session_id}\u0000${c.title ?? ""}`).join("\u0001"));
   const counts = useLeaderCounts();
   const leaderTotal = totalCounts(counts, leaders);
-  // the main row sits above the pages, so"Persona chats"waits for the assistant (a hub without it has none)
-  const chats = !!assistant;
+  // Single-main-chat convergence: show the secondary Persona chats block only when pinned 常驻 leaders exist or a non-main Persona page/chat is open
+  const chats = !!assistant && (directions.length > 0 || activeKey === "history" || activeKey.startsWith("j:"));
   // a conversation row's ⋯ / right click (iOS: its long press)
   const [convMenu, setConvMenu] = useState<{ s: Session; anchor: HTMLElement; at?: MenuAt } | null>(null);
   // one function for the sidebar's life: the conversation rows and the main row keep their memo across pushes
@@ -672,13 +672,16 @@ function useAgentSort() {
 
 /** The ⋯'s items, the paged list's as the complete list's (#6662): the sorts (none by state, whose sections are the
  *  states already), then the archived Agents. Collapse all / Expand all are the title row's button alone (#6447). */
-function agentListItems({ sorts, sort, chooseSort, archives, hover, onNavigate }: { sorts: boolean; sort: AgentSort; chooseSort: (s: AgentSort) => void; archives: boolean; hover: (k: string | null) => void; onNavigate?: () => void }): MenuItem[] {
+function agentListItems({ groupings, grouping, chooseGrouping, sorts, sort, chooseSort, archives, hover, onNavigate }: { groupings: readonly { key: AgentGrouping; label: string; short: string }[]; grouping: AgentGrouping; chooseGrouping: (g: AgentGrouping) => void; sorts: boolean; sort: AgentSort; chooseSort: (s: AgentSort) => void; archives: boolean; hover: (k: string | null) => void; onNavigate?: () => void }): MenuItem[] {
   return [
-    ...(sorts ? AGENT_SORTS.map((o): MenuItem => ({
-      key: `sort:${o.key}`, label: o.label, icon: o.key === "updated" ? "clock" : "layers", checked: sort === o.key, onSelect: () => { chooseSort(o.key); hover(null); },
+    ...groupings.map((g): MenuItem => ({
+      key: `group:${g.key}`, label: g.label, icon: "layers", radio: true, checked: grouping === g.key, onSelect: () => { chooseGrouping(g.key); hover(null); },
+    })),
+    ...(sorts ? AGENT_SORTS.map((o, i): MenuItem => ({
+      key: `sort:${o.key}`, label: o.label, icon: o.key === "updated" ? "clock" : "layers", divider: i === 0 && groupings.length > 0, checked: sort === o.key, onSelect: () => { chooseSort(o.key); hover(null); },
     })) : []),
     // the agents archived from a row's ⋯ (lib/agent-archives.ts), to find and restore
-    ...(archives ? [{ key: "archived", label: t("agentmenus.archived_agents"), icon: "archive" as const, divider: sorts, onSelect: () => { navigate({ name: "agent-archives" }); onNavigate?.(); hover(null); } }] : []),
+    ...(archives ? [{ key: "archived", label: t("agentmenus.archived_agents"), icon: "archive" as const, divider: groupings.length > 0 || sorts, onSelect: () => { navigate({ name: "agent-archives" }); onNavigate?.(); hover(null); } }] : []),
   ];
 }
 
@@ -764,7 +767,7 @@ function BoundedAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate,
   const listMenu = useMenu();
   const [sortChoice, chooseSort] = useAgentSort();
   const byUpdate = sortChoice === "updated" && grouping !== "state";
-  const listItems = agentListItems({ sorts: grouping !== "state", sort: sortChoice, chooseSort, archives, hover, onNavigate });
+  const listItems = agentListItems({ groupings, grouping, chooseGrouping, sorts: grouping !== "state", sort: sortChoice, chooseSort, archives, hover, onNavigate });
   const pagedGrouping = useMemo(() => ({
     dimension: PAGED_DIMENSION[grouping],
     label: AGENT_GROUPINGS.find((g) => g.key === grouping)?.label ?? "",
@@ -912,19 +915,20 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const groups = useMemo(() => {
     if (shownGrouping === "space" || shownGrouping === "repo" || shownGrouping === "machine") return [];
     if (shownGrouping === "todo") return [];
-    return buildAgentGroups(unpinned, machines, "state", mutes);
-  }, [unpinned, machines, shownGrouping, mutes, todos]);
+    return buildAgentGroups(unpinned, machines, "state", mutes, recent);
+  }, [unpinned, machines, shownGrouping, mutes, recent, todos]);
   // by todo waits for the first GET /todos: the socket pushes the sessions before it answers, and a tree drawn without
   // the todos puts every agent under No to-do for a moment, then moves them under their todos (#2812); the chat list's
   // rows are drawn at once
   const todosPending = !chatList && shownGrouping === "todo" && !todosLoaded;
+  const sessionsPending = !loaded && all.length === 0 && launches.length === 0;
   // what the list says in place of its groups while it has none to show (audit items 4 and 36): the hub out of reach
-  // since the page opened, the complete list's read failed (why, and Retry), or By to-do waiting for its to-dos; before,
-  // the first two left "Loading…" or nothing at all under the controls for good. An older hub's rows come with the
+  // since the page opened, the complete list's read failed (why, and Retry), or waiting for the first sessions / to-dos;
+  // before, the first two left "Loading…" or nothing at all under the controls for good. An older hub's rows come with the
   // socket's pushes, before GET /sessions answers, so they are drawn without waiting for it (#2812)
   const listNote = hubUnreachable ? <p className="px-2 py-1 text-xs leading-normal text-ink-3">{t("sidebar.agents_offline")}</p>
     : !loaded && listError ? <ListError text={agentsReadFailed(listError)} onRetry={retryFullAgentSessions} />
-    : todosPending ? <p className="px-2 py-1 text-[12px] text-ink-3">{t("sidebar.loading")}</p>
+    : todosPending || sessionsPending ? <p className="px-2 py-1 text-[12px] text-ink-3">{t("sidebar.loading")}</p>
     : null;
   // Only inputs the tree reads rebuild it; unchanged nodes keep their objects so their rows' memo holds.
   const lastTodoTree = useRef<TodoTree | undefined>(undefined);
@@ -1026,7 +1030,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const tree = { machines, reg, hover, activeKey, go, mutes, onSpaceMenu, onRowMenu, onNodeMenu, onNavigate };
 
   // the list menu, the paged list's too (agentListItems); with nothing in it the menu's button goes
-  const listItems = agentListItems({ sorts: shownGrouping !== "state", sort: sortChoice, chooseSort, archives, hover, onNavigate });
+  const listItems = agentListItems({ groupings: availableGroupings, grouping: shownGrouping, chooseGrouping: chooseGroupingOutOfChatList, sorts: shownGrouping !== "state", sort: sortChoice, chooseSort, archives, hover, onNavigate });
 
   return (
     <div data-sidebar-agents ref={groupsRef}>
@@ -1052,8 +1056,8 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
         {add && <AgentsAdd onNewAgent={onNewAgent} onNavigate={onNavigate} />}
       </div>
       <Collapse open={!folded} sidebarFold>
-        <GroupingBar groupings={availableGroupings} selection={shownGrouping} onChoose={chooseGroupingOutOfChatList} />
-        <FilterBar selection={filter} counts={filterTotals} onChoose={choose} botmux={botmux} />
+        {grouping !== "state" && <GroupingBar groupings={availableGroupings} selection={shownGrouping} onChoose={chooseGroupingOutOfChatList} />}
+        {(shownGrouping !== "state" || filter !== "all" || Boolean(botmux)) && <FilterBar selection={filter} counts={filterTotals} onChoose={choose} botmux={botmux} />}
       </Collapse>
       </div>
     }>
@@ -1143,7 +1147,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
         <AgentSection key={group.key} group={group} machines={machines} byTodo={shownGrouping === "todo"} showHost={mixedHosts} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} onNavigate={onNavigate} />
       )))}
 
-      {recent.length > 0 && !todoTree && (
+      {recent.length > 0 && !todoTree && shownGrouping !== "state" && (
         <Section title={t("sidebar.recent")} folded={recentFolded} onToggle={toggleRecent} right={<GroupCount n={recent.length} label={t("sidebar.agent_count", { count: recent.length })} />}>
           {recentRows}
         </Section>

@@ -42,8 +42,8 @@ describe("a Persona conversation's sidebar menu (iOS AssistantSidebar)", () => {
     expect(items.find((i) => i.key === "end")).toMatchObject({ danger: true, confirm: "确认结束", inline: true });
   });
 
-  it("gives the main conversation only 复制会话 ID and 结束…", () => {
-    expect(conversationMenuItems(conv(), { main: true }).map((i) => i.key)).toEqual(["copy", "end"]);
+  it("gives the main conversation 全部 Persona 对话, 新对话, 复制会话 ID and 结束…", () => {
+    expect(conversationMenuItems(conv(), { main: true }).map((i) => i.key)).toEqual(["all-chats", "new-chat", "copy", "end"]);
   });
 
   it("has no 结束… once it has stopped", () => {

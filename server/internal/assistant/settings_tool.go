@@ -138,7 +138,7 @@ func (s *Service) ownSettings() []ownSetting {
 			get: func(ctx context.Context) (string, error) { return fmt.Sprint(s.mainBackgroundFolded(ctx)), nil },
 			set: s.setMainBackgroundFolded},
 		{Setting: Setting{Key: "assistant.main_compact_window", Title: "Main chat compaction window", Actions: getSet,
-			About: "400000 (the default): the main conversation is compacted at about this many tokens (and sent /compact when " +
+			About: "200000 (the default): the main conversation is compacted at about this many tokens (and sent /compact when " +
 				"idle at 75% of it) instead of its model's whole window, when it runs on a launcher Persona manages that declares " +
 				"a larger one; fewer tokens re-read every turn and rewritten after a long pause, while early details stay in the " +
 				"task ledger and the old conversation. 0: the launcher's window, as for every other conversation and Agent. " +
@@ -262,11 +262,10 @@ func (s *Service) ownSettings() []ownSetting {
 			get: func(ctx context.Context) (string, error) { return fmt.Sprint(s.inboxSignalsOn(ctx)), nil },
 			set: s.setInboxSignals},
 		{Setting: Setting{Key: "assistant.main_supervises_own_tasks", Title: "The main chat supervises its own tasks", Actions: getSet,
-			About: "off (the default): the background supervisor, one built-in Persona conversation made on first use, follows up " +
-				"every supervised task no leader supervises: their supervision messages go to it and it reviews them with task_review, " +
-				"so the main conversation stays free to answer the user. The main conversation still hears of failed starts and of " +
-				"what the background supervisor hands to the user, and may review any of these tasks itself. on: the main conversation " +
-				"gets these supervision messages itself, as before the background supervisor existed. Applies to signals raised from " +
+			About: "on (the default): the main conversation supervises every task it hands out that no leader supervises, receiving " +
+				"their supervision signals directly and reviewing them with task_review as a unified single-brain Super-Agent. " +
+				"off: the background supervisor, one built-in Persona conversation made on first use, follows up those tasks so the " +
+				"main conversation stays separate. Applies to signals raised from " +
 				"the change on (a supervision message already with the background supervisor is finished there); tasks keep running",
 			Value: "true or false"},
 			get: func(ctx context.Context) (string, error) { return fmt.Sprint(s.mainSupervisesOwnTasks(ctx)), nil },

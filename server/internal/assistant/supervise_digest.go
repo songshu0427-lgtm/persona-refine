@@ -631,14 +631,19 @@ func (s *Service) digestEntry(ctx context.Context, g superviseSignal, web string
 		e.Asks, e.Decisions = asks, s.todoDecisionsContext(ctx, t.ID) // what was settled already, not to be gone against
 	}
 	if g.Kind == sigReport { // what it said is the report itself, not a reason in brackets
-		e.Detail, e.Report, e.Said, e.Evidence, e.Step, e.Steps = "", g.Report, g.Detail, g.Evidence, g.Step, g.Steps
+		e.Detail, e.Report, e.Said, e.Step, e.Steps = "", g.Report, spillDigestText(g.Detail, digestSpillRunes), g.Step, g.Steps
+		for _, ev := range g.Evidence {
+			e.Evidence = append(e.Evidence, spillDigestText(ev, digestSpillRunes))
+		}
+	} else if draft == nil && g.Kind != sigAllStopped {
+		e.Detail = spillDigestText(e.Detail, digestSpillRunes)
 	}
 	// Progress reports stay quiet. Their persisted evidence accompanies the next
 	// real supervision event, even after restart or a report of a different kind.
 	for i, c := range v.Criteria {
 		if c.At != nil {
 			e.Evidence = append(e.Evidence, fmt.Sprintf("criterion %d [%s] %s — %s (%s at %s)",
-				i+1, c.State, c.Criterion, c.Evidence, c.By, c.At.UTC().Format(time.RFC3339)))
+				i+1, c.State, c.Criterion, spillDigestText(c.Evidence, digestSpillRunes), c.By, c.At.UTC().Format(time.RFC3339)))
 		}
 	}
 	if g.Kind == sigOrphaned {
@@ -725,11 +730,31 @@ func (s *Service) digestEntry(ctx context.Context, g superviseSignal, web string
 			}
 			text = closeout.Strip(text) // told above, in a form that cannot be cut in the middle
 		}
-		e.Last = clipMiddle(text, 600)
+		e.Last = spillDigestText(text, digestSpillRunes)
 	} else if g.Machine != "" {
 		e.Machine = g.Machine
 	}
 	return e, true
+}
+
+// digestSpillRunes caps each inline worker report, answer or evidence block injected into a supervision digest so a
+// single verbose turn cannot bloat the main conversation's context (full transcripts stay available via agent_read).
+const digestSpillRunes = 700
+
+func spillDigestText(s string, maxRunes int) string {
+	r := []rune(s)
+	if maxRunes <= 0 || len(r) <= maxRunes {
+		return s
+	}
+	const note = "\n… (truncated; use agent_read for full output) …\n"
+	nr := []rune(note)
+	keep := maxRunes - len(nr)
+	if keep < 40 {
+		return string(r[:maxRunes])
+	}
+	head := keep * 2 / 3
+	tail := keep - head
+	return string(r[:head]) + note + string(r[len(r)-tail:])
 }
 
 // sortEntries puts what waits on a decision first.

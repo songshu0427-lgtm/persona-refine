@@ -62,9 +62,9 @@ describe("the sidebar's grouping", () => {
     off();
     expect(groupingLabel("space")).toBe("按项目");
   });
-  it("starts from by todo when nothing was chosen", () => {
+  it("starts from urgency (by state) when nothing was chosen", () => {
     vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {} });
-    expect(cycleGrouping()).toBe("machine");
+    expect(cycleGrouping()).toBe("todo");
   });
 });
 

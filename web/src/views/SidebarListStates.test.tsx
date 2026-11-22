@@ -69,9 +69,9 @@ let root: Root;
 const flush = async () => {
   for (let i = 0; i < 8; i++) await act(async () => { await Promise.resolve(); await new Promise((r) => setTimeout(r, 0)); });
 };
-const grouping = () => host.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Agent 分组"]')!;
-const checked = () => [...grouping().querySelectorAll('[role="radio"]')].find((b) => b.getAttribute("aria-checked") === "true")?.getAttribute("aria-label");
-const agentsBlock = () => grouping().closest<HTMLElement>("[data-sidebar-agents]")!;
+const grouping = () => host.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Agent 分组"]');
+const checked = () => [...(grouping()?.querySelectorAll('[role="radio"]') ?? [])].find((b) => b.getAttribute("aria-checked") === "true")?.getAttribute("aria-label");
+const agentsBlock = () => host.querySelector<HTMLElement>("[data-sidebar-agents]")!;
 const alerts = () => [...agentsBlock().querySelectorAll('[role="alert"]')].map((el) => el.textContent);
 const retryButton = () => [...agentsBlock().querySelectorAll("button")].find((b) => b.textContent === t("sidebar.retry"));
 const render = async () => {
@@ -146,6 +146,8 @@ describe("the complete Agents list's read fails (audit item 4)", () => {
 });
 
 describe("By to-do whose to-dos cannot be read (audit item 27)", () => {
+  beforeEach(() => localStorage.setItem("persona.agentGrouping", "todo"));
+
   it("lists by status for now, saying why with Retry, and goes back to By to-do once they are read", async () => {
     let todos = failed;
     vi.stubGlobal("fetch", hub({ todos: () => todos() }));
@@ -154,7 +156,7 @@ describe("By to-do whose to-dos cannot be read (audit item 27)", () => {
     expect(getState().todosError).not.toBeNull();
     // not every Agent under one name: by status, the stored choice kept
     expect(checked()).toBe("按状态");
-    expect(localStorage.getItem("persona.agentGrouping")).toBeNull();
+    expect(localStorage.getItem("persona.agentGrouping")).toBe("todo");
     const [said] = alerts();
     expect(said).toContain(t("sidebar.todos_read_failed", { error: "" }).replace(/[:：]\s*$/, ""));
     expect(said).toMatch(/500/);
@@ -206,6 +208,7 @@ describe("a list drawn while the socket tries again after giving up (audit item 
 
 describe("the paged Agents list's read fails (audit item 4)", () => {
   it("says it could not read the Agents list, as the complete list does, with Retry", async () => {
+    localStorage.setItem("persona.agentGrouping", "todo");
     let sessions = failed;
     vi.stubGlobal("fetch", hub({ sessions: () => sessions() }));
     online(["sessions_list", "sessions_agents_only", "sessions_todo"]);
@@ -248,13 +251,14 @@ describe("the chat list needs no to-dos (the Filter menu's chat rows)", () => {
 
 describe("By to-do's to-dos read again from the grouping bar (audit item 27)", () => {
   it("reads them when 按待办 is tapped while they cannot be read, as the note's Retry does", async () => {
+    localStorage.setItem("persona.agentGrouping", "todo");
     let todos = failed;
     vi.stubGlobal("fetch", hub({ todos: () => todos() }));
     online();
     await render();
     expect(checked()).toBe("按状态");
     todos = () => json({ todos: [todo] });
-    await act(async () => grouping().querySelector<HTMLElement>('[role="radio"][aria-label="按待办"]')!.click());
+    await act(async () => grouping()!.querySelector<HTMLElement>('[role="radio"][aria-label="按待办"]')!.click());
     await flush();
     expect(alerts()).toEqual([]);
     expect(checked()).toBe("按待办");
@@ -264,6 +268,7 @@ describe("By to-do's to-dos read again from the grouping bar (audit item 27)", (
 
 describe("By to-do's groups say what their rows say (audit item 48)", () => {
   it("says 未运行 beside Recent (not running) and 完成未看 beside agents on no to-do finished and not looked at", async () => {
+    localStorage.setItem("persona.agentGrouping", "todo");
     const stopped: Session = { machine_id: "mac", session_id: "s2", title: "旧的迁移", cwd: "/code/old", status: "offline", state: "offline", updated_at: "2026-11-04T00:00:00Z" };
     const unseen: Session = { machine_id: "mac", session_id: "s3", title: "写周报", cwd: "/code/notes", status: "idle", state: "unread", updated_at: "2026-11-05T00:00:00Z" };
     const every = [agent, stopped, unseen];

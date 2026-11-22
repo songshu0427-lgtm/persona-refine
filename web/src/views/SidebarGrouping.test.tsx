@@ -62,11 +62,11 @@ let root: Root;
 const flush = async () => {
   for (let i = 0; i < 5; i++) await act(async () => { await Promise.resolve(); });
 };
-const grouping = () => host.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Agent 分组"]')!;
-const segments = () => [...grouping().querySelectorAll<HTMLButtonElement>('[role="radio"]')];
+const grouping = () => host.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Agent 分组"]');
+const segments = () => [...(grouping()?.querySelectorAll<HTMLButtonElement>('[role="radio"]') ?? [])];
 const checked = () => segments().find((b) => b.getAttribute("aria-checked") === "true")?.getAttribute("aria-label");
 // the Agents block's body: the segments, the quick filter and the groups (the personal agents' Loading... is elsewhere)
-const agentsBlock = () => grouping().closest<HTMLElement>("[data-sidebar-agents]")!;
+const agentsBlock = () => host.querySelector<HTMLElement>("[data-sidebar-agents]")!;
 const render = async () => {
   act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
   await flush();
@@ -94,6 +94,8 @@ afterEach(() => {
 });
 
 describe("按待办 before the todos have loaded", () => {
+  beforeEach(() => localStorage.setItem("persona.agentGrouping", "todo"));
+
   it("says 加载中… until GET /todos answers, then draws the agent under its todo, never under 没挂待办的 first", async () => {
     let answer!: (r: Response) => void;
     const todos = new Promise<Response>((r) => (answer = r));
@@ -170,7 +172,7 @@ describe("group controls in every Agents view", () => {
     expect(host.querySelectorAll("[data-sidebar-agents-controls] [data-testid=agents-fold-all]")).toHaveLength(1);
     await act(async () => { action("全部折叠").click(); await Promise.resolve(); });
     expect(disclosures().every((b) => b.getAttribute("aria-expanded") === "false")).toBe(true);
-    expect(grouping().closest("[inert]")).toBeNull();
+    expect(grouping()?.closest("[inert]") ?? null).toBeNull();
     await flush();
     await act(async () => { action("全部展开").click(); await Promise.resolve(); });
     expect(disclosures().every((b) => b.getAttribute("aria-expanded") === "true")).toBe(true);
@@ -224,16 +226,17 @@ describe("the fold-all button keeps the Agents controls", () => {
 
   it.each(["todo", "machine", "repo", "space", "state"])("folds %s to its group headings and opens it again, the controls staying", async (mode) => {
     localStorage.setItem("persona.agentGrouping", mode);
+    const expectedControls = mode === "state" ? { tabs: false, filters: false, filter: true } : everyControl;
     vi.stubGlobal("fetch", hub(() => json({ todos: [todo] })));
     await refresh();
     await render();
-    expect(controls()).toEqual(everyControl);
+    expect(controls()).toEqual(expectedControls);
     expect(agentShown()).toBe(true);
     expect(foldAll()!.getAttribute("aria-label")).toBe("全部折叠");
     expect(shows()).toBe(glyph("foldToggle"));
 
     await press();
-    expect(controls()).toEqual(everyControl);
+    expect(controls()).toEqual(expectedControls);
     expect(headings().length).toBeGreaterThan(0);
     expect(headings().every((b) => b.getAttribute("aria-expanded") === "false")).toBe(true);
     expect(agentShown()).toBe(false);
@@ -244,7 +247,7 @@ describe("the fold-all button keeps the Agents controls", () => {
     expect(shows()).toBe(glyph("unfoldToggle"));
 
     await press();
-    expect(controls()).toEqual(everyControl);
+    expect(controls()).toEqual(expectedControls);
     expect(headings().every((b) => b.getAttribute("aria-expanded") === "true")).toBe(true);
     expect(agentShown()).toBe(true);
     expect(shows()).toBe(glyph("foldToggle"));
@@ -296,15 +299,18 @@ describe("按待办's 最近（未运行）", () => {
 });
 
 describe("a hub without todos (GET /todos 404)", () => {
-  it("hides 待办 and shows 按机器 for a browser that never chose", async () => {
+  it("opens on urgency cleanly without 加载中… and omits 按待办 from the list menu", async () => {
     vi.stubGlobal("fetch", hub(() => json({ error: "not found" }, 404)));
     await refresh();
     await render();
-    expect(segments().map((b) => b.textContent)).toEqual(["机器", "仓库", "项目", "状态"]);
-    expect(checked()).toBe("按机器");
-    expect(agentsBlock().textContent).toContain("工作电脑");
+    expect(grouping()).toBeNull();
+    expect(agentsBlock().textContent).toContain("进行中");
+    expect(agentsBlock().textContent).toContain("改发布脚本");
     expect(agentsBlock().textContent).not.toContain("加载中…");
     expect(localStorage.getItem("persona.agentGrouping")).toBeNull();
+    act(() => host.querySelector<HTMLButtonElement>('button[aria-label="Agent 列表选项"]')!.click());
+    const labels = [...document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')].map((el) => el.textContent);
+    expect(labels).toEqual(["按机器", "按仓库", "按项目", "按状态"]);
   });
 
   it("keeps a 按待办 chosen before and shows it again once the hub has todos", async () => {

@@ -29,7 +29,7 @@ func (s *Service) supervisionInstructions(ctx context.Context, machine, id strin
 	}
 	main := id == cfg.Main
 	if main {
-		if machine != cfg.mainRouteMachine() || cfg.MainSupervisesOwnTasks == nil || !*cfg.MainSupervisesOwnTasks {
+		if machine != cfg.mainRouteMachine() || !mainSupervisesOwnTasksOf(cfg) {
 			return "", nil
 		}
 	} else if machine != cfg.MachineID {

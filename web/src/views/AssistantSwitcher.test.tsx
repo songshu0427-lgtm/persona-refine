@@ -225,7 +225,7 @@ describe("the sidebar's assistant switcher", () => {
     expect(document.body.textContent).toContain("mi_again");
   });
 
-  it("shows one assistant's identity and roster, with New and Manage but no default tag or counts", async () => {
+  it("shows one assistant's identity and roster cleanly, omitting New and Manage while single", async () => {
     setRoster({ default: "assistant", managers: [ROSTER.managers[0]] });
     await render();
     expect(head().textContent).toContain("助手");
@@ -245,7 +245,7 @@ describe("the sidebar's assistant switcher", () => {
     expect(radios[0].textContent).toContain("助手");
     expect(radios[0].textContent).not.toContain("默认");
     expect(radios[0].querySelector("[data-menu-badge]")).toBeNull();
-    expect(rows().slice(1).map((r) => r.textContent)).toEqual(["新建助手", "管理助手…", "跟随系统", "浅色", "深色", "设置", "断开这个浏览器…"]);
+    expect(rows().slice(1).map((r) => r.textContent)).toEqual(["跟随系统", "浅色", "深色", "设置", "断开这个浏览器…"]);
     await choose("设置");
     expect(navigate).toHaveBeenCalledWith({ name: "settings" });
   });

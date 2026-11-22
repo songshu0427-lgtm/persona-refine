@@ -138,6 +138,8 @@ func newTierService(t *testing.T, l proto.ManagedLauncher) (*Service, *fakeRuleE
 		t.Fatal(err)
 	}
 	setSettings(t, s, func(v *Settings) {
+		off := false
+		v.MainSupervisesOwnTasks = &off
 		v.Main, v.Launcher = "main1", l.Name
 		v.BackgroundSupervisor, v.BackgroundSupervisorMachineID = "bg", v.MachineID
 	})
@@ -234,12 +236,13 @@ func TestSetupBlockSuggestsNoTierWithoutTheBackgroundSupervisor(t *testing.T) {
 		t.Fatalf("off: %v", got)
 	}
 	// On, but none was ever made.
-	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks, v.BackgroundSupervisor = nil, "" })
+	bgMode := false
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks, v.BackgroundSupervisor = &bgMode, "" })
 	if got := setupIDs(s.setupFor(ctx, now, loc, i18n.En, testWeb)); len(got) != 0 {
 		t.Fatalf("none made: %v", got)
 	}
 	// There, but the reviews were the main conversation's.
-	setSettings(t, s, func(v *Settings) { v.BackgroundSupervisor = "bg" })
+	setSettings(t, s, func(v *Settings) { v.MainSupervisesOwnTasks, v.BackgroundSupervisor = &bgMode, "bg" })
 	ev.events = tierReviews(now, "m", supervisorMain, "big-model", 2*setupTierMin, 0, 2*supervisionReopenWithin)
 	if got := setupIDs(s.setupFor(ctx, now, loc, i18n.En, testWeb)); len(got) != 0 {
 		t.Fatalf("reviewed by the main conversation: %v", got)

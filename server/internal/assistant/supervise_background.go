@@ -46,13 +46,19 @@ type backgroundBook struct {
 	rounds   superviseRounds
 }
 
-// backgroundOn: the background supervisor is on with settings cfg (assistant.main_supervises_own_tasks is not on).
+// mainSupervisesOwnTasksOf reports whether the main conversation supervises its own unled tasks under cfg (on by default
+// for single-brain Super-Agent supervision unless explicitly set to false).
+func mainSupervisesOwnTasksOf(cfg Settings) bool {
+	return cfg.MainSupervisesOwnTasks == nil || *cfg.MainSupervisesOwnTasks
+}
+
+// backgroundOn: the background supervisor is on with settings cfg (assistant.main_supervises_own_tasks is explicitly off).
 func (s *Service) backgroundOn(cfg Settings) bool {
-	return !s.noBackground && (cfg.MainSupervisesOwnTasks == nil || !*cfg.MainSupervisesOwnTasks)
+	return !s.noBackground && !mainSupervisesOwnTasksOf(cfg)
 }
 
 // mainSupervisesOwnTasks is assistant.main_supervises_own_tasks in effect: the main conversation follows up its own
-// tasks itself (off by default: the background supervisor does).
+// tasks itself (on by default; setting false delegates them to the background supervisor).
 func (s *Service) mainSupervisesOwnTasks(ctx context.Context) bool {
 	return !s.backgroundOn(s.settings(ctx))
 }
