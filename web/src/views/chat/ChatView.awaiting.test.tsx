@@ -367,4 +367,135 @@ describe("a message waiting for its turn to start (#2450)", () => {
     await flush();
     expect(interrupts()).toHaveLength(0);
   });
+
+  it("stopping a working turn before any output lands clears Working… and Thinking… once idle, survives a reload, and lets the next message await", async () => {
+    const now = new Date().toISOString();
+    captured.session = {
+      ...captured.session,
+      status: "busy",
+      state: "working",
+      source_kind: "claude_desktop",
+      capabilities: { read: true, send: true, interrupt: true, plugin_input: true },
+    };
+    transcript.items = [{ id: "u1", seq: 1, role: "user", kind: "text", text: "List my commits", ts: now }];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    expect(stopButton()).not.toBeNull();
+    expect(host.textContent).toContain(t("lib-work-groups.working"));
+    expect(host.textContent).toContain(t("chat-runningstatusbar.thinking"));
+    expect(host.querySelector('[data-running-status="on"]')).not.toBeNull();
+
+    act(() => stopButton()!.click());
+    await flush();
+    expect(interrupts()).toHaveLength(1);
+
+    captured.session = {
+      ...captured.session,
+      status: "idle",
+      state: "idle",
+      capabilities: { read: true, send: true, interrupt: false, plugin_input: true },
+    };
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    expect(stopControl()).toBeNull();
+    expect(host.textContent).not.toContain(t("lib-work-groups.working"));
+    expect(host.querySelector('[data-running-status="on"]')).toBeNull();
+
+    // Reloading the page within AWAIT_MS keeps the interrupted turn stopped via localStorage.
+    act(() => root.unmount());
+    root = createRoot(host);
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    expect(stopControl()).toBeNull();
+    expect(host.textContent).not.toContain(t("lib-work-groups.working"));
+    expect(host.textContent).not.toContain(t("chat-runningstatusbar.thinking"));
+    expect(host.querySelector('[data-running-status="on"]')).toBeNull();
+
+    // Sending a subsequent prompt shows awaiting and Interrupt normally again.
+    transcript.items = [
+      ...transcript.items,
+      { id: "u2", seq: 2, role: "user", kind: "text", text: "Follow up", ts: new Date().toISOString() },
+    ];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    expect(stopButton()).not.toBeNull();
+    expect(host.textContent).toContain(t("lib-work-groups.working"));
+    expect(host.querySelector('[data-running-status="on"]')).not.toBeNull();
+  });
+
+  it("offers Interrupt during awaiting on a plugin-connected outside Claude session before the hub reports working", async () => {
+    captured.session = {
+      ...captured.session,
+      status: "idle",
+      state: "idle",
+      source_kind: "claude_desktop",
+      capabilities: { read: true, send: true, interrupt: false, plugin_input: true },
+    };
+    transcript.items = [{ id: "u1", seq: 1, role: "user", kind: "text", text: "Quick check", ts: new Date().toISOString() }];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    expect(stopButton()).not.toBeNull();
+    expect(host.textContent).toContain(t("lib-work-groups.working"));
+    expect(host.querySelector('[data-running-status="on"]')).not.toBeNull();
+    act(() => stopButton()!.click());
+    await flush();
+    expect(interrupts()).toHaveLength(1);
+    expect(stopControl()).toBeNull();
+    expect(host.textContent).not.toContain(t("lib-work-groups.working"));
+    expect(host.querySelector('[data-running-status="on"]')).toBeNull();
+  });
+
+  it("stopping an answered turn while a second message is queued does not suppress awaiting when the queued message starts", async () => {
+    const now = new Date().toISOString();
+    captured.session = {
+      ...captured.session,
+      status: "busy",
+      state: "working",
+      queued: ["Second turn"],
+      capabilities: { read: true, send: true, interrupt: true },
+    };
+    transcript.items = [
+      { id: "u1", seq: 1, role: "user", kind: "text", text: "First turn", ts: now },
+      { id: "a1", seq: 2, role: "assistant", kind: "text", text: "Partial reply", ts: now },
+    ];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    act(() => stopButton()!.click());
+    await flush();
+    expect(interrupts()).toHaveLength(1);
+
+    captured.session = {
+      ...captured.session,
+      status: "idle",
+      state: "idle",
+      queued: [],
+      capabilities: { read: true, send: true, interrupt: true },
+    };
+    transcript.items = [
+      ...transcript.items,
+      { id: "u2", seq: 3, role: "user", kind: "text", text: "Second turn", ts: new Date().toISOString() },
+    ];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    expect(stopButton()).not.toBeNull();
+    expect(host.textContent).toContain(t("lib-work-groups.working"));
+    expect(host.querySelector('[data-running-status="on"]')).not.toBeNull();
+  });
+
+  it("keeps awaiting intact when the interrupt request fails", async () => {
+    fetcher.mockImplementation(async (url) =>
+      String(url).endsWith("/interrupt")
+        ? new Response(JSON.stringify({ error: "Refused" }), { status: 409, headers: { "Content-Type": "application/json" } })
+        : new Response("{}"),
+    );
+    transcript.items = [{ id: "u1", seq: 1, role: "user", kind: "text", text: "Write a status line", ts: new Date().toISOString() }];
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    act(() => stopButton()!.click());
+    await flush();
+    expect(interrupts()).toHaveLength(1);
+    expect(stopButton()).not.toBeNull();
+    expect(host.textContent).toContain(t("lib-work-groups.working"));
+    expect(host.querySelector('[data-running-status="on"]')).not.toBeNull();
+  });
 });

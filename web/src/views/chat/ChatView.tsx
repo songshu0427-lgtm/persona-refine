@@ -92,7 +92,7 @@ import { navRailTicks, type NavRailSource, type NavRailTick } from "../../lib/na
 import { containsInput, indexedNavTicks, userInputRevision, windowUserInputs, USER_INPUT_PAGE_SIZE } from "../../lib/user-input-index";
 import { useRevealedInputSeq, useUserInputs } from "./useUserInputs";
 import { useChatScrollbar } from "./useChatScrollbar";
-import { ChatLineView, closedRecap, closeRecap, dismissedError, dismissError, ErrorBanner, errorKey, OpenRecapLine } from "./Lines";
+import { ChatLineView, closedRecap, closeRecap, dismissedError, dismissError, ErrorBanner, errorKey, OpenRecapLine, stoppedTurn, stopTurn } from "./Lines";
 import { useTranscript } from "./useTranscript";
 import { publishTranscript, unpublishTranscript } from "./transcript-share";
 import { useEarlierStretches } from "./useEarlierStretches";
@@ -489,14 +489,18 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
   const latestTime = lastSeg?.answer?.ts ?? lastSeg?.user?.ts;
   const [awaitNow, setAwaitNow] = useState(() => Date.now());
   const turnFailure = session?.failure_reason ? { since: session.state_since } : undefined;
-  // a message whose wait the hub took a stop for (#2450): it is no longer worked on, so Working… and Interrupt go at
-  // once instead of after AWAIT_MS; a turn the hub reports later still shows through `state`
-  const [stoppedTurn, setStoppedTurn] = useState<string>();
-  const awaitedTurn = awaitingTurn(lastSeg, state, awaitNow, turnFailure) ? lastSeg?.user?.id : undefined;
-  const awaiting = awaitedTurn !== undefined && awaitedTurn !== stoppedTurn;
-  const awaitingNow = useRef<string | undefined>(undefined);
-  awaitingNow.current = awaiting ? awaitedTurn : undefined;
+  // a message whose wait or turn the hub took a stop for (#2450): once the session goes back to idle with no answer,
+  // Working… and Thinking… go at once instead of staying up for AWAIT_MS; a turn the hub reports later still shows through `state`
+  const recapKey = `${mid}/${sid}`;
+  const [stoppedTurnId, setStoppedTurnId] = useState(() => stoppedTurn(recapKey));
+  useEffect(() => setStoppedTurnId(stoppedTurn(recapKey)), [recapKey]);
   const lastAnswered = Boolean(lastSeg?.steps.length || lastSeg?.answer);
+  const awaitedTurn = awaitingTurn(lastSeg, state, awaitNow, turnFailure) ? lastSeg?.user?.id : undefined;
+  const awaiting = awaitedTurn !== undefined && awaitedTurn !== stoppedTurnId;
+  const awaitingNow = useRef(false);
+  awaitingNow.current = awaiting;
+  const unansweredNow = useRef<string | undefined>(undefined);
+  unansweredNow.current = !lastAnswered ? lastSeg?.user?.id : undefined;
   useEffect(() => {
     // draw again when the wait runs out, so a message nobody picks up stops looking worked on; once something answers
     // it there is nothing to wait for (and no clock to reset on every streamed item)
@@ -1279,11 +1283,13 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
     stopInFlight.current = false;
     setStopping(false);
   }, []);
+  const canStop = (s = session, wait = awaiting) =>
+    sessionCan(s, "interrupt") || Boolean(wait && s?.capabilities?.plugin_input);
   const interrupt = useCallback(async () => {
-    if (stopInFlight.current || !sessionCan(getSession(mid, sid), "interrupt")) return;
+    if (stopInFlight.current || !canStop(getSession(mid, sid), awaitingNow.current)) return;
     stopInFlight.current = true;
     setStopping(true);
-    const waited = awaitingNow.current;
+    const waited = unansweredNow.current;
     try {
       // the hub gives the computer 90 s: past that the link is dead, and a request that never ends must not hold the block
       const r = await apiOp<{ state?: string }>(`${sessionPath(mid, sid)}/interrupt`, { method: "POST", timeout: pastHub(90_000) });
@@ -1291,13 +1297,18 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
       if (r.state === "unknown") throw new Error(t("lib-new-agent.outcome_unknown"));
       toast(t("chat-chatview.interrupted"));
       stopMessageFeedback(mid, sid);
-      if (waited) setStoppedTurn(waited);
-      stopTimer.current = window.setTimeout(stopDone, STOP_SETTLE_MS);
+      if (waited) {
+        stopTurn(recapKey, waited);
+        setStoppedTurnId(waited);
+      }
+      const cur = getSession(mid, sid);
+      if (!cur || stateOf(cur) !== "working") stopDone();
+      else stopTimer.current = window.setTimeout(stopDone, STOP_SETTLE_MS);
     } catch (e) {
       toast(t("chat-chatview.interrupt_failed", { error: errorText(e) }), "error");
       stopDone();
     }
-  }, [mid, sid, stopDone]);
+  }, [mid, sid, recapKey, stopDone]);
   // the turn ended, and not necessarily by this stop
   useEffect(() => {
     if (state !== "working") stopDone();
@@ -1850,7 +1861,6 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
   }, [bannerKey]);
   // Claude Code's "while you were away" recap, open in full while it is the newest thing and not closed: the chat's last
   // line, in the flow with the agent's words (#1360: above the composer it covered the end of the reply)
-  const recapKey = `${mid}/${sid}`;
   const [recapClosed, setRecapClosed] = useState(() => closedRecap(recapKey));
   useEffect(() => setRecapClosed(closedRecap(recapKey)), [recapKey]);
   const newestRecap = !assistant && lastLine?.kind === "recaps" ? lastLine.items[lastLine.items.length - 1] : undefined;
@@ -2305,7 +2315,7 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
           editingLast={editProp}
           loadingDraft={editingLast}
           // Persona's conversations too, the main one included (#1467): the node stops their turn like an agent's
-          onStop={sessionCan(session, "interrupt") ? interrupt : undefined}
+          onStop={canStop() ? interrupt : undefined}
           stopping={stopping}
           commands={commands}
           suggestion={session?.suggestion}

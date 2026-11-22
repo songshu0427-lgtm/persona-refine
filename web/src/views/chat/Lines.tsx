@@ -271,6 +271,11 @@ export const closeRecap = (key: string, id: string) => closeIn(CLOSED_RECAPS, ke
 export const dismissedError = (key: string) => closedIn(DISMISSED_ERRORS, key);
 export const dismissError = (key: string, error: string) => closeIn(DISMISSED_ERRORS, key, error);
 
+/** The unanswered user message whose turn was interrupted per conversation, kept in this browser so returning to or
+ *  reloading the chat within AWAIT_MS does not show it as awaiting again. */
+export const stoppedTurn = (key: string) => closedIn("persona.stoppedTurns", key);
+export const stopTurn = (key: string, id: string) => closeIn("persona.stoppedTurns", key, id);
+
 // ── model API errors ──
 
 type APIErrorLine = Extract<ChatLine, { kind: "apiError" }>;
