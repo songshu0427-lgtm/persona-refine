@@ -3,8 +3,8 @@
 import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { t } from "../i18n";
 import { isSpaceMuted } from "../lib/agent-filter";
-import { isQuiet, sessionHost, type AgentMutes, type Space } from "../lib/agent-groups";
-import { showsWorktreeLevel, type RepoMachine, type RepoTree, type RepoWorktree } from "../lib/agent-repos";
+import { byRepoActivity, isQuiet, sessionHost, type AgentMutes, type Space } from "../lib/agent-groups";
+import { type RepoMachine, type RepoTree, type RepoWorktree } from "../lib/agent-repos";
 import { paneRoute, tabRowKeys, type ChildStates, type HerdrMachine, type HerdrSpace, type HerdrTab } from "../lib/herdr-tree";
 import { machineWithHub } from "../lib/mesh";
 import { agentLabel } from "../lib/mentions";
@@ -405,22 +405,28 @@ function RepoSection({ tree, machineId, online, machineLauncher, sideChildren, r
   const row = (s: Session, hint?: string) => (
     <RepoSessionItem key={`s:${s.machine_id}/${s.session_id}`} s={s} sides={sideChildren?.get(`${s.machine_id}/${s.session_id}`)} hint={hint} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} />
   );
-  // A lone main checkout, or an Orca worktree whose folder names its project, needs no extra level.
-  const flat = !showsWorktreeLevel(tree);
+  // Plain project folders never render an extra git branch / worktree tree in the sidebar: sessions sit directly under
+  // their project folder, while catalog-managed workspaces (Orca / Paseo / Herdr) keep their explicit workspace tree.
+  const hasCatalogWorkspace = tree.worktrees.some((w) => Boolean(w.workspace));
+  const flat = !hasCatalogWorkspace;
   const w0 = tree.worktrees[0];
   // A single catalog workspace whose folder name already matches the repository (e.g. herdr's `agent-smoke`) renders as a
   // single folder header instead of repeating `agent-smoke` › `agent-smoke`.
-  const singleWorkspace = !flat && tree.worktrees.length === 1 && Boolean(w0?.workspace) && w0!.name === tree.name && w0!.children.length === 0 && !w0!.branch;
-  const repoSessions = useMemo(() => tree.worktrees.flatMap((w) => w.tree), [tree.worktrees]);
+  const singleWorkspace = hasCatalogWorkspace && tree.worktrees.length === 1 && Boolean(w0?.workspace) && w0!.name === tree.name && w0!.children.length === 0;
+  const repoSessions = useMemo(() => {
+    const all = tree.worktrees.flatMap((w) => w.tree);
+    return tree.worktrees.length > 1 ? [...all].sort(byRepoActivity) : all;
+  }, [tree.worktrees]);
   const repoLauncher = preferredNativeLauncher(repoSessions) ?? machineLauncher;
-  const primaryPath = w0?.path || tree.key.split("\u0000")[1] || "";
+  const mainCheckout = tree.worktrees.find((w) => w.main) ?? w0;
+  const primaryPath = mainCheckout?.path || (/^(\/|[a-zA-Z]:[\\/])/.test(tree.repo) ? tree.repo : "");
   const startInRepo = online && (w0?.target || primaryPath)
     ? () => openNewAgent(w0?.target && tree.worktrees.length === 1 ? { workspace: w0.target } : { machineId, cwd: primaryPath, launcher: repoLauncher })
     : undefined;
   if (singleWorkspace && w0) {
     return <RepoWorktreeRows w={w0} repo={tree.name} topRepo onAdd={startInRepo} row={row} activeKey={activeKey} holdsSide={holdsSide} go={go} selected={selected} {...actions} />;
   }
-  const flatSessions = flat && w0 ? w0.sessions : [];
+  const flatSessions = flat ? repoSessions : [];
   const shownFlat = showAll || flatSessions.length <= REPO_INITIAL_LIMIT
     ? flatSessions
     : firstAndCurrent(flatSessions, REPO_INITIAL_LIMIT, (s) => rowKey(s) === activeKey || Boolean(sideChildren?.get(`${s.machine_id}/${s.session_id}`)?.some((c) => rowKey(c) === activeKey)));

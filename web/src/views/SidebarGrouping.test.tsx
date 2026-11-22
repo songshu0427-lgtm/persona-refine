@@ -156,11 +156,27 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
       session_id: "p-main",
       title: "meta-rsi (test)",
       cwd: "/Users/demo/code/business-meta/notes",
+      repo_root: "/Users/demo/code/business-meta",
+      worktree: "/Users/demo/code/business-meta",
+      branch: "feat/batch-sites-n20-v20261121",
       space_kind: "claude_desktop",
       space_id: "codex-project:/Users/demo/code/business-meta",
       status: "idle",
       state: "idle",
       updated_at: "2026-11-22T08:00:00Z",
+    };
+    const worktreeSession: Session = {
+      machine_id: "mac",
+      session_id: "p-wt",
+      title: "worktree 里跑的对话",
+      cwd: "/Users/demo/code/business-meta/.claude/worktrees/exp-wt",
+      repo_root: "/Users/demo/code/business-meta",
+      worktree: "/Users/demo/code/business-meta/.claude/worktrees/exp-wt",
+      branch: "exp-wt",
+      space_kind: "claude_desktop",
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-22T07:30:00Z",
     };
     const sideLive: Session = {
       machine_id: "mac",
@@ -215,9 +231,9 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
       const path = new URL(url, "http://hub").pathname;
       if (path === "/api/v1/todos") return json({ todos: [] });
       if (path === "/api/v1/machines") return json({ machines: [mac, devbox] });
-      if (path === "/api/v1/sessions") return json({ sessions: [parent, sideLive, nestedSubdirOffline, codexThread, smokeManual], total: 5, has_more: false, revision: "r1" });
+      if (path === "/api/v1/sessions") return json({ sessions: [parent, sideLive, worktreeSession, nestedSubdirOffline, codexThread, smokeManual], total: 6, has_more: false, revision: "r1" });
       if (path === "/api/v1/workspaces") return json({
-        workspaces: [{ machine_id: "devbox", source: "herdr", workspace_id: "ws-smoke", title: "agent-smoke", cwd: "/home/demo/agent-smoke", available: true }],
+        workspaces: [{ machine_id: "devbox", source: "herdr", workspace_id: "ws-smoke", title: "agent-smoke", cwd: "/home/demo/agent-smoke", branch: "main", available: true }],
       });
       return json({});
     }));
@@ -225,13 +241,16 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
     await render();
     await flush();
 
-    // 1. Offline desktop sessions + nested subdirectory + side session are all shown inside `business-meta`
+    // 1. Offline desktop sessions + nested subdirectory + worktree session + side session are all shown flat inside `business-meta` with NO git branch/worktree tree
     const text = agentsBlock().textContent ?? "";
     expect(text).toContain("business-meta");
     expect(text).toContain("meta-rsi (test)");
     expect(text).toContain("英文rsi");
+    expect(text).toContain("worktree 里跑的对话");
     expect(text).toContain("Codex 同项目分析");
     expect(text).toContain("结构化解析新事项");
+    expect(text).not.toContain("feat/batch-sites-n20-v20261121");
+    expect(text).not.toContain("个智能体");
     expect(text).not.toContain("最近（未运行）");
 
     // 2. Single same-named catalog workspace (`agent-smoke`) renders no duplicate nested header and no `派出` badge
