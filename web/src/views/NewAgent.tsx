@@ -207,8 +207,9 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
     submitted.current = true;
     onClose();
   };
-  // a preset's folder, put in once its computer is the chosen one (choosing a computer loads that one's last folder)
+  // a preset's folder/launcher, put in once its computer is the chosen one (choosing a computer loads that one's last folder)
   const presetCwd = useRef<{ mid: string; cwd: string } | null>(null);
+  const presetLauncher = useRef<{ mid: string; launcher?: string } | null>(null);
   // The recent setups (#2134), read again each time the sheet opens; the card a tap filled the form from (its mark stays
   // while the form still holds what it put in).
   const [recents, setRecents] = useState(loadRecentSetups);
@@ -310,6 +311,7 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
   useEffect(() => {
     if (!open) return;
     presetCwd.current = null;
+    presetLauncher.current = null;
     setWorkspacePicked(false);
     if (!preset) {
       setWorkspace(null);
@@ -338,10 +340,11 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
       setInWorktree(false);
       return;
     }
-    if (preset.machineId && preset.cwd && online.some((m) => m.id === preset.machineId)) {
-      presetCwd.current = { mid: preset.machineId, cwd: preset.cwd };
+    if (preset.machineId && online.some((m) => m.id === preset.machineId)) {
+      presetLauncher.current = { mid: preset.machineId, launcher: preset.launcher };
+      presetCwd.current = { mid: preset.machineId, cwd: preset.cwd ?? "" };
       setMid(preset.machineId);
-      pickCwd(preset.cwd);
+      if (preset.cwd) pickCwd(preset.cwd);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, preset]);
@@ -371,6 +374,20 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
   // run it now (#1643: then the first that can), with this computer's latest model for it in the recent setups. No model
   // list for it (the configuration runs no launcher): no model.
   const restoreLauncher = (machine: string, card: RecentSetup | null, ls: Launcher[], effective: ModelBinding | null, carry: ModelChoice | null = null) => {
+    const requested = presetLauncher.current?.mid === machine ? presetLauncher.current : null;
+    if (requested) presetLauncher.current = null;
+    if (!card && !carry && requested) {
+      const explicit = requested.launcher && ls.some((l) => l.name === requested.launcher) ? requested.launcher : "";
+      const fallbackDesktop = !explicit ? (ls.find((l) => l.name === "claude-desktop")?.name ?? ls.find(startsInDesktopApp)?.name ?? "") : "";
+      const nativePick = explicit || fallbackDesktop;
+      if (nativePick) {
+        touched.current = true;
+        setLauncher(nativePick);
+        setModel(machineModel(loadRecentSetups(), machine, nativePick));
+        setEffort("");
+        return;
+      }
+    }
     if (!card && carry && (carry.launcher || effective !== null) && choiceCarries(carry, ls)) {
       touched.current = true; // still the user's: it goes on to the computer after this one too
       setLauncher(carry.launcher);
@@ -446,10 +463,10 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
     const p = presetCwd.current;
     if (p?.mid === mid) presetCwd.current = null;
     const card = pendingSetup.current?.machine === mid ? pendingSetup.current : null;
-    const filled = card ? card.cwd : p?.mid === mid ? p.cwd : (localStorage.getItem(`new.cwd.${mid}`) ?? "");
+    const filled = card ? card.cwd : p?.mid === mid && p.cwd ? p.cwd : (localStorage.getItem(`new.cwd.${mid}`) ?? "");
     setCwd(filled);
-    // the last start's folder is not picked; a card's is (a card of a temporary session has none)
-    setCwdPicked(card ? Boolean(card.cwd) : p?.mid === mid);
+    // the last start's folder is not picked; a card's or explicit preset folder is (a temporary session or machine-only preset has none)
+    setCwdPicked(card ? Boolean(card.cwd) : Boolean(p?.mid === mid && p.cwd));
     setMode(card?.agent_type === "claude" ? card.mode : (localStorage.getItem(`new.mode.${mid}`) ?? ""));
     followFilled(filled);
     setNaming(false);
@@ -513,6 +530,8 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
   // A start in a desktop app (lib/desktop-start.ts, #5480 Claude's, #5726 the Codex App): no folder picked is a temporary
   // session, browsing starts in the folder holding the app's projects (worked out when the computer or the launcher
   // changes, not on every push), and a new folder may be named.
+  const desktopLaunchers = useMemo(() => launchers.filter(startsInDesktopApp), [launchers]);
+  const cliLauncher = useMemo(() => launchers.find((l) => !startsInDesktopApp(l)), [launchers]);
   const desktopLauncher = runs ? launchers.find((l) => l.name === runs) : undefined;
   const desktopStart = startsInDesktopApp(desktopLauncher);
   const codexApp = desktopLauncher?.source === CODEX_APP_SOURCE;
@@ -908,6 +927,34 @@ function AgentForm({ open, onClose, preset }: NewAgentProps) {
               )}
               {wtError && <p role="alert" className="mt-1 pl-[21px] text-[11.5px] leading-snug text-red">{t("newagent.worktree_failed", { error: wtError })}</p>}
             </div>
+          )}
+
+          {!workspace && desktopLaunchers.length > 0 && (
+            <Field label={t("lib-agent-groups.source_desktop")}>
+              <div data-testid="start-surface" className="flex flex-wrap gap-1.5">
+                {desktopLaunchers.map((l) => (
+                  <Choice
+                    key={l.name}
+                    selected={runs === l.name}
+                    onClick={() => pickModel({ launcher: l.name, model: machineModel(loadRecentSetups(), mid, l.name), effort: "" })}
+                  >
+                    {launcherTitle(l.name, names)}
+                  </Choice>
+                ))}
+                {(unified || Boolean(cliLauncher)) && (
+                  <Choice
+                    selected={!desktopStart}
+                    onClick={() => {
+                      const defaultCli = unified && !startsInDesktopApp(launchers.find((l) => l.name === defaultRuns));
+                      if (defaultCli) followDefault();
+                      else if (cliLauncher) pickModel({ launcher: cliLauncher.name, model: machineModel(loadRecentSetups(), mid, cliLauncher.name), effort: "" });
+                    }}
+                  >
+                    {t("lib-agent-groups.source_terminal")}
+                  </Choice>
+                )}
+              </div>
+            </Field>
           )}
 
           {!workspace && !desktopStart && hosts.length > 1 && (

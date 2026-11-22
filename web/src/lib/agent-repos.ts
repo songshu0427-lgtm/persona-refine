@@ -150,6 +150,22 @@ function containingOrcaWorktree(s: Session, known: ReadonlyMap<string, OrcaWorkt
   return undefined;
 }
 
+/** Desktop project root advertised by Claude Desktop / Codex App (`codex-project:<path>`), when `cwd` sits inside it
+ *  without crossing into a separate git worktree marker. */
+function desktopProjectRoot(s: Session): string | undefined {
+  if (!s.space_id?.startsWith("codex-project:")) return undefined;
+  const root = trimmed(s.space_id.slice("codex-project:".length));
+  if (!root) return undefined;
+  const cwd = trimmed(s.cwd);
+  if (!cwd) return root;
+  if (cwd !== root && !cwd.startsWith(`${root}/`)) return undefined;
+  const below = cwd === root ? "" : cwd.slice(root.length + 1);
+  if (WORKTREE_SEGMENTS.some(([marker]) => below.startsWith(marker.slice(1)))) return undefined;
+  return root;
+}
+
+const isDesktopProjectSession = (s: Session) => s.space_kind === "claude_desktop" || s.space_kind === "codex_app";
+
 /** Orca's exact project id wins for its own sessions and for any source running inside a known Orca worktree.
  *  Other sessions keep the host-supplied root or path inference. */
 function placementOf(s: Session, known: ReadonlyMap<string, OrcaWorktree>): Placement {
@@ -162,8 +178,9 @@ function placementOf(s: Session, known: ReadonlyMap<string, OrcaWorktree>): Plac
     return { repo: `orca:${orca.repoId}`, name: baseName(orca.path), worktree: orca.spaceId, path: orca.path, main: false, spaceId: orca.spaceId };
   }
   if (git) return { ...git, path: git.worktree, git: true };
-  if (s.repo_root) {
-    const where = repoOf(s.cwd ?? "", s.repo_root);
+  const projectRoot = s.repo_root || desktopProjectRoot(s);
+  if (projectRoot) {
+    const where = repoOf(s.cwd ?? "", projectRoot);
     return { ...where, path: where.worktree };
   }
   const where = repoOf(s.cwd ?? "", undefined);
@@ -243,15 +260,28 @@ type RepoBucket = { tree: RepoTree; orca: boolean; git: boolean; bySpace: Map<st
 
 /** Build one computer's repositories. Learn Orca worktrees from live Orca-hosted sessions first, so every agent source
  *  running in one can share its exact identity; without a live Orca-hosted session its path is not known to be Orca's. */
-function buildRepos(sessions: Session[], machineId: string): RepoTree[] {
+function buildRepos(sessions: Session[], machineId: string, compareSessions: (a: Session, b: Session) => number = byAttention): RepoTree[] {
   const known = new Map<string, OrcaWorktree>();
+  const desktopRoots = new Set<string>();
   for (const s of sessions) {
     const worktree = orcaSpace(s);
     if (worktree && !known.has(worktree.path)) known.set(worktree.path, worktree);
+    if (isDesktopProjectSession(s)) {
+      const candidate = desktopProjectRoot(s) || trimmed(s.repo_root) || trimmed(s.cwd);
+      if (candidate && segments(candidate).length >= 3 && !WORKTREE_SEGMENTS.some(([marker]) => candidate.includes(marker))) {
+        desktopRoots.add(candidate);
+      }
+    }
   }
+  const orderedDesktopRoots = [...desktopRoots].sort((a, b) => a.length - b.length);
   const repos = new Map<string, RepoBucket>();
   for (const s of sessions) {
-    const where = placementOf(s, known);
+    let where = placementOf(s, known);
+    if (!where.spaceId && isDesktopProjectSession(s) && where.repo) {
+      const enclosing = orderedDesktopRoots.find((root) => where.repo !== root && where.repo.startsWith(`${root}/`)
+        && !WORKTREE_SEGMENTS.some(([marker]) => where.repo.slice(root.length + 1).startsWith(marker.slice(1))));
+      if (enclosing) where = { repo: enclosing, name: baseName(enclosing), worktree: enclosing, path: enclosing, main: true, git: where.git };
+    }
     const key = `${machineId}\u0000${where.repo}`;
     let bucket = repos.get(key);
     if (!bucket) {
@@ -294,7 +324,7 @@ function buildRepos(sessions: Session[], machineId: string): RepoTree[] {
     const { tree } = bucket;
     const orcaTrees = new Set(bucket.bySpace.values());
     for (const w of tree.worktrees) {
-      w.sessions.sort(byAttention);
+      w.sessions.sort(compareSessions);
       if (bucket.orca && !bucket.git) w.main = w.sessions.some((s) => (s.repo_root ?? "").replace(/\/+$/, "") === w.path);
       // A linked tree takes the name its host gave it (#4497), its branch staying beside it; its key stays its path.
       // The main checkout keeps its name (several workspaces can share it), and Orca's trees keep Orca's naming.
@@ -380,7 +410,7 @@ function repositoryWorkspace(s: Session, catalog: readonly HostWorkspace[], mana
 
 /** Older hubs still get title navigation for pinned Agents, without rendering or counting them twice. */
 function legacyNavigationRepos(sessions: Session[], machineId: string, options: RepoCatalogOptions): RepoTree[] {
-  if (!options.navigationSessions) return buildRepos(sessions, machineId);
+  if (!options.navigationSessions) return buildRepos(sessions, machineId, options.compareSessions);
   const navigation = options.navigationSessions.filter((s) => !s.assistant && s.machine_id === machineId);
   const drawn = new Set(sessions);
   const fill = (w: RepoWorktree): Session[] => {
@@ -397,7 +427,7 @@ function legacyNavigationRepos(sessions: Session[], machineId: string, options: 
     }
     return w.tree;
   };
-  return buildRepos(navigation, machineId).map((repo) => ({ ...repo, count: repo.worktrees.flatMap(fill).length }));
+  return buildRepos(navigation, machineId, options.compareSessions).map((repo) => ({ ...repo, count: repo.worktrees.flatMap(fill).length }));
 }
 
 function catalogRepos(sessions: Session[], machineId: string, options: RepoCatalogOptions): RepoTree[] {

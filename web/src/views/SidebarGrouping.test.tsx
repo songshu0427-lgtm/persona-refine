@@ -12,6 +12,7 @@ vi.hoisted(() => {
 });
 import { t } from "../i18n";
 import { filterAgentList, resetAgentListFilters } from "../lib/agent-list-filters";
+import { onOpenNewAgent, type NewAgentPreset } from "../lib/new-agent";
 import { refresh, reset } from "../lib/store";
 import type { Todo } from "../lib/todos";
 import type { Machine, Session } from "../lib/types";
@@ -145,6 +146,105 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
     await render();
     expect(checked()).toBe("按仓库");
     expect(agentsBlock().textContent).not.toContain("加载中…");
+  });
+
+  it("仓库 view merges Claude Desktop + Codex App project history, expands side sessions, flattens single workspaces, and opens native New Agent with project preset", async () => {
+    localStorage.setItem("persona.agentGrouping", "repo");
+    const devbox: Machine = { id: "devbox", name: "ARM DevBox", online: true };
+    const parent: Session = {
+      machine_id: "mac",
+      session_id: "p-main",
+      title: "meta-rsi (test)",
+      cwd: "/Users/demo/code/business-meta/notes",
+      space_kind: "claude_desktop",
+      space_id: "codex-project:/Users/demo/code/business-meta",
+      status: "idle",
+      state: "idle",
+      updated_at: "2026-11-22T08:00:00Z",
+    };
+    const sideLive: Session = {
+      machine_id: "mac",
+      session_id: "p-side-1",
+      title: "英文rsi",
+      cwd: "/Users/demo/code/business-meta",
+      space_kind: "claude_desktop",
+      space_id: "codex-project:/Users/demo/code/business-meta",
+      folded_under: "p-main",
+      folded_as: "side",
+      status: "idle",
+      state: "idle",
+      updated_at: "2026-11-22T08:10:00Z",
+    };
+    const nestedSubdirOffline: Session = {
+      machine_id: "mac",
+      session_id: "p-sub",
+      title: "结构化解析新事项",
+      cwd: "/Users/demo/code/business-meta/exp/subrepo",
+      repo_root: "/Users/demo/code/business-meta/exp/subrepo",
+      space_kind: "claude_desktop",
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-21T08:00:00Z",
+    };
+    const codexThread: Session = {
+      machine_id: "mac",
+      session_id: "p-codex",
+      title: "Codex 同项目分析",
+      cwd: "/Users/demo/code/business-meta",
+      space_kind: "codex_app",
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-21T12:00:00Z",
+    };
+    const smokeManual: Session = {
+      machine_id: "devbox",
+      session_id: "s-smoke",
+      title: "执行测试",
+      cwd: "/home/demo/agent-smoke",
+      space_kind: "herdr",
+      space_id: "ws-smoke",
+      space_name: "agent-smoke",
+      started_by_persona: true,
+      status: "idle",
+      state: "idle",
+      updated_at: "2026-11-22T09:00:00Z",
+    };
+    const openedPresets: NewAgentPreset[] = [];
+    const offPreset = onOpenNewAgent((p) => openedPresets.push(p));
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      const path = new URL(url, "http://hub").pathname;
+      if (path === "/api/v1/todos") return json({ todos: [] });
+      if (path === "/api/v1/machines") return json({ machines: [mac, devbox] });
+      if (path === "/api/v1/sessions") return json({ sessions: [parent, sideLive, nestedSubdirOffline, codexThread, smokeManual], total: 5, has_more: false, revision: "r1" });
+      if (path === "/api/v1/workspaces") return json({
+        workspaces: [{ machine_id: "devbox", source: "herdr", workspace_id: "ws-smoke", title: "agent-smoke", cwd: "/home/demo/agent-smoke", available: true }],
+      });
+      return json({});
+    }));
+    await refresh();
+    await render();
+    await flush();
+
+    // 1. Offline desktop sessions + nested subdirectory + side session are all shown inside `business-meta`
+    const text = agentsBlock().textContent ?? "";
+    expect(text).toContain("business-meta");
+    expect(text).toContain("meta-rsi (test)");
+    expect(text).toContain("英文rsi");
+    expect(text).toContain("Codex 同项目分析");
+    expect(text).toContain("结构化解析新事项");
+    expect(text).not.toContain("最近（未运行）");
+
+    // 2. Single same-named catalog workspace (`agent-smoke`) renders no duplicate nested header and no `派出` badge
+    expect(agentsBlock().querySelector('[data-persona-dispatched]')).toBeNull();
+    const smokeButtons = [...agentsBlock().querySelectorAll("button")].filter((b) => b.textContent?.trim() === "agent-smoke");
+    expect(smokeButtons).toHaveLength(1);
+
+    // 3. Clicking `+` on `business-meta` opens New Agent pre-filled with mac + project cwd + claude-desktop launcher
+    const addBusinessMeta = agentsBlock().querySelector<HTMLButtonElement>('button[aria-label="新建 Agent · business-meta"]');
+    expect(addBusinessMeta).not.toBeNull();
+    act(() => addBusinessMeta!.click());
+    expect(openedPresets).toEqual([{ machineId: "mac", cwd: "/Users/demo/code/business-meta", launcher: "claude-desktop" }]);
+    offPreset();
   });
 });
 

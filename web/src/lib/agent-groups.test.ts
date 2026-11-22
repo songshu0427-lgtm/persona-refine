@@ -30,18 +30,19 @@ describe("Agent 分组偏好", () => {
 });
 
 describe("状态视图分组（需要你 → 进行中 → 派出任务 → 最近 → 已屏蔽）", () => {
-  it("固定顺序：需要你 → 进行中 → 派出任务（默认展开并识别督办/worktree 任务）→ 最近（手动会话 100% 保留）→ 已屏蔽（折叠）", () => {
+  it("固定顺序：需要你 → 进行中 → 派出任务（默认展开并仅识别督办/worktree 任务，普通手动新建不误判为派出）→ 最近 → 已屏蔽（折叠）", () => {
     const dispatchedKeys = dispatchedSessionKeys([
       { id: "td-supervised", supervision: { mode: "auto" }, agents: [{ machine_id: "machine-a", session_id: "todo-worker" }] } as never,
+      { id: "td-origin", origin: "assistant", agents: [{ machine_id: "machine-a", session_id: "origin-worker" }] } as never,
       { id: "td-manual", agents: [{ machine_id: "machine-a", session_id: "manual-linked" }] } as never,
     ]);
     const all = [
       session("manual-idle", "idle"),
       session("manual-linked", "idle"),
-      session("persona-done", "idle", { started_by_persona: true }),
+      session("webui-manual", "idle", { started_by_persona: true }),
       session("todo-worker", "idle", { updated_at: date(4) }),
       session("worktree-worker", "idle", { cwd: "/Users/demo/.herdr/worktrees/persona/task-todo-39102cb2935e49da", updated_at: date(5) }),
-      session("persona-unread", "unread", { started_by_persona: true }),
+      session("origin-worker", "unread", { updated_at: date(3) }),
       session("persona-working", "working", { started_by_persona: true }),
       session("persona-needs", "needs_you", { started_by_persona: true }),
       session("manual-working", "working"),
@@ -51,9 +52,10 @@ describe("状态视图分组（需要你 → 进行中 → 派出任务 → 最�
       session("muted-working", "working"),
     ];
     const offline = [
-      session("manual-offline", "offline", { updated_at: date(2) }),
-      session("persona-offline", "offline", { started_by_persona: true, updated_at: date(3) }),
+      session("manual-offline", "offline", { started_by_persona: true, updated_at: date(2) }),
+      session("dispatched-offline", "offline", { cwd: "/Users/demo/.herdr/worktrees/persona/task-todo-999", updated_at: date(6) }),
     ];
+    expect(isDispatchedSession(all[2], dispatchedKeys)).toBe(false);
     expect(isDispatchedSession(all[3], dispatchedKeys)).toBe(true);
     expect(isDispatchedSession(all[4], dispatchedKeys)).toBe(true);
     expect(isDispatchedSession(all[1], dispatchedKeys)).toBe(false);
@@ -61,9 +63,9 @@ describe("状态视图分组（需要你 → 进行中 → 派出任务 → 最�
     expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "派出任务", "最近", "已屏蔽"]);
     expect(ids(groups[0].sessions)).toEqual(["persona-needs"]);
     expect(ids(groups[1].sessions)).toEqual(["manual-working", "persona-working", "waiting"]);
-    expect(ids(groups[2].sessions)).toEqual(["worktree-worker", "todo-worker", "persona-offline", "persona-done", "persona-unread"]);
+    expect(ids(groups[2].sessions)).toEqual(["dispatched-offline", "worktree-worker", "todo-worker", "origin-worker"]);
     expect(groups[2].initialLimit).toBe(5);
-    expect(ids(groups[3].sessions)).toEqual(["manual-unread", "manual-idle", "manual-linked", "unknown", "manual-offline"]);
+    expect(ids(groups[3].sessions)).toEqual(["manual-unread", "manual-idle", "manual-linked", "webui-manual", "unknown", "manual-offline"]);
     expect(groups[3].initialLimit).toBe(8);
     expect(groups.slice(0, 4).every((g) => !g.folded)).toBe(true);
     expect(groups[4].folded).toBe(true);

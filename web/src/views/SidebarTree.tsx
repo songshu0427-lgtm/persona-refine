@@ -1,6 +1,6 @@
 // The Agents section's trees (by to-do, repository, space, machine, terminal) and the rows they hold. Imports only
 // SidebarParts and SidebarRows among the sidebar's files.
-import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef } from "react";
+import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { t } from "../i18n";
 import { isSpaceMuted } from "../lib/agent-filter";
 import { isQuiet, sessionHost, type AgentMutes, type Space } from "../lib/agent-groups";
@@ -8,7 +8,9 @@ import { showsWorktreeLevel, type RepoMachine, type RepoTree, type RepoWorktree 
 import { paneRoute, tabRowKeys, type ChildStates, type HerdrMachine, type HerdrSpace, type HerdrTab } from "../lib/herdr-tree";
 import { machineWithHub } from "../lib/mesh";
 import { agentLabel } from "../lib/mentions";
-import { baseName } from "../lib/format";
+import { baseName, stateOf } from "../lib/format";
+import { openNewAgent } from "../lib/new-agent";
+import { firstAndCurrent } from "../lib/persona-nav";
 import { href, navigate, useRoute, type Route } from "../lib/router";
 import { terminalTarget } from "../lib/session-view";
 import { useStore } from "../lib/store";
@@ -29,6 +31,8 @@ import { sameValue } from "../lib/stable-lines";
 import { stateCount } from "../lib/state-labels";
 import { neverConnected } from "../lib/add-computer";
 import { type GoFn, GroupCount, holdsRow, type NodeMenuFn, type RegFn, rowKey, type RowMenuFn, Section, SidebarGroup } from "./SidebarParts";
+import { ShowMoreRow } from "./SidebarSection";
+import { SectionAdd } from "./SectionAdd";
 import { NavRow, SessionRow } from "./SidebarRows";
 import { WindowedRows } from "./WindowedRows";
 import { workspacePinTime, type WorkspaceTarget } from "../lib/workspace-catalog";
@@ -284,20 +288,84 @@ export interface WorkspaceTreeActions {
 
 const holdsWorkspace = (w: RepoWorktree, key?: string): boolean => Boolean(key && (w.key === key || w.children.some((child) => holdsWorkspace(child, key))));
 
+const REPO_INITIAL_LIMIT = 15;
+
+function preferredNativeLauncher(...groups: (readonly Session[] | undefined)[]): string | undefined {
+  for (const list of groups) {
+    if (!list?.length) continue;
+    if (list.some((s) => s.space_kind === "claude_desktop")) return "claude-desktop";
+    if (list.some((s) => s.space_kind === "codex_app")) return "codex-app";
+  }
+  return undefined;
+}
+
+const RepoSessionItem = memo(function RepoSessionItem({ s, sides, hint, reg, hover, activeKey, go, onRowMenu }: {
+  s: Session;
+  sides?: readonly Session[];
+  hint?: string;
+  reg: RegFn;
+  hover: (k: string | null) => void;
+  activeKey: string;
+  go: GoFn;
+  onRowMenu: RowMenuFn;
+}) {
+  const key = `s:${s.machine_id}/${s.session_id}`;
+  const hasSides = Boolean(sides && sides.length > 0);
+  const allOffline = stateOf(s) === "offline" && (!sides || sides.every((c) => stateOf(c) === "offline"));
+  const [folded, toggle] = useFolded(`sides:${s.machine_id}/${s.session_id}`, allOffline, { holds: Boolean(sides && holdsRow(sides, activeKey)) });
+  if (!hasSides) {
+    return <SessionRow s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} hideDispatchedBadge onMenu={onRowMenu} />;
+  }
+  return (
+    <div>
+      <div className="flex items-center">
+        <div className="min-w-0 flex-1">
+          <SessionRow s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} hideDispatchedBadge onMenu={onRowMenu} />
+        </div>
+        <button
+          type="button"
+          aria-expanded={!folded}
+          aria-label={t("lib-todo-tree.spawned_agents", { count: sides!.length })}
+          title={`${sides!.length}`}
+          onClick={(e) => { e.stopPropagation(); toggle(); }}
+          className="touch-hit relative z-20 mr-1 flex h-5 shrink-0 items-center gap-0.5 rounded-[5px] px-1 text-[10.5px] text-ink-3 hover:bg-hover hover:text-ink tabular-nums"
+        >
+          {folded && <span>{sides!.length}</span>}
+          <Icon name="chevron" size={9} stroke={2.4} className="shrink-0 opacity-75 transition-transform" style={{ ...sidebarFoldMotion(!folded), transform: folded ? "rotate(-90deg)" : "none" }} />
+        </button>
+      </div>
+      <Collapse open={!folded} sidebarFold>
+        <div className="ml-4 flex flex-col gap-px border-l border-line pl-1.5" inert={folded || undefined}>
+          {sides!.map((c) => {
+            const ck = `s:${c.machine_id}/${c.session_id}`;
+            return <SessionRow key={ck} s={c} k={ck} reg={reg} hover={hover} active={activeKey === ck} to={{ name: "session", mid: c.machine_id, sid: c.session_id }} go={go} hideDispatchedBadge onMenu={onRowMenu} />;
+          })}
+        </div>
+      </Collapse>
+    </div>
+  );
+});
+
 /** One computer in the repository tree (#2108 / #2126): header folds the whole computer; flat when only one computer has agents. */
-export function RepoMachineSection({ m, flat, machines, reg, hover, activeKey, go, onRowMenu, ...actions }: { m: RepoMachine; flat: boolean; machines: Machine[]; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn } & WorkspaceTreeActions) {
+export function RepoMachineSection({ m, flat, machines, sideChildren, reg, hover, activeKey, go, onRowMenu, ...actions }: { m: RepoMachine; flat: boolean; machines: Machine[]; sideChildren?: ReadonlyMap<string, Session[]>; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn } & WorkspaceTreeActions) {
   const online = m.machine.online;
   const selected = useWorkspaceSelection();
   const onSelectWorkspace = (target: WorkspaceTarget) => { selectWorkspace(target); actions.onSelectWorkspace?.(target); };
-  const [folded, toggle] = useFolded(m.foldKey, !online, { holds: m.repos.some((r) => r.worktrees.some((w) => holdsRow(w.navigationTree ?? w.tree, activeKey) || holdsWorkspace(w, selected))) });
-  const repos = m.repos.map((tree) => <RepoSection key={tree.key} tree={tree} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} selected={selected} {...actions} onSelectWorkspace={onSelectWorkspace} />);
+  const holdsSide = (rows: readonly Session[]) => Boolean(sideChildren && rows.some((s) => {
+    const kids = sideChildren.get(`${s.machine_id}/${s.session_id}`);
+    return Boolean(kids && holdsRow(kids, activeKey));
+  }));
+  const [folded, toggle] = useFolded(m.foldKey, !online, { holds: m.repos.some((r) => r.worktrees.some((w) => holdsRow(w.navigationTree ?? w.tree, activeKey) || holdsSide(w.navigationTree ?? w.tree) || holdsWorkspace(w, selected))) });
+  const machineLauncher = preferredNativeLauncher(m.sessions);
+  const machineName = machineWithHub(m.machine.id, machines);
+  const repos = m.repos.map((tree) => <RepoSection key={tree.key} tree={tree} machineId={m.machine.id} online={online} machineLauncher={machineLauncher} sideChildren={sideChildren} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} selected={selected} {...actions} onSelectWorkspace={onSelectWorkspace} />);
   if (flat) return <>{repos}</>;
   return (
     <SidebarGroup className="mt-3" heading={
       <div className="group/sec flex items-center gap-1 px-2 pb-0.5">
         <button type="button" aria-expanded={!folded} onClick={toggle} className="relative z-10 flex min-h-7 min-w-0 flex-1 items-center gap-1.5 whitespace-nowrap text-left [@media(pointer:coarse)]:min-h-11">
           <span aria-hidden className={cx("size-1.5 shrink-0 rounded-full", online ? "bg-green" : "bg-line-strong")} />
-          <span className={cx("min-w-0 truncate text-[12.5px] font-semibold", online ? "text-ink" : "text-ink-3")}>{machineWithHub(m.machine.id, machines)}</span>
+          <span className={cx("min-w-0 truncate text-[12.5px] font-semibold", online ? "text-ink" : "text-ink-3")}>{machineName}</span>
           <span className="sr-only">{online ? t("sidebar.online") : neverConnected(m.machine) ? t("sidebar.not_connected_yet") : t("sidebar.offline")}</span>
           <Icon name="chevron" size={10} stroke={2.4} className="shrink-0 text-ink-3 transition-transform" style={{ ...sidebarFoldMotion(!folded), transform: folded ? "rotate(-90deg)" : "none" }} />
         </button>
@@ -309,6 +377,11 @@ export function RepoMachineSection({ m, flat, machines, reg, hover, activeKey, g
           <span className="shrink-0 text-[10.5px] whitespace-nowrap text-ink-3">{neverConnected(m.machine) ? t("sidebar.not_connected_yet") : t("sidebar.offline")}</span>
         ) : (
           <SessionTally sessions={m.sessions} folded={folded} />
+        )}
+        {online && (
+          <span className="opacity-0 transition-opacity group-hover/sec:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
+            <SectionAdd label={`${t("sidebar.new_agent")} · ${machineName}`} onClick={(e) => { e.stopPropagation(); openNewAgent({ machineId: m.machine.id, launcher: machineLauncher }); }} />
+          </span>
         )}
       </div>
       }>
@@ -322,32 +395,69 @@ export function RepoMachineSection({ m, flat, machines, reg, hover, activeKey, g
 }
 
 /** One repository on one machine ("By repo"): its working trees under it, the main checkout marked and first. */
-function RepoSection({ tree, reg, hover, activeKey, go, onRowMenu, selected, ...actions }: { tree: RepoTree; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn; selected?: string } & WorkspaceTreeActions) {
-  const [folded, toggle] = useFolded(tree.key, false, { holds: tree.worktrees.some((w) => holdsRow(w.navigationTree ?? w.tree, activeKey) || holdsWorkspace(w, selected)) });
-  const row = (s: Session, hint: string) => {
-    const key = `s:${s.machine_id}/${s.session_id}`;
-    return <SessionRow key={key} s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} onMenu={onRowMenu} />;
-  };
+function RepoSection({ tree, machineId, online, machineLauncher, sideChildren, reg, hover, activeKey, go, onRowMenu, selected, ...actions }: { tree: RepoTree; machineId: string; online: boolean; machineLauncher?: string; sideChildren?: ReadonlyMap<string, Session[]>; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn; selected?: string } & WorkspaceTreeActions) {
+  const holdsSide = (rows: readonly Session[]) => Boolean(sideChildren && rows.some((s) => {
+    const kids = sideChildren.get(`${s.machine_id}/${s.session_id}`);
+    return Boolean(kids && holdsRow(kids, activeKey));
+  }));
+  const [folded, toggle] = useFolded(tree.key, false, { holds: tree.worktrees.some((w) => holdsRow(w.navigationTree ?? w.tree, activeKey) || holdsSide(w.navigationTree ?? w.tree) || holdsWorkspace(w, selected)) });
+  const [showAll, setShowAll] = useState(false);
+  const row = (s: Session, hint?: string) => (
+    <RepoSessionItem key={`s:${s.machine_id}/${s.session_id}`} s={s} sides={sideChildren?.get(`${s.machine_id}/${s.session_id}`)} hint={hint} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} />
+  );
   // A lone main checkout, or an Orca worktree whose folder names its project, needs no extra level.
   const flat = !showsWorktreeLevel(tree);
+  const w0 = tree.worktrees[0];
+  // A single catalog workspace whose folder name already matches the repository (e.g. herdr's `agent-smoke`) renders as a
+  // single folder header instead of repeating `agent-smoke` › `agent-smoke`.
+  const singleWorkspace = !flat && tree.worktrees.length === 1 && Boolean(w0?.workspace) && w0!.name === tree.name && w0!.children.length === 0 && !w0!.branch;
+  const repoSessions = useMemo(() => tree.worktrees.flatMap((w) => w.tree), [tree.worktrees]);
+  const repoLauncher = preferredNativeLauncher(repoSessions) ?? machineLauncher;
+  const primaryPath = w0?.path || tree.key.split("\u0000")[1] || "";
+  const startInRepo = online && (w0?.target || primaryPath)
+    ? () => openNewAgent(w0?.target && tree.worktrees.length === 1 ? { workspace: w0.target } : { machineId, cwd: primaryPath, launcher: repoLauncher })
+    : undefined;
+  if (singleWorkspace && w0) {
+    return <RepoWorktreeRows w={w0} repo={tree.name} topRepo onAdd={startInRepo} row={row} activeKey={activeKey} holdsSide={holdsSide} go={go} selected={selected} {...actions} />;
+  }
+  const flatSessions = flat && w0 ? w0.sessions : [];
+  const shownFlat = showAll || flatSessions.length <= REPO_INITIAL_LIMIT
+    ? flatSessions
+    : firstAndCurrent(flatSessions, REPO_INITIAL_LIMIT, (s) => rowKey(s) === activeKey || Boolean(sideChildren?.get(`${s.machine_id}/${s.session_id}`)?.some((c) => rowKey(c) === activeKey)));
   return (
     <Section
       title={<span className="flex min-w-0 items-center gap-1.5"><Icon name="folder" size={12} stroke={2} className="shrink-0 text-ink-3" /><span className="truncate">{tree.name}</span></span>}
       folded={folded}
       onToggle={toggle}
-      right={<GroupCount n={tree.count} label={t("sidebar.agent_count", { count: tree.count })} />}
+      right={
+        <span className="flex shrink-0 items-center gap-1">
+          <GroupCount n={tree.count} label={t("sidebar.agent_count", { count: tree.count })} />
+          {startInRepo && (
+            <span className="opacity-0 transition-opacity group-hover/sec:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
+              <SectionAdd label={`${t("sidebar.new_agent")} · ${tree.name}`} onClick={(e) => { e.stopPropagation(); startInRepo(); }} />
+            </span>
+          )}
+        </span>
+      }
     >
-      {flat ? <WindowedRows items={tree.worktrees[0]!.sessions} holds={(s) => rowKey(s) === activeKey} render={(s) => row(s, tree.name)} /> : tree.worktrees.map((w) => <RepoWorktreeRows key={w.key} w={w} repo={tree.name} row={row} activeKey={activeKey} go={go} selected={selected} {...actions} />)}
+      {flat ? (
+        <>
+          <WindowedRows items={shownFlat} holds={(s) => rowKey(s) === activeKey || Boolean(sideChildren?.get(`${s.machine_id}/${s.session_id}`)?.some((c) => rowKey(c) === activeKey))} render={(s) => row(s)} />
+          {flatSessions.length > REPO_INITIAL_LIMIT && (
+            <ShowMoreRow label={showAll ? t("sidebar.show_less") : t("sidebar.show_more", { count: flatSessions.length - shownFlat.length })} onClick={() => setShowAll((x) => !x)} />
+          )}
+        </>
+      ) : tree.worktrees.map((w) => <RepoWorktreeRows key={w.key} w={w} repo={tree.name} row={row} activeKey={activeKey} holdsSide={holdsSide} go={go} selected={selected} {...actions} />)}
     </Section>
   );
 }
 
 /** One working tree's agents under its own folding row: the main checkout wears a home mark, and a tree with nothing
  *  running says so. Orca child worktrees have their own remembered, initially expanded chip after the parent's agents. */
-function RepoWorktreeRows({ w, repo, row, activeKey, go, selected, ...actions }: { w: RepoWorktree; repo: string; row: (s: Session, hint: string) => React.ReactElement; activeKey: string; go: GoFn; selected?: string } & WorkspaceTreeActions) {
-  const [folded, toggle] = useFolded(w.key, !w.workspace && w.sessions.length === 0, { holds: holdsRow(w.navigationTree ?? w.tree, activeKey) || w.children.some((child) => holdsWorkspace(child, selected)) });
+function RepoWorktreeRows({ w, repo, topRepo = false, onAdd, row, activeKey, holdsSide, go, selected, ...actions }: { w: RepoWorktree; repo: string; topRepo?: boolean; onAdd?: () => void; row: (s: Session, hint?: string) => React.ReactElement; activeKey: string; holdsSide?: (rows: readonly Session[]) => boolean; go: GoFn; selected?: string } & WorkspaceTreeActions) {
+  const [folded, toggle] = useFolded(w.key, !w.workspace && w.sessions.length === 0, { holds: holdsRow(w.navigationTree ?? w.tree, activeKey) || Boolean(holdsSide?.(w.navigationTree ?? w.tree)) || w.children.some((child) => holdsWorkspace(child, selected)) });
   const descendants = w.navigationTree ? w.children.flatMap((c) => c.navigationTree ?? c.tree) : w.tree.slice(w.sessions.length);
-  const [childrenFolded, toggleChildren] = useFolded(`${w.key}/children`, false, { holds: holdsRow(descendants, activeKey) || w.children.some((child) => holdsWorkspace(child, selected)) });
+  const [childrenFolded, toggleChildren] = useFolded(`${w.key}/children`, false, { holds: holdsRow(descendants, activeKey) || Boolean(holdsSide?.(descendants)) || w.children.some((child) => holdsWorkspace(child, selected)) });
   const selectedRow = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const row = selectedRow.current;
@@ -358,28 +468,36 @@ function RepoWorktreeRows({ w, repo, row, activeKey, go, selected, ...actions }:
   const running = w.sessions.filter((s) => !isQuiet(s, mutes)).length;
   const title = [w.workspace?.project_name, w.name, w.branch, w.path, w.workspace?.source].filter(Boolean).join(" · ");
   const label = <><span className="min-w-0 truncate">{w.name}</span>{w.workspace?.project_name && w.workspace.project_name !== repo && <span className="min-w-0 max-w-24 truncate text-ink-3">{w.workspace.project_name}</span>}</>;
+  const subHint = w.name !== repo ? `${repo} › ${w.name}` : undefined;
   return (
-    <div ref={selectedRow} className="mt-px" data-workspace-key={w.workspace ? w.key : undefined}>
-      <div className={cx("group/sec relative z-10 flex w-full min-w-0 items-center gap-1.5 whitespace-nowrap rounded-control py-1 pl-3 pr-2 text-left text-[11.5px] text-ink-2 hover:bg-hover", selected === w.key && "bg-hover")} {...(w.target && actions.onWorkspaceMenu ? contextMenuProps((at, anchor) => actions.onWorkspaceMenu!(w.target!, anchor, at)) : {})}>
+    <div ref={selectedRow} className={topRepo ? "mt-2" : "mt-px"} data-sidebar-group={topRepo ? "" : undefined} data-workspace-key={w.workspace ? w.key : undefined}>
+      <div data-sidebar-group-heading={topRepo ? "" : undefined} className={cx("group/sec relative z-10 flex w-full min-w-0 items-center gap-1.5 whitespace-nowrap rounded-control py-1 text-left hover:bg-hover", topRepo ? "pl-2 pr-2 text-[11px] font-semibold text-ink-3" : "pl-3 pr-2 text-[11.5px] text-ink-2", selected === w.key && "bg-hover")} {...(w.target && actions.onWorkspaceMenu ? contextMenuProps((at, anchor) => actions.onWorkspaceMenu!(w.target!, anchor, at)) : {})}>
         <button type="button" aria-label={t("workspace-tree.disclosure", { name: w.name })} aria-expanded={!folded} onClick={toggle} className="touch-hit relative flex min-h-7 shrink-0 items-center [@media(pointer:coarse)]:min-h-11">
-          <Icon name="chevron" size={9} stroke={2.4} className="shrink-0 opacity-60 transition-transform" style={{ ...sidebarFoldMotion(!folded), transform: folded ? "rotate(-90deg)" : "none" }} />
+          <Icon name="chevron" size={topRepo ? 10 : 9} stroke={2.4} className="shrink-0 opacity-60 transition-transform" style={{ ...sidebarFoldMotion(!folded), transform: folded ? "rotate(-90deg)" : "none" }} />
         </button>
-        {w.main && <Icon name="home" size={11} stroke={2} className="shrink-0 text-ink-3" />}
+        {topRepo ? <Icon name="folder" size={12} stroke={2} className="shrink-0 text-ink-3" /> : w.main && <Icon name="home" size={11} stroke={2} className="shrink-0 text-ink-3" />}
         <SpaceMarks pinned={workspacePinTime(w.workspace) !== undefined} muted={false} />
         <button type="button" title={title} aria-pressed={selected === w.key} aria-expanded={!folded} onClick={() => { if (w.target) actions.onSelectWorkspace?.(w.target); toggle(); }} className="flex min-h-7 min-w-0 flex-1 items-center gap-1.5 text-left hover:text-ink [@media(pointer:coarse)]:min-h-11">{label}</button>
         {w.workspace?.available === false && <Icon name="warning" size={11} className="shrink-0 text-ink-3" aria-label={t("workspace-tree.unavailable")} />}
-        <span className="ml-auto shrink-0 text-[10.5px] text-ink-3 tabular-nums">{running > 0 ? t("sidebar.worktree_agents", { count: w.sessions.length }) : t("sidebar.idle")}</span>
+        <span className="ml-auto shrink-0 text-[10.5px] font-normal text-ink-3 tabular-nums">
+          {topRepo ? w.sessions.length : running > 0 ? t("sidebar.worktree_agents", { count: w.sessions.length }) : t("sidebar.idle")}
+        </span>
+        {onAdd && (
+          <span className="opacity-0 transition-opacity group-hover/sec:opacity-100 focus-within:opacity-100 [@media(hover:none)]:opacity-100">
+            <SectionAdd label={`${t("sidebar.new_agent")} · ${w.name}`} onClick={(e) => { e.stopPropagation(); onAdd(); }} />
+          </span>
+        )}
         {w.target && actions.onWorkspaceMenu && <button type="button" data-row-menu aria-label={t("workspace-tree.actions", { name: w.name })} aria-haspopup="menu" onClick={(e) => actions.onWorkspaceMenu!(w.target!, e.currentTarget)} className="touch-hit relative flex size-5 shrink-0 items-center justify-center rounded-control text-ink-3 hover:bg-hover-2 focus-visible:text-ink [@media(hover:none)]:size-8"><Icon name="more" size={12} /></button>}
       </div>
       <Collapse open={!folded} sidebarFold>
         <div inert={folded || undefined}>
-          <div className="flex flex-col gap-px pl-2"><WindowedRows items={w.sessions} holds={(s) => rowKey(s) === activeKey} render={(s) => row(s, `${repo} › ${w.name}`)} /></div>
+          <div className={cx("flex flex-col gap-px", topRepo ? "pl-1" : "pl-2")}><WindowedRows items={w.sessions} holds={(s) => rowKey(s) === activeKey || Boolean(holdsSide?.([s]))} render={(s) => row(s, subHint)} /></div>
           {w.children.length > 0 && (
             <>
               <RepoChildToggle count={w.children.length} counts={w.childStates} folded={childrenFolded} onToggle={toggleChildren} />
               <Collapse open={!childrenFolded} sidebarFold>
                 <div className="ml-3.5 flex w-[calc(100%-0.875rem)] flex-col gap-px" inert={childrenFolded || undefined}>
-                  {w.children.map((c) => <RepoWorktreeRows key={c.key} w={c} repo={repo} row={row} activeKey={activeKey} go={go} selected={selected} {...actions} />)}
+                  {w.children.map((c) => <RepoWorktreeRows key={c.key} w={c} repo={repo} row={row} activeKey={activeKey} holdsSide={holdsSide} go={go} selected={selected} {...actions} />)}
                 </div>
               </Collapse>
             </>

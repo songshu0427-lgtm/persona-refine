@@ -51,9 +51,35 @@ export function dispatchedSessionKeys(todos: readonly { origin?: string; plan_id
 }
 
 export function isDispatchedSession(s: Session, dispatchedKeys?: ReadonlySet<string>): boolean {
-  if (s.started_by_persona) return true;
   if (dispatchedKeys?.has(`${s.machine_id}/${s.session_id}`) || dispatchedKeys?.has(s.session_id)) return true;
   return isTaskWorktreePath(s.cwd);
+}
+
+const CATALOG_WORKSPACE_HOSTS = new Set(["herdr", "herdr-core", "botmux", "orca", "paseo"]);
+
+/** Native folder / desktop project sessions (Claude Desktop, Codex App, CLI history) stay inside their project folder
+ *  in By repo even when stopped; workspace-catalog hosts keep their own workspace pin rules (`hasWorkspacePin`). */
+export function isRepoOfflineRetained(s: Session, onlineMachineIds: ReadonlySet<string>): boolean {
+  if (s.archived || !onlineMachineIds.has(s.machine_id)) return false;
+  return !CATALOG_WORKSPACE_HOSTS.has(s.space_kind || s.host || sessionHost(s));
+}
+
+const REPO_ATTENTION_RANK: Record<AgentState, number> = {
+  needs_you: 0,
+  working: 1,
+  unread: 2,
+  idle: 3,
+  unknown: 3,
+  offline: 3,
+};
+
+/** Project-folder ordering in By repo: active attention states lead, while settled (idle/offline) sessions sort by
+ *  latest activity so Claude Desktop and Codex App project histories merge chronologically. */
+export function byRepoActivity(a: Session, b: Session): number {
+  const ra = REPO_ATTENTION_RANK[stateOf(a)] ?? 3;
+  const rb = REPO_ATTENTION_RANK[stateOf(b)] ?? 3;
+  if (ra !== rb) return ra - rb;
+  return byTime(b.updated_at, a.updated_at) || a.session_id.localeCompare(b.session_id) || a.machine_id.localeCompare(b.machine_id);
 }
 
 // the host kinds a pane ref may be prefixed with (keep in step with Kinds in server/internal/host/host.go); herdr's ids go bare and may hold a colon
@@ -78,7 +104,7 @@ export function sessionHost(s: Session): string {
 export type SessionSource = "feishu" | "terminal" | "desktop";
 
 export function sessionSource(s: Session): SessionSource | undefined {
-  if (s.space_kind === "codex_app" || s.host === "paseo" || s.host === "cindy" || (s.source_kind === "runtime" && s.source_instance_id === "orca")) return "desktop";
+  if (s.space_kind === "codex_app" || s.space_kind === "claude_desktop" || s.host === "paseo" || s.host === "cindy" || (s.source_kind === "runtime" && s.source_instance_id === "orca")) return "desktop";
   const host = sessionHost(s);
   if (host === "botmux") return "feishu";
   return host ? "terminal" : undefined;

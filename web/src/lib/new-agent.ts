@@ -218,6 +218,8 @@ export interface NewAgentPreset {
   prompt?: string;
   machineId?: string;
   cwd?: string;
+  /** Preferred native launcher on the target machine (e.g. `claude-desktop` or `codex-app` when creating from a Mac project). */
+  launcher?: string;
   /** Messages forwarded to a new Agent (#3899; several at once, #3838): their card over the first message, which carries
    *  them in front; and the pictures they had, attached. */
   forwards?: ContextRef[];

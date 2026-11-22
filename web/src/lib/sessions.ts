@@ -21,9 +21,10 @@ export function useAgentSessions(): Session[] {
 }
 
 /** The complete list as its readers get it: `error` says why it has not loaded (its read failed; it is read again in a
- *  few seconds, or now with retryFullAgentSessions), "" while it loads or once it has. */
-export interface FullAgentSessions { sessions: Session[]; loaded: boolean; error: string }
-const EMPTY_FULL_LIST = { sessions: [] as Session[], loaded: false, error: "", base: {} as Record<string, Session[]> };
+ *  few seconds, or now with retryFullAgentSessions), "" while it loads or once it has. `unfolded` retains raw non-assistant
+ *  rows so project trees can expand nested side conversations under their parent row. */
+export interface FullAgentSessions { sessions: Session[]; unfolded: Session[]; loaded: boolean; error: string }
+const EMPTY_FULL_LIST = { sessions: [] as Session[], unfolded: [] as Session[], loaded: false, error: "", base: {} as Record<string, Session[]> };
 const FULL_LIST_RETRY_MS = 5_000;
 // Working agents emit list hints for every display update. Space reads from their completion so hints that keep
 // arriving share one read. The complete list is read once; later reads ask only for what changed (complete-sessions.ts).
@@ -73,7 +74,8 @@ function createFullCache(owner: string) {
       const result = await complete.read(controller.signal);
       // An unchanged delta leaves the published snapshot (and its older base, which only widens the overlay) as it is.
       if (valid() && (result.changed || !fullSnapshot.loaded)) {
-        fullSnapshot = { sessions: foldRows(result.sessions).filter((s) => !s.assistant), loaded: true, error: "", base, epoch: fullSnapshot.epoch };
+        const unfolded = result.sessions.filter((s) => !s.assistant);
+        fullSnapshot = { sessions: foldRows(result.sessions).filter((s) => !s.assistant), unfolded, loaded: true, error: "", base, epoch: fullSnapshot.epoch };
         fullChanged();
       }
     } catch (e) {
@@ -159,7 +161,7 @@ export function useFullAgentSessions(on = true): FullAgentSessions {
   const full = useCompleteAgentSessions(on);
   return useMemo(() => {
     const sessions = foldRows(full.sessions);
-    return sessions === full.sessions ? full : { sessions, loaded: full.loaded, error: full.error };
+    return sessions === full.sessions ? full : { sessions, unfolded: full.unfolded, loaded: full.loaded, error: full.error };
   }, [full]);
 }
 
@@ -179,7 +181,10 @@ function useCompleteAgentSessions(on: boolean): FullAgentSessions {
   return useMemo(() => {
     // `on` false: the caller has no use for the list now and asks the hub for nothing
     if (!on) return EMPTY_FULL_LIST;
-    if (!bounded) return { sessions: foldRows(Object.values(by).flat()).filter((s) => !s.assistant), loaded, error: "" };
+    if (!bounded) {
+      const raw = Object.values(by).flat();
+      return { sessions: foldRows(raw).filter((s) => !s.assistant), unfolded: raw.filter((s) => !s.assistant), loaded, error: "" };
+    }
     if (!loaded) return EMPTY_FULL_LIST;
     if (by === full.base) return full;
     // Reflect actions on retained details (rename, mark seen) without copying the complete list into the store.
@@ -187,11 +192,11 @@ function useCompleteAgentSessions(on: boolean): FullAgentSessions {
     const key = (s: Session) => JSON.stringify([s.machine_id, s.session_id]);
     const before = new Map(Object.values(full.base).flat().map((s) => [key(s), s]));
     const current = new Map(Object.values(by).flat().map((s) => [key(s), s]));
-    const sessions = full.sessions.filter((s) => !before.has(key(s)) || current.has(key(s))).map((s) => {
+    const overlay = (rows: Session[]) => rows.filter((s) => !before.has(key(s)) || current.has(key(s))).map((s) => {
       const next = current.get(key(s));
       return next && next !== before.get(key(s)) ? next : s;
     });
-    return { sessions, loaded: full.loaded, error: full.error };
+    return { sessions: overlay(full.sessions), unfolded: overlay(full.unfolded), loaded: full.loaded, error: full.error };
   }, [on, bounded, loaded, full, by]);
 }
 
