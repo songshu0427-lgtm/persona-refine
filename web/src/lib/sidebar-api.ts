@@ -3,19 +3,15 @@ import { storedValue, storeValue } from "./compatibility";
 // grouped, walk the rows. The sidebar's groups subscribe through useFolded (`onFoldAll`), Sidebar.tsx subscribes to
 // `onGrouping` and marks its list `data-sidebar-rows`, and the shortcuts call the rest. Kept out of the sidebar's views
 // so they only gain the few lines that listen.
-import { AGENT_GROUPINGS, agentGrouping, type AgentGrouping } from "./agent-groups";
+import { AGENT_GROUPINGS, SIDEBAR_GROUPINGS, sidebarGrouping, type AgentGrouping } from "./agent-groups";
 import { noteFoldAll } from "./fold-all";
 
 export const GROUPING_KEY = "persona.agentGrouping";
 
-/** Whether the Agents block draws the hub's paged list (`BoundedAgentsBlock`) rather than the complete one (#6662): every
- *  grouping but By repository, whose worktree level needs every session, and By to-do only on a hub that lists sessions by
- *  to-do; pins and several assistants' scopes need the complete list. ⌘K's "Filter Agents list" asks it too (#6589). */
+/** Both sidebar groupings (`state` and `repo`) read the complete list so dispatched tasks and repository worktrees separate cleanly. */
 export function pagedAgentList(o: { bounded: boolean; byTodo: boolean; todosSupported: boolean; pins: { sessions: string[]; spaces: string[] }; stored: string | null; several: boolean }): boolean {
-  const grouping = agentGrouping(o.stored);
-  // a hub without todos shows by machine, a by-todo choice kept for when it has them
-  const shown = !o.todosSupported && grouping === "todo" ? "machine" : grouping;
-  return o.bounded && !o.several && o.pins.sessions.length === 0 && o.pins.spaces.length === 0 && shown !== "repo" && shown !== "state" && (shown !== "todo" || o.byTodo);
+  const shown = sidebarGrouping(o.stored);
+  return o.bounded && !o.several && o.pins.sessions.length === 0 && o.pins.spaces.length === 0 && shown !== "repo" && shown !== "state";
 }
 
 // ── fold all / open all ──────────────────────────────────
@@ -80,8 +76,8 @@ export function onGrouping(listener: (g: AgentGrouping) => void): () => void {
   return () => void groupingListeners.delete(listener);
 }
 
-/** The grouping after `current`, among those offered (a hub without todos has no "By to-do"). */
-export function nextGrouping(current: AgentGrouping, offered: readonly AgentGrouping[] = AGENT_GROUPINGS.map((g) => g.key)): AgentGrouping {
+/** The grouping after `current`, among those offered (`state | repo` by default). */
+export function nextGrouping(current: AgentGrouping, offered: readonly AgentGrouping[] = SIDEBAR_GROUPINGS.map((g) => g.key)): AgentGrouping {
   // a choice the hub cannot offer is shown as the first one (the sidebar does the same)
   const i = Math.max(0, offered.indexOf(current));
   return offered[(i + 1) % offered.length] ?? current;
@@ -95,7 +91,7 @@ export function setAgentGrouping(grouping: AgentGrouping): void {
 
 /** Switches the sidebar to its next grouping (kept in this browser, as the menu's choice is); returns it. */
 export function cycleGrouping(offered?: readonly AgentGrouping[]): AgentGrouping {
-  const next = nextGrouping(agentGrouping(storedValue(GROUPING_KEY)), offered);
+  const next = nextGrouping(sidebarGrouping(storedValue(GROUPING_KEY)), offered);
   setAgentGrouping(next);
   return next;
 }

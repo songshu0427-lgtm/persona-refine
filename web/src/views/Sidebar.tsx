@@ -8,11 +8,11 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { t } from "../i18n";
 import { NARROW, useMedia } from "../lib/viewport";
 import { AGENT_FILTERS, agentFilter, applyFilter, arrangeSpaces, BOTMUX_HIDDEN_KEY, botmuxAndFilter, filterCounts, isBotmux, isSpaceMuted, matchingKeys, shownFilters, unreadOf, withoutBotmux, type AgentFilter, type FilterCounts } from "../lib/agent-filter";
-import { applyDimensionFilters, buildAgentFacets, DEFAULT_DIMENSION_FILTERS, hasActiveDimensionFilters, NO_FACETS, type AgentDimensionFilters } from "../lib/agent-chatlist-filter";
-import { getAgentListFilters, setAgentListFilters, useAgentListFilters } from "../lib/agent-list-filters";
+import { applyDimensionFilters, buildAgentFacets, DEFAULT_DIMENSION_FILTERS, hasActiveDimensionFilters } from "../lib/agent-chatlist-filter";
+import { setAgentListFilters, useAgentListFilters } from "../lib/agent-list-filters";
 import { AGENT_SORT_KEY, AGENT_SORTS, agentSort, byUpdated, machineTreeByUpdate, projectsByUpdate, repoMachinesByUpdate, todoTreeByUpdate, type AgentSort } from "../lib/agent-sort";
 import { AgentChatListRow, AgentFilterButton, AgentFilterChips } from "./agents/AgentChatListControls";
-import { agentGrouping, AGENT_GROUPINGS, type AgentGrouping, buildAgentGroups, buildSpaces, hostsOf, isQuiet, sessionHost, splitAgentSessions, type AgentGroup, type Space } from "../lib/agent-groups";
+import { type AgentGrouping, buildAgentGroups, buildSpaces, dispatchedSessionKeys, hostsOf, isDispatchedSession, isQuiet, sessionHost, SIDEBAR_GROUPINGS, sidebarGrouping, splitAgentSessions, type AgentGroup, type Space } from "../lib/agent-groups";
 import { buildRepoMachineTree, hasWorkspacePin } from "../lib/agent-repos";
 import { useWorkspaceCatalog } from "../lib/workspace-catalog";
 import { keyedRefs } from "../lib/keyed-refs";
@@ -32,12 +32,11 @@ import { ConversationRowMenu } from "./ConversationMenu";
 import { conversationPage } from "../lib/conversation-page";
 import { href, navigate, onLinkClick, showsSession, type Route } from "../lib/router";
 import { retryFullAgentSessions, useAgentSessions, useFullAgentSessions } from "../lib/sessions";
-import { getState, refresh, refreshTodos, useHubUnreachable, useStore } from "../lib/store";
-import { SESSIONS_SIDE_FOLD_FEATURE } from "../lib/side-fold";
+import { refresh, refreshTodos, useHubUnreachable, useStore } from "../lib/store";
 import { conversationTitle, mergeConversations } from "./assistant/conversations";
 import { useShownManager } from "../lib/manager-choice";
 import { agentGroupLabel, agentTreeState, buildTodoTree, shareTree, worstTreeState, type TodoTree } from "../lib/todo-tree";
-import { openTodoFromTag, sortTodos, TODO_STATUS_INFO, type TodoStatus } from "../lib/todos";
+import { openTodoFromTag, TODO_STATUS_INFO, type TodoStatus } from "../lib/todos";
 import type { Machine, Session } from "../lib/types";
 import { Collapse, cx, EASE, Kbd, Menu, sidebarFoldMotion, useMenu, useNow, type MenuItem } from "../ui/atoms";
 import { StatusMark } from "../ui/StatusMark";
@@ -60,15 +59,10 @@ import type { LinkTargetSpace } from "./LinkTodoDialog";
 import { lazyDialog } from "./LazyOverlay";
 import { FoldScope, useFolded } from "../lib/use-folded";
 import { clipsOverflow, glideBox, glideStyle, sameBox, type GlideBox, type Span } from "../lib/glide";
-import { AGENTS_FOLD, onGrouping, pagedAgentList } from "../lib/sidebar-api";
+import { AGENTS_FOLD, onGrouping } from "../lib/sidebar-api";
 import { jumpHint, useBindings } from "../lib/shortcuts";
 import { markAllSeenLabel, stateCount } from "../lib/state-labels";
-import { PagedSessionList, type PagedQuickFilters } from "./agents/PagedSessionList";
 import { ListError } from "../ui/ListError";
-import { SESSION_LIST_STYLE } from "../ui/list-metrics";
-import { RUNTIME_AGENTS_PATH, supportsPagedAgents, runtimeActiveAt, runtimeAgents, runtimeIdentity, runtimeNeedsYou, runtimeOrder, runtimeParentIdentity, runtimePlace, runtimeRemoval } from "../lib/runtime-list";
-import { SESSIONS_CATALOG_FEATURE, SESSIONS_JUST_FINISHED_FEATURE, SESSIONS_QUICK_FILTERS_FEATURE, SESSIONS_TODO_FEATURE, type GroupDimension, type TodoNames } from "../lib/session-groups";
-import { type ListFilters } from "../lib/session-list";
 import { NoComputers, useAddComputer } from "./machines/AddComputerEntry";
 import { BADGE_CLASS, DOT_CLASS, type GoFn, GroupCount, holdsRow, morePagesMenu, type NavPage, type NodeMenuFn, type RegFn, rowKey, type RowMenuFn, Section, SidebarGroup, GroupFoldButton, useActiveKey, useGo, useNavPages } from "./SidebarParts";
 import { NavRow, PersonalAgents, PersonaRow, SessionRow, SubHeading } from "./SidebarRows";
@@ -616,37 +610,16 @@ function TodosUnread() {
 }
 
 function AgentsBlock(props: AgentsBlockProps) {
-  const bounded = useStore((s) => supportsPagedAgents(s.features));
-  const byTodo = useStore((s) => s.features.includes(SESSIONS_TODO_FEATURE));
-  const todosSupported = useStore((s) => s.todosSupported);
-  const todosUnread = useTodosUnread();
-  // never reached since the page opened (the page's Offline, the same flag): the complete list's block says so (the
-  // paged one would only load), whatever features an earlier login left (audit item 36)
   const hubUnreachable = useHubUnreachable();
-  const pins = useStore((s) => s.pins);
   const [stored, setGrouping] = useState(() => storedValue("persona.agentGrouping"));
   useEffect(() => onGrouping(setGrouping), []);
-  const grouping = agentGrouping(stored);
-  // a hub without todos shows by machine, a by-todo choice kept for when it has them; to-dos that cannot be read, by
-  // status until they can
-  const shown = todosSupported === false && grouping === "todo" ? "machine" : todosUnread && grouping === "todo" ? "state" : grouping;
-  // several assistants: the list is the current one's (docs/assistant/managers.md "Clients"), which the hub's paged list
-  // cannot ask for, so the complete list is read and filtered here
-  const several = useScope().several;
-  // One set of groupings either way (#6662): the paged list draws them all but By repository, whose worktree level needs
-  // every session, and By to-do only on a hub that lists sessions by to-do; pins need the complete list too.
-  const paged = pagedAgentList({ bounded, byTodo, todosSupported, pins, stored, several });
+  const grouping: AgentGrouping = sidebarGrouping(stored);
   const chooseGrouping = useCallback((g: AgentGrouping) => {
     storeValue("persona.agentGrouping", g);
     setGrouping(g);
-    // By to-do while its to-dos cannot be read (shown by status): the tap reads them again, as the note's Retry does
-    const { todosError, todos } = getState();
-    if (g === "todo" && todosError !== null && todos.length === 0) void refreshTodos();
     props.hover(null);
   }, [props.hover]);
-  // `shown !== "repo"` only tells TypeScript what pagedAgentList already rules out
-  return paged && shown !== "repo" && !hubUnreachable ? <BoundedAgentsBlock {...props} grouping={shown} todosUnread={todosUnread && grouping === "todo"} chooseGrouping={chooseGrouping} />
-    : <LegacyAgentsBlock {...props} grouping={grouping} hubUnreachable={hubUnreachable} chooseGrouping={chooseGrouping} />;
+  return <LegacyAgentsBlock {...props} grouping={grouping} hubUnreachable={hubUnreachable} chooseGrouping={chooseGrouping} />;
 }
 
 /** The Agents block's title, the paged list's as the complete list's (#6662): unpinning changes nothing above the list. */
@@ -685,128 +658,9 @@ function agentListItems({ groupings, grouping, chooseGrouping, sorts, sort, choo
   ];
 }
 
-/** The groupings this hub offers: By to-do only where it has to-dos. */
+/** The 2 persistent sidebar groupings: 状态 (urgency + dispatched tasks) | 仓库 (machine → repository/worktree). */
 function useGroupings() {
-  const todosSupported = useStore((s) => s.todosSupported);
-  return useMemo(() => AGENT_GROUPINGS.filter((g) => g.key !== "todo" || todosSupported !== false), [todosSupported]);
-}
-
-/** What each quick filter selects on the paged list (`sessions_quick_filters`, #6662), as the complete list matches them
- *  (lib/agent-filter.ts): Working without the ones that only wait in the background, which have their own chip. */
-const QUICK_SELECT: Record<AgentFilter, ListFilters> = {
-  all: {}, needs: { state: "needs_you" }, unread: { state: "unread" }, working: { state: "working", waiting: "0" },
-  bg_waiting: { state: "working", waiting: "1" }, feishu: { pane_source: "feishu" }, terminal: { pane_source: "terminal" },
-};
-/** The botmux sessions hidden: every read leaves out their origin (a botmux session is a Lark group's). */
-const HIDE_BOTMUX: ListFilters = { exclude_pane_source: "feishu" };
-const SHOW_ALL: ListFilters = {};
-const NO_COUNTS: FilterCounts = { needs: 0, unread: 0, working: 0, bg_waiting: 0, feishu: 0, terminal: 0 };
-
-/** The paged list's section kind for each grouping it draws (#6662): By project is the space (`group`). */
-const PAGED_DIMENSION: Record<Exclude<AgentGrouping, "repo">, GroupDimension> = { todo: "todo", machine: "machine", space: "group", state: "state" };
-
-function BoundedAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, add = true, grouping, todosUnread = false, chooseGrouping }: AgentsBlockProps & { grouping: Exclude<AgentGrouping, "repo">; /** By to-do shown by status: its to-dos cannot be read */ todosUnread?: boolean; chooseGrouping: (g: AgentGrouping) => void }) {
-  const machines = useStore(selectSidebarMachines);
-  const catalog = useStore((s) => s.features.includes(SESSIONS_CATALOG_FEATURE));
-  const justFinished = useStore((s) => s.features.includes(SESSIONS_JUST_FINISHED_FEATURE));
-  // a hub that folds side sessions (#7944) leaves them out of the list: nothing to nest under a parent
-  const sideFold = useStore((s) => s.features.includes(SESSIONS_SIDE_FOLD_FEATURE));
-  const archives = useStore((s) => s.features.includes(AGENT_ARCHIVES_FEATURE));
-  const [rowMenu, setRowMenu] = useState<{ s: Session; anchor: HTMLElement; at?: MenuAt } | null>(null);
-  const [renaming, setRenaming] = useState<Session | null>(null);
-  const [deleting, setDeleting] = useState<Session | null>(null);
-  const [linkTarget, setLinkTarget] = useState<Session>();
-  const closeLinkTarget = useCallback(() => setLinkTarget(undefined), []);
-  // the ⋯ toggles the menu, as in the full list
-  const onRowMenu = useCallback<RowMenuFn>((s, anchor, at) => setRowMenu((m) => (!at && m?.anchor === anchor ? null : { s, anchor, at })), []);
-  // The complete list's grouping bar (#6662): the same segments, so a pin or an unpin changes nothing above the list.
-  // By repository takes the complete list (AgentsBlock).
-  const groupings = useGroupings();
-  // by to-do: the open to-dos' titles and the To-dos page's order; the hub counts their sessions by id
-  const todos = useScopedTodos();
-  const todoNames = useMemo((): TodoNames => {
-    const open = sortTodos(todos.filter((td) => !td.done_at));
-    const titles = new Map(open.map((td) => [td.id, td.title]));
-    return { order: open.map((td) => td.id), title: (id) => titles.get(id) };
-  }, [todos]);
-  // The complete list's quick filters and botmux switch, kept where it keeps them, so a pin or an unpin keeps the chip
-  // too; on a hub that cannot select them (no sessions_quick_filters), the paged list's own state chips.
-  const quickFilters = useStore((s) => s.features.includes(SESSIONS_QUICK_FILTERS_FEATURE));
-  const [filter, setFilter] = useState(() => agentFilter(storedValue("persona.agentFilter")));
-  const [botmuxHidden, setBotmuxHidden] = useState(() => botmuxAndFilter(filter, localStorage.getItem(BOTMUX_HIDDEN_KEY) === "1", "filter").hidden);
-  const saveBotmuxHidden = useCallback((next: boolean) => {
-    localStorage.setItem(BOTMUX_HIDDEN_KEY, next ? "1" : "0");
-    window.dispatchEvent(new Event("persona-botmux-visibility"));
-    setBotmuxHidden(next);
-  }, []);
-  const chooseFilter = useCallback((f: AgentFilter) => {
-    if (botmuxAndFilter(f, botmuxHidden, "filter").hidden !== botmuxHidden) saveBotmuxHidden(false);
-    storeValue("persona.agentFilter", f);
-    setFilter(f);
-    hover(null);
-  }, [botmuxHidden, hover, saveBotmuxHidden]);
-  const toggleBotmux = useCallback(() => {
-    const next = botmuxAndFilter(filter, !botmuxHidden, "botmux");
-    saveBotmuxHidden(next.hidden);
-    if (next.filter !== filter) chooseFilter(next.filter);
-    hover(null);
-  }, [filter, botmuxHidden, saveBotmuxHidden, chooseFilter, hover]);
-  const quick = useMemo((): PagedQuickFilters | undefined => quickFilters ? {
-    select: QUICK_SELECT[filter],
-    exclude: botmuxHidden ? HIDE_BOTMUX : SHOW_ALL,
-    // the switch shows while there are Lark sessions to hide, or they are hidden
-    bar: (counts) => <FilterBar selection={filter} counts={counts ?? NO_COUNTS} onChoose={chooseFilter} botmux={(counts?.feishu ?? 0) > 0 || botmuxHidden ? { hidden: botmuxHidden, onToggle: toggleBotmux } : undefined} />,
-  } : undefined, [quickFilters, filter, botmuxHidden, chooseFilter, toggleBotmux]);
-  const groupsRef = useRef<HTMLDivElement>(null);
-  // the words ⌘K's "Filter Agents list" put on the list, its search (#6589): only its words, which the hub matches as
-  // text; the Filter menu's choices are the complete list's, so a chip shows here only what this list is narrowed by
-  const listQuery = useAgentListFilters().query;
-  const queryOnly = useMemo(() => ({ ...DEFAULT_DIMENSION_FILTERS, query: listQuery }), [listQuery]);
-  const setQuery = useCallback((next: AgentDimensionFilters) => setAgentListFilters({ ...getAgentListFilters(), query: next.query }), []);
-  // the complete list's ⋯: its sorts order the sections here (the hub pages the rows newest first either way)
-  const listMenu = useMenu();
-  const [sortChoice, chooseSort] = useAgentSort();
-  const byUpdate = sortChoice === "updated" && grouping !== "state";
-  const listItems = agentListItems({ groupings, grouping, chooseGrouping, sorts: grouping !== "state", sort: sortChoice, chooseSort, archives, hover, onNavigate });
-  const pagedGrouping = useMemo(() => ({
-    dimension: PAGED_DIMENSION[grouping],
-    label: AGENT_GROUPINGS.find((g) => g.key === grouping)?.label ?? "",
-    todos: todoNames,
-    quick,
-    // its sections follow the title row's fold-all, as the complete list's groups do
-    foldScope: AGENTS_FOLD,
-    byUpdate,
-    bar: <GroupingBar groupings={groupings} selection={grouping} onChoose={chooseGrouping} />,
-    query: listQuery,
-    // the to-dos' failure under the chips, lined up with the list's own errors below (the chips' row is padded)
-    chips: <><AgentFilterChips filters={queryOnly} onChange={setQuery} facets={NO_FACETS} />{todosUnread && <div className="-mx-1"><TodosUnread /></div>}</>,
-  }), [grouping, todoNames, groupings, chooseGrouping, quick, byUpdate, listQuery, queryOnly, setQuery, todosUnread]);
-  return <div data-sidebar-agents ref={groupsRef}>
-    {/* the complete list's title row (#6662): fold all, the ⋯ with its sorts and the archived Agents, and "+" */}
-    <div className={SESSION_LIST_STYLE.heading}>
-      <span className={AGENTS_TITLE}>Agents</span>
-      <GroupFoldButton groups={groupsRef} onAction={() => hover(null)} />
-      {listItems.length > 0 && <ListMenuButton sorted={byUpdate} open={Boolean(listMenu.anchor)} onClick={listMenu.open} />}
-      {add && <AgentsAdd onNewAgent={onNewAgent} onNavigate={onNavigate} />}
-    </div>
-    {listMenu.anchor && <Menu anchor={listMenu.anchor} onClose={listMenu.close} align="right" items={listItems} />}
-    <HubNoticeLine />
-    <HerdrNotices />
-    <PagedSessionList root={runtimeAgents} path={RUNTIME_AGENTS_PATH} identity={runtimeIdentity} compare={runtimeOrder} removeIdentity={runtimeRemoval} parentOf={sideFold ? undefined : runtimeParentIdentity} event="sessions_list" grouping={pagedGrouping}
-      activeAt={runtimeActiveAt} needsYou={runtimeNeedsYou} isOpen={(s) => activeKey === `s:${s.machine_id}/${s.session_id}`}
-      catalog={catalog} justFinished={justFinished} placeOf={runtimePlace} failureText={agentsReadFailed}
-      label={(dimension, id) => dimension === "machine" ? machineWithHub(id, machines) : id}
-      renderRow={(s, within) => {
-        const k = `s:${s.machine_id}/${s.session_id}`;
-        // under a group's heading the row leaves out what the heading says: its computer, its space, its to-do
-        const where = [within === "machine" ? "" : machineWithHub(s.machine_id, machines), within === "group" ? "" : s.space_name || baseName(s.cwd)];
-        return <SessionRow s={s} k={k} reg={reg} hover={hover} active={activeKey === k} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} onMenu={onRowMenu} hint={where.filter(Boolean).join(" · ")} showTodoTag={within !== "todo"} />;
-      }} />
-    {rowMenu && <AgentRowMenu s={rowMenu.s} anchor={rowMenu.anchor} at={rowMenu.at} onClose={() => setRowMenu(null)} onRename={setRenaming} onDelete={setDeleting} onLinkTodo={setLinkTarget} />}
-    {renaming && <RenameDialog open session={renaming} onClose={() => setRenaming(null)} />}
-    {deleting && <DeleteSessionDialog open session={deleting} machineName={machineWithHub(deleting.machine_id, machines)} onClose={() => setDeleting(null)} />}
-    <LinkTodoDialog open={Boolean(linkTarget)} session={linkTarget} onClose={closeLinkTarget} />
-  </div>;
+  return SIDEBAR_GROUPINGS;
 }
 
 
@@ -884,10 +738,14 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
     () => applyDimensionFilters(listed, dimFilters, evalCtx, facets),
     [listed, dimFilters, evalCtx, facets],
   );
-  // A host pin keeps its saved conversations in the repository tree, including ones older than Recent's 40 rows.
-  const { live, recent: offline } = useMemo(() => splitAgentSessions(dimFiltered, machines,
-    shownGrouping === "repo" && !chatList ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) : undefined),
-  [dimFiltered, machines, shownGrouping, chatList, catalog]);
+  const dispatchedKeys = useMemo(() => dispatchedSessionKeys(todos), [todos]);
+  // A host pin keeps its saved conversations in the repository tree, and dispatched tasks stay visible in 状态 beyond Recent's 40 rows.
+  const { live, recent: offline } = useMemo(() => splitAgentSessions(
+    dimFiltered,
+    machines,
+    shownGrouping === "repo" && !chatList ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) : undefined,
+    shownGrouping === "state" && !chatList ? (s) => isDispatchedSession(s, dispatchedKeys) : undefined,
+  ), [dimFiltered, machines, shownGrouping, chatList, catalog, dispatchedKeys]);
   const seeded = useRef(false);
   useEffect(() => {
     // a filter saved in this browser starts from what it matches once the list has loaded
@@ -915,8 +773,8 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const groups = useMemo(() => {
     if (shownGrouping === "space" || shownGrouping === "repo" || shownGrouping === "machine") return [];
     if (shownGrouping === "todo") return [];
-    return buildAgentGroups(unpinned, machines, "state", mutes, recent);
-  }, [unpinned, machines, shownGrouping, mutes, recent, todos]);
+    return buildAgentGroups(unpinned, machines, "state", mutes, recent, dispatchedKeys);
+  }, [unpinned, machines, shownGrouping, mutes, recent, dispatchedKeys]);
   // by todo waits for the first GET /todos: the socket pushes the sessions before it answers, and a tree drawn without
   // the todos puts every agent under No to-do for a moment, then moves them under their todos (#2812); the chat list's
   // rows are drawn at once
@@ -1056,7 +914,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
         {add && <AgentsAdd onNewAgent={onNewAgent} onNavigate={onNavigate} />}
       </div>
       <Collapse open={!folded} sidebarFold>
-        {grouping !== "state" && <GroupingBar groupings={availableGroupings} selection={shownGrouping} onChoose={chooseGroupingOutOfChatList} />}
+        <GroupingBar groupings={availableGroupings} selection={shownGrouping} onChoose={chooseGroupingOutOfChatList} />
         {(shownGrouping !== "state" || filter !== "all" || Boolean(botmux)) && <FilterBar selection={filter} counts={filterTotals} onChoose={choose} botmux={botmux} />}
       </Collapse>
       </div>
@@ -1266,6 +1124,10 @@ const FilterBar = memo(function FilterBar({ selection, counts, onChoose, botmux 
 // Every group in the sidebar is one of these: its title folds it, and the fold is kept in this browser (useFolded).
 function AgentSection({ group, machines, byTodo, showHost, reg, hover, activeKey, go, onRowMenu, onNavigate }: { group: AgentGroup; machines: Machine[]; byTodo?: boolean; showHost?: boolean; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn; onNavigate?: () => void }) {
   const [folded, toggle] = useFolded(group.key, group.folded, { follow: true, holds: holdsRow(group.sessions, activeKey) });
+  const [showAll, setShowAll] = useState(false);
+  const shownSessions = group.initialLimit && !showAll
+    ? firstAndCurrent(group.sessions, group.initialLimit, (s) => rowKey(s) === activeKey)
+    : group.sessions;
   const row = (s: Session) => {
     const key = `s:${s.machine_id}/${s.session_id}`;
     const context = [s.space_name || baseName(s.cwd), machines.length > 1 ? machineWithHub(s.machine_id, machines) : ""].filter(Boolean).join(" · ");
@@ -1305,7 +1167,12 @@ function AgentSection({ group, machines, byTodo, showHost, reg, hover, activeKey
 
   return (
     <Section title={titleNode} folded={folded} onToggle={toggle} right={rightNode}>
-      <WindowedRows items={group.sessions} holds={(s) => rowKey(s) === activeKey} render={row} />
+      <WindowedRows items={shownSessions} holds={(s) => rowKey(s) === activeKey} render={row} />
+      {Boolean(group.initialLimit && group.sessions.length > group.initialLimit) && (
+        <button type="button" onClick={() => setShowAll((x) => !x)} className="relative z-10 w-full rounded-[7px] px-2 py-1 text-left text-[12px] text-ink-3 hover:text-ink-2 [@media(pointer:coarse)]:min-h-11">
+          {showAll ? t("sidebar.show_less") : t("sidebar.show_more", { count: group.sessions.length - shownSessions.length })}
+        </button>
+      )}
     </Section>
   );
 }

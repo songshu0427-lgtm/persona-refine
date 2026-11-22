@@ -73,6 +73,11 @@ describe("hovering sidebar rows", () => {
     await flush();
     const list = host.querySelector<HTMLElement>("[data-sidebar-rows]")!;
     const glide = list.querySelector<HTMLElement>("[data-glide]")!;
+    const showMore = [...list.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent?.includes("再显示"));
+    if (showMore) {
+      act(() => showMore.click());
+      await flush();
+    }
     const links = [...list.querySelectorAll<HTMLAnchorElement>("a")].filter((a) => a.textContent?.includes("task ")).slice(0, 10);
     expect(links).toHaveLength(10);
     expect(host.textContent).toContain("task 12");

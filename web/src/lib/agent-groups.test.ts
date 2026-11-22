@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { agentGrouping, type AgentMutes, awaitsReply, buildAgentGroups, hostsOf, isQuiet, justFinished, replyAsk, sessionHost, splitAgentSessions } from "./agent-groups";
+import { agentGrouping, type AgentMutes, awaitsReply, buildAgentGroups, dispatchedSessionKeys, hostsOf, isDispatchedSession, isQuiet, justFinished, replyAsk, sessionHost, sidebarGrouping, splitAgentSessions } from "./agent-groups";
 import { byAttention } from "./format";
 import type { AgentState, Machine, Session } from "./types";
 
@@ -20,14 +20,27 @@ describe("Agent 分组偏好", () => {
     expect(agentGrouping(null)).toBe("state");
     expect(agentGrouping("invalid")).toBe("state");
     for (const value of ["repo", "space", "state", "machine", "todo"]) expect(agentGrouping(value)).toBe(value);
+    expect(sidebarGrouping(null)).toBe("state");
+    expect(sidebarGrouping("todo")).toBe("state");
+    expect(sidebarGrouping("state")).toBe("state");
+    expect(sidebarGrouping("repo")).toBe("repo");
+    expect(sidebarGrouping("machine")).toBe("repo");
+    expect(sidebarGrouping("space")).toBe("repo");
   });
 });
 
-describe("三层紧急度分组与手动会话保留", () => {
-  it("固定三层紧急度顺序（需要你 → 进行中 → 最近），手动会话 100% 展开保留，仅已完成 Persona 临时 Worker 默认折叠", () => {
+describe("状态视图分组（需要你 → 进行中 → 派出任务 → 最近 → 已屏蔽）", () => {
+  it("固定顺序：需要你 → 进行中 → 派出任务（默认展开并识别督办/worktree 任务）→ 最近（手动会话 100% 保留）→ 已屏蔽（折叠）", () => {
+    const dispatchedKeys = dispatchedSessionKeys([
+      { id: "td-supervised", supervision: { mode: "auto" }, agents: [{ machine_id: "machine-a", session_id: "todo-worker" }] } as never,
+      { id: "td-manual", agents: [{ machine_id: "machine-a", session_id: "manual-linked" }] } as never,
+    ]);
     const all = [
       session("manual-idle", "idle"),
+      session("manual-linked", "idle"),
       session("persona-done", "idle", { started_by_persona: true }),
+      session("todo-worker", "idle", { updated_at: date(4) }),
+      session("worktree-worker", "idle", { cwd: "/Users/demo/.herdr/worktrees/persona/task-todo-39102cb2935e49da", updated_at: date(5) }),
       session("persona-unread", "unread", { started_by_persona: true }),
       session("persona-working", "working", { started_by_persona: true }),
       session("persona-needs", "needs_you", { started_by_persona: true }),
@@ -41,15 +54,32 @@ describe("三层紧急度分组与手动会话保留", () => {
       session("manual-offline", "offline", { updated_at: date(2) }),
       session("persona-offline", "offline", { started_by_persona: true, updated_at: date(3) }),
     ];
-    const groups = buildAgentGroups(all, machines, "state", mutes, offline);
-    expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "最近", "已屏蔽", "已完成的派出任务"]);
+    expect(isDispatchedSession(all[3], dispatchedKeys)).toBe(true);
+    expect(isDispatchedSession(all[4], dispatchedKeys)).toBe(true);
+    expect(isDispatchedSession(all[1], dispatchedKeys)).toBe(false);
+    const groups = buildAgentGroups(all, machines, "state", mutes, offline, dispatchedKeys);
+    expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "派出任务", "最近", "已屏蔽"]);
     expect(ids(groups[0].sessions)).toEqual(["persona-needs"]);
     expect(ids(groups[1].sessions)).toEqual(["manual-working", "persona-working", "waiting"]);
-    expect(ids(groups[2].sessions)).toEqual(["manual-unread", "manual-idle", "unknown", "manual-offline"]);
-    expect(groups.slice(0, 3).every((g) => !g.folded)).toBe(true);
-    expect(groups[3].folded).toBe(true);
-    expect(ids(groups[4].sessions)).toEqual(["persona-offline", "persona-done", "persona-unread"]);
+    expect(ids(groups[2].sessions)).toEqual(["worktree-worker", "todo-worker", "persona-offline", "persona-done", "persona-unread"]);
+    expect(groups[2].initialLimit).toBe(5);
+    expect(ids(groups[3].sessions)).toEqual(["manual-unread", "manual-idle", "manual-linked", "unknown", "manual-offline"]);
+    expect(groups[3].initialLimit).toBe(8);
+    expect(groups.slice(0, 4).every((g) => !g.folded)).toBe(true);
     expect(groups[4].folded).toBe(true);
+  });
+
+  it("splitAgentSessions 在超过 40 条离线会话时仍完整保留已派出的离线任务", () => {
+    const manualOff = Array.from({ length: 45 }, (_, i) =>
+      session(`m-${i}`, "offline", { updated_at: `2026-01-02T00:${String(59 - i).padStart(2, "0")}:00Z` }),
+    );
+    const oldDispatched = session("dispatched-old", "offline", {
+      cwd: "/Users/demo/.herdr/worktrees/persona/task-todo-abc123",
+      updated_at: "2026-01-01T00:00:00Z",
+    });
+    const { recent } = splitAgentSessions([...manualOff, oldDispatched], machines, undefined, (s) => isDispatchedSession(s));
+    expect(recent).toHaveLength(41);
+    expect(ids(recent)).toContain("dispatched-old");
   });
 
   it("屏蔽的需要你仍排第一，普通手动已看归入最近而不进入已屏蔽", () => {

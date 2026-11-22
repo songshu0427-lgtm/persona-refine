@@ -6,11 +6,19 @@ import { byTime } from "./times";
 import { stateName } from "./state-labels";
 
 export type AgentGrouping = "repo" | "space" | "state" | "machine" | "todo";
-// "By to-do" leads and is the default for a browser that never picked one (#2812); a grouping picked before stays. The
-// sidebar shows them in this order as segments, the paged list and the complete list alike (#6662), and the
-// switch-grouping shortcut goes round them in it. "By machine" is herdr's own layout (machine → workspace → tab,
-// lib/herdr-tree.ts). `short` is the segment's label, `label` the full name. "By pinned" (#4352) is gone (#6662): the
-// sidebar's 常驻 rows unfold to the same tree, so a picked one reads as By to-do.
+export type SidebarGrouping = "state" | "repo";
+
+export const SIDEBAR_GROUPINGS: { key: SidebarGrouping; label: string; short: string }[] = [
+  { key: "state", label: t("lib-agent-groups.by_state"), short: t("lib-agent-groups.seg_state") },
+  { key: "repo", label: t("lib-agent-groups.by_repo"), short: t("lib-agent-groups.seg_repo") },
+];
+
+export function sidebarGrouping(value: string | null): SidebarGrouping {
+  if (value === "repo" || value === "machine" || value === "space") return "repo";
+  return "state";
+}
+
+// Legacy 5-grouping metadata kept for low-level tree helpers.
 export const AGENT_GROUPINGS: { key: AgentGrouping; label: string; short: string }[] = [
   { key: "todo", label: t("lib-agent-groups.by_todo"), short: t("lib-agent-groups.seg_todo") },
   { key: "machine", label: t("lib-agent-groups.by_machine"), short: t("lib-agent-groups.seg_machine") },
@@ -22,6 +30,30 @@ export const AGENT_GROUPINGS: { key: AgentGrouping; label: string; short: string
 // the grouping this browser chose last (persona.agentGrouping, #1836); urgency-first by state until it chooses
 export function agentGrouping(value: string | null): AgentGrouping {
   return AGENT_GROUPINGS.find((g) => g.key === value)?.key ?? "state";
+}
+
+const TASK_WORKTREE_RE = /[/\\]\.herdr[/\\]worktrees[/\\].*[/\\]task-todo-/;
+
+export function isTaskWorktreePath(cwd: string | undefined): boolean {
+  return Boolean(cwd && TASK_WORKTREE_RE.test(cwd));
+}
+
+export function dispatchedSessionKeys(todos: readonly { origin?: string; plan_id?: string; supervision?: unknown; agents?: readonly { machine_id: string; session_id: string }[] }[]): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const td of todos) {
+    if (!(td.origin || td.plan_id || td.supervision) || !td.agents?.length) continue;
+    for (const a of td.agents) {
+      if (a.machine_id && a.session_id) out.add(`${a.machine_id}/${a.session_id}`);
+      if (a.session_id) out.add(a.session_id);
+    }
+  }
+  return out;
+}
+
+export function isDispatchedSession(s: Session, dispatchedKeys?: ReadonlySet<string>): boolean {
+  if (s.started_by_persona) return true;
+  if (dispatchedKeys?.has(`${s.machine_id}/${s.session_id}`) || dispatchedKeys?.has(s.session_id)) return true;
+  return isTaskWorktreePath(s.cwd);
 }
 
 // the host kinds a pane ref may be prefixed with (keep in step with Kinds in server/internal/host/host.go); herdr's ids go bare and may hold a colon
@@ -76,21 +108,24 @@ export interface AgentGroup {
   /** Its agents only wait on background commands (#6045): drawn with the waiting mark. */
   waiting?: boolean;
   folded?: boolean;
+  initialLimit?: number;
   todoId?: string;
   todoStatus?: string;
   /** What the group is and why its agents are in it, for a name that does not say it alone (a tooltip). */
   hint?: string;
 }
 
-export function splitAgentSessions(all: Session[], machines: Machine[], keepOffline?: (s: Session) => boolean) {
+export function splitAgentSessions(all: Session[], machines: Machine[], keepOffline?: (s: Session) => boolean, keepRecent?: (s: Session) => boolean) {
   const online = new Set(machines.filter((m) => m.online).map((m) => m.id));
   const agents = all.filter((s) => !s.assistant);
   const live = agents.filter((s) => (stateOf(s) !== "offline" && online.has(s.machine_id)) || keepOffline?.(s));
   const listed = new Set(live);
-  const recent = agents
+  const sortedOffline = agents
     .filter((s) => !listed.has(s))
-    .sort((a, b) => byTime(b.updated_at, a.updated_at) || a.machine_id.localeCompare(b.machine_id) || a.session_id.localeCompare(b.session_id))
-    .slice(0, 40);
+    .sort((a, b) => byTime(b.updated_at, a.updated_at) || a.machine_id.localeCompare(b.machine_id) || a.session_id.localeCompare(b.session_id));
+  const recent = keepRecent
+    ? sortedOffline.filter((s, idx) => idx < 40 || keepRecent(s))
+    : sortedOffline.slice(0, 40);
   return { live, recent };
 }
 
@@ -169,29 +204,30 @@ function byDate(a: Session, b: Session): number {
   return byTime(date(b), date(a)) || a.session_id.localeCompare(b.session_id) || a.machine_id.localeCompare(b.machine_id);
 }
 
-// 3-tier urgency hierarchy: 需要你 → 进行中 → 最近 (100% of manual sessions stay visible), while finished/quiet
-// Persona-dispatched temporary Workers (started_by_persona) fold into 已完成的派出任务 at the bottom.
-export function buildAgentGroups(all: Session[], machines: Machine[], _grouping: "state", mutes: AgentMutes = { spaces: [], sessions: [] }, offlineRecent: Session[] = []): AgentGroup[] {
+// Urgency + source hierarchy: 需要你 → 进行中 → 派出任务 (Persona-dispatched tasks, unfolded with cap) → 最近 (manual
+// chats, unfolded with cap) → 已屏蔽 (folded).
+export function buildAgentGroups(all: Session[], machines: Machine[], _grouping: "state", mutes: AgentMutes = { spaces: [], sessions: [] }, offlineRecent: Session[] = [], dispatchedKeys?: ReadonlySet<string>): AgentGroup[] {
   const { live } = splitAgentSessions(all, machines);
   const groups: AgentGroup[] = [
     { key: "state:needs", name: stateName("needs_you"), state: "needs_you", sessions: [] },
     { key: "state:working", name: t("sidebar.in_progress"), state: "working", sessions: [] },
-    { key: "state:recent", name: t("sidebar.recent_chats"), sessions: [] },
+    { key: "state:dispatched-tasks", name: t("sidebar.dispatched_done"), state: "idle", sessions: [], initialLimit: 5 },
+    { key: "state:recent", name: t("sidebar.recent_chats"), sessions: [], initialLimit: 8 },
     { key: "state:muted", name: t("lib-agent-groups.state_muted"), sessions: [], folded: true },
-    { key: "state:dispatched", name: t("sidebar.dispatched_done"), state: "idle", sessions: [], folded: true },
   ];
   for (const s of live) {
     const state = stateOf(s);
     const waiting = isWaiting(s);
+    const dispatched = isDispatchedSession(s, dispatchedKeys);
     const index = state === "needs_you" || awaitsReply(s, mutes) ? 0
-      : isMuted(s, mutes) && (state === "working" || state === "unread" || waiting) ? 3
+      : isMuted(s, mutes) && (state === "working" || state === "unread" || waiting) ? 4
       : state === "working" || backgroundWaiting(s) || waiting ? 1
-      : s.started_by_persona ? 4
-      : 2;
+      : dispatched ? 2
+      : 3;
     groups[index].sessions.push(s);
   }
   for (const s of offlineRecent) {
-    groups[s.started_by_persona ? 4 : 2].sessions.push(s);
+    groups[isDispatchedSession(s, dispatchedKeys) ? 2 : 3].sessions.push(s);
   }
   return groups.filter((g) => g.sessions.length).map((g) => ({
     ...g,

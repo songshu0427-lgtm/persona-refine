@@ -2,7 +2,7 @@
 // agents. Imports only SidebarParts among the sidebar's files.
 import { memo, useCallback, useMemo, useState, useSyncExternalStore } from "react";
 import { t } from "../i18n";
-import { awaitsReply, justFinished, sessionSource, sourceName } from "../lib/agent-groups";
+import { awaitsReply, isTaskWorktreePath, justFinished, sessionSource, sourceName } from "../lib/agent-groups";
 import { addSection, arrangeSessions, assignSection, GROUP_LABEL, isDefaultView, providerLabel, refreshAgentSessions, removeSection, resetView, setView, SHOW_LABEL, SORT_LABEL, toggleProvider, togglePin, totalUnread, updateAgentPrefs, useAgentList, useAgentPrefs, viewOf, type AgentPrefs, type AgentSession, type GroupBy, type ShowMode, type SortBy } from "../lib/agents";
 import { ago, backgroundWaiting, sessionCan, sessionPreview, sourceSubtitle, sessionTitle, stateOf, tabLabel } from "../lib/format";
 import { firstAndCurrent } from "../lib/persona-nav";
@@ -266,6 +266,11 @@ export const SessionRow = memo(function SessionRow({ s: row, k, reg, hover, acti
   const awaiting = useStore((x) => awaitsReply(s, x.mutes));
   // Just finished (#9751): done before you looked, less than three hours ago
   const finished = useStore((x) => justFinished(s, x.mutes));
+  const dispatched = useStore((stState) => !s.assistant && (
+    Boolean(s.started_by_persona) ||
+    isTaskWorktreePath(s.cwd) ||
+    stState.todos.some((td) => Boolean(td.origin || td.plan_id || td.supervision) && td.agents?.some((a) => a.session_id === given.session_id && (!a.machine_id || a.machine_id === given.machine_id)))
+  ));
   // where it was opened, marked at the row's end: not on a tab with several panes (endRoom), where a herdr tab is a
   // terminal by definition, each pane's row under it says so, and the mark's room is the title's
   const source = showState && !s.assistant && !endRoom ? sessionSource(s) : undefined;
@@ -407,8 +412,8 @@ export const SessionRow = memo(function SessionRow({ s: row, k, reg, hover, acti
         </span>
       )}
       {host && <span className={cx("shrink-0 rounded bg-hover px-1 text-[10px] leading-4 text-ink-3", aside)}>{host}</span>}
-      {showState && !s.assistant && s.started_by_persona && st === "working" && (
-        <span data-persona-dispatched title={t("sidebar.persona_dispatched")} className={cx("shrink-0 rounded bg-hover px-1 text-[10px] leading-4 text-ink-3", aside)}>Persona</span>
+      {showState && !s.assistant && dispatched && (
+        <span data-persona-dispatched title={t("sidebar.persona_dispatched")} className={cx("shrink-0 rounded bg-hover px-1 text-[10px] leading-4 text-ink-3", aside)}>{t("sidebar.dispatched_badge")}</span>
       )}
       {showTodoTag && s.todo && (
         <span

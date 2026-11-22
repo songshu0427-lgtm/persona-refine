@@ -114,58 +114,59 @@ for (const paged of [false, true]) {
       expect(grouping()).not.toBeNull();
       expect(host.textContent).toContain(tail.title);
     });
-    it.each(["machine", "space", "repo", "state", "todo"])("honors saved %s grouping", async (saved) => {
+    it.each([
+      ["machine", "仓库"],
+      ["space", "仓库"],
+      ["repo", "仓库"],
+      ["state", "状态"],
+      ["todo", "状态"],
+    ] as const)("normalizes saved %s grouping to %s in the persistent 2-tab bar", async (saved, expectedTab) => {
       const { fetch } = await render(paged, emptyPins, saved);
-      if (saved !== "state") expect(chosen()).toBe({ todo: "待办", machine: "机器", repo: "仓库", space: "项目" }[saved]);
-      else expect(grouping()).toBeNull();
+      expect(chosen()).toBe(expectedTab);
       expect(localStorage.getItem("persona.agentGrouping")).toBe(saved);
-      // urgency (state) and By repository read the complete list so dispatched Workers and worktrees separate cleanly
-      const complete = !paged || saved === "repo" || saved === "state";
-      expect(Boolean(pagedList())).toBe(!complete);
-      expect(completeReads(fetch).length > 0).toBe(complete);
-      if (complete) expect(host.textContent).toContain(tail.title);
+      expect(Boolean(pagedList())).toBe(false);
+      expect(completeReads(fetch).length > 0).toBe(true);
+      expect(host.textContent).toContain(tail.title);
     });
-    it("opens on urgency (state) by default without the grouping bar", async () => {
+    it("opens on 状态 by default with the persistent 2-tab grouping bar", async () => {
       const { fetch } = await render(paged);
-      expect(grouping()).toBeNull();
+      expect(chosen()).toBe("状态");
       expect(Boolean(pagedList())).toBe(false);
       expect(completeReads(fetch).length > 0).toBe(true);
     });
   });
 }
 
-it("reacts to pins saved while the paged list is mounted, then releases the fallback, the bar unchanged", async () => {
-  await render(true, emptyPins, "todo");
-  expect(pagedList()).not.toBeNull();
-  expect(chosen()).toBe("待办");
+it("reacts to pins saved while mounted, keeping the 2-tab bar unchanged", async () => {
+  await render(true, emptyPins, "state");
+  expect(chosen()).toBe("状态");
   await act(async () => savePins({ sessions: ["computer/Beyond first page"], spaces: [] }));
   await flush();
-  expect(pagedList()).toBeNull();
-  expect(chosen()).toBe("待办");
+  expect(chosen()).toBe("状态");
+  expect(host.textContent).toContain("置顶");
   expect(host.textContent).toContain(tail.title);
   await act(async () => savePins(emptyPins));
   await flush();
-  expect(pagedList()).not.toBeNull();
-  expect(chosen()).toBe("待办");
+  expect(chosen()).toBe("状态");
 });
 
-it("honors the grouping shortcut while the paged list is mounted", async () => {
-  await render(true, emptyPins, "todo");
+it("honors the grouping shortcut to toggle between 状态 and 仓库", async () => {
+  await render(true, emptyPins, "state");
   act(() => { cycleGrouping(); });
   await flush();
-  expect(localStorage.getItem("persona.agentGrouping")).toBe("machine");
-  expect(chosen()).toBe("机器");
-  expect(pagedList()).not.toBeNull();
+  expect(localStorage.getItem("persona.agentGrouping")).toBe("repo");
+  expect(chosen()).toBe("仓库");
+  act(() => { cycleGrouping(); });
+  await flush();
+  expect(localStorage.getItem("persona.agentGrouping")).toBe("state");
+  expect(chosen()).toBe("状态");
 });
 
-it("has no search field of its own: ⌘K's words are the paged list's search, a chip whose × takes them off (#6589)", async () => {
-  const { fetch } = await render(true, emptyPins, "todo");
-  expect(pagedList()).not.toBeNull();
+it("has no search field of its own: ⌘K's words appear as a search chip whose × takes them off (#6589)", async () => {
+  await render(true, emptyPins, "state");
   expect(host.querySelector("[data-sidebar-agents] input")).toBeNull();
   act(() => filterAgentList("review"));
   await flush();
-  // the hub reads them as its text search, the matches listed flat
-  expect(fetch.mock.calls.some(([url]) => new URL(url as string, "http://hub.example.com").searchParams.get("q") === "review")).toBe(true);
   const chip = host.querySelector('[data-sidebar-agents] [data-chip="query"]')!;
   expect(chip.textContent).toContain("review");
   await act(async () => chip.querySelector<HTMLButtonElement>("button[aria-label]")!.click());

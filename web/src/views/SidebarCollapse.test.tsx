@@ -259,22 +259,22 @@ describe("folding a block of the sidebar", () => {
   it("tucks the grouping bar away under urgency default, showing segments once a non-state grouping is chosen", async () => {
     act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
     await flush();
-    expect(host.querySelector('[role="radiogroup"][aria-label="Agent 分组"]')).toBeNull();
-    localStorage.setItem("persona.agentGrouping", "todo");
-    act(() => root.unmount());
-    root = createRoot(host);
-    act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
-    await flush();
     const bar = host.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Agent 分组"]')!;
+    expect(bar).not.toBeNull();
     const segs = [...bar.querySelectorAll<HTMLButtonElement>('[role="radio"]')];
-    expect(segs.map((b) => b.textContent)).toEqual(["待办", "机器", "仓库", "项目", "状态"]);
-    expect(segs.map((b) => b.getAttribute("aria-label"))).toEqual(["按待办", "按机器", "按仓库", "按项目", "按状态"]);
+    expect(segs.map((b) => b.textContent)).toEqual(["状态", "仓库"]);
+    expect(segs.map((b) => b.getAttribute("aria-label"))).toEqual(["按状态", "按仓库"]);
     expect(segs[0].getAttribute("aria-checked")).toBe("true");
     expect(segs.every((b) => b.className.includes("whitespace-nowrap"))).toBe(true);
     act(() => segs[1].click());
-    expect(localStorage.getItem("persona.agentGrouping")).toBe("machine");
+    expect(localStorage.getItem("persona.agentGrouping")).toBe("repo");
     expect(segs[1].getAttribute("aria-checked")).toBe("true");
     expect(segs[0].getAttribute("aria-checked")).toBe("false");
+    // Switching back to 状态 keeps the 2-tab bar visible
+    act(() => segs[0].click());
+    expect(localStorage.getItem("persona.agentGrouping")).toBe("state");
+    expect(host.querySelector('[role="radiogroup"][aria-label="Agent 分组"]')).not.toBeNull();
+    expect(segs[0].getAttribute("aria-checked")).toBe("true");
   });
 
   it("keeps a grouping chosen before in the list menu", async () => {
@@ -308,13 +308,13 @@ describe("folding a block of the sidebar", () => {
 describe("ordering the Agents list (G099)", () => {
   const item = (label: string) => [...document.querySelectorAll<HTMLElement>('[role^="menuitem"]')].find((el) => el.textContent?.includes(label));
 
-  it("offers 状态优先 / 最近更新 under non-state groupings and keeps the choice", async () => {
-    localStorage.setItem("persona.agentGrouping", "machine");
+  it("offers 状态优先 / 最近更新 under 仓库 and keeps the choice", async () => {
+    localStorage.setItem("persona.agentGrouping", "repo");
     act(() => root.render(<Sidebar route={{ name: "home" }} onSearch={() => {}} onNewAgent={() => {}} />));
     await flush();
     act(() => button("Agent 列表选项")!.click());
     expect(item("状态优先")).toBeDefined();
-    expect(item("按机器")).toBeDefined();
+    expect(item("按仓库")).toBeDefined();
     act(() => item("最近更新")!.click());
     await flush();
     expect(localStorage.getItem("persona.agentSort")).toBe("updated");

@@ -42,10 +42,9 @@ describe("folding every group", () => {
 });
 
 describe("the sidebar's grouping", () => {
-  it("goes round the groupings", () => {
-    expect(nextGrouping("todo")).toBe("machine");
-    expect(nextGrouping("machine")).toBe("repo");
-    expect(nextGrouping("state")).toBe("todo");
+  it("goes round the 2 persistent groupings (state <-> repo)", () => {
+    expect(nextGrouping("state")).toBe("repo");
+    expect(nextGrouping("repo")).toBe("state");
   });
   it("skips the ones a hub does not offer", () => {
     expect(nextGrouping("state", ["machine", "repo", "space", "state"])).toBe("machine");
@@ -56,15 +55,15 @@ describe("the sidebar's grouping", () => {
     vi.stubGlobal("localStorage", { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) });
     const seen: string[] = [];
     const off = onGrouping((g) => seen.push(g));
-    expect(cycleGrouping()).toBe("space");
-    expect(store.get(GROUPING_KEY)).toBe("space");
-    expect(seen).toEqual(["space"]);
+    expect(cycleGrouping()).toBe("state");
+    expect(store.get(GROUPING_KEY)).toBe("state");
+    expect(seen).toEqual(["state"]);
     off();
-    expect(groupingLabel("space")).toBe("按项目");
+    expect(groupingLabel("repo")).toBe("按仓库");
   });
-  it("starts from urgency (by state) when nothing was chosen", () => {
+  it("starts from urgency (by state) when nothing was chosen and cycles to repo", () => {
     vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {} });
-    expect(cycleGrouping()).toBe("todo");
+    expect(cycleGrouping()).toBe("repo");
   });
 });
 

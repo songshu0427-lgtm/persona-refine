@@ -12,7 +12,7 @@ vi.hoisted(() => {
 });
 import { t } from "../i18n";
 import { filterAgentList, resetAgentListFilters } from "../lib/agent-list-filters";
-import { connect, refresh, reset } from "../lib/store";
+import { refresh, reset } from "../lib/store";
 import type { Todo } from "../lib/todos";
 import type { Machine, Session } from "../lib/types";
 import { Icon, type IconName } from "../ui/icons";
@@ -93,75 +93,63 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("按待办 before the todos have loaded", () => {
-  beforeEach(() => localStorage.setItem("persona.agentGrouping", "todo"));
-
-  it("says 加载中… until GET /todos answers, then draws the agent under its todo, never under 没挂待办的 first", async () => {
-    let answer!: (r: Response) => void;
-    const todos = new Promise<Response>((r) => (answer = r));
-    vi.stubGlobal("fetch", hub(() => todos));
-    // the socket pushes the machines and sessions while GET /todos (asked for on hello) is still on its way
-    connect();
-    const sock = FakeSocket.all[FakeSocket.all.length - 1];
-    sock.open();
-    sock.push({ type: "hello", server_version: "v1" });
-    sock.push({ type: "machines", machines: [mac] });
-    sock.push({ type: "sessions", machine_id: "mac", sessions: [agent] });
-    await render();
-    expect(checked()).toBe("按待办");
-    expect(agentsBlock().textContent).toContain("加载中…");
-    expect(agentsBlock().textContent).not.toContain("没挂待办的");
-    expect(agentsBlock().textContent).not.toContain("改发布脚本");
-
-    await act(async () => answer(new Response(JSON.stringify({ todos: [todo] }), { status: 200 })));
-    await flush();
-    expect(agentsBlock().textContent).not.toContain("加载中…");
-    expect(agentsBlock().textContent).toContain("天气 App 发 1.3 版");
-    expect(agentsBlock().textContent).toContain("改发布脚本");
-    // the agent sits under its to-do; 没挂待办的 is listed (#6458) and holds none
-    expect(agentsBlock().querySelector('[data-tree-branch="todo:td1"]')?.textContent).toContain("改发布脚本");
-    expect(agentsBlock().querySelector('[data-tree-branch="todo:none"] [data-tree-branch-row]')?.textContent).toMatch(/^没挂待办的.*0 个 Agent$/);
-    expect(agentsBlock().querySelector('[data-tree-branch="todo:none"]')?.textContent).not.toContain("改发布脚本");
-  });
-
-  it("draws the todos as soon as GET /todos answers, while GET /sessions is still on its way", async () => {
-    const slow = vi.fn((url: string) => {
-      if (url.endsWith("/api/v1/todos")) return json({ todos: [todo] });
-      if (url.endsWith("/api/v1/sessions")) return new Promise<Response>(() => {});
+describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () => {
+  it("renders 状态 | 仓库 persistently and shows supervised/worktree dispatched tasks in 派出任务 with 派出 badge", async () => {
+    const dispatchedWorker: Session = {
+      machine_id: "mac",
+      session_id: "s-dispatched",
+      title: "修复 Persona 的 Codex 实例问题",
+      cwd: "/Users/demo/.herdr/worktrees/persona/task-todo-39102cb2935e49da",
+      status: "idle",
+      state: "idle",
+      started_by_persona: false,
+      updated_at: "2026-11-22T09:10:00Z",
+    };
+    const manualChat: Session = {
+      machine_id: "mac",
+      session_id: "s-manual",
+      title: "本地日常调试会话",
+      cwd: "/Users/demo/code/weather",
+      status: "idle",
+      state: "idle",
+      updated_at: "2026-11-22T09:05:00Z",
+    };
+    const supervisedTodo: Todo = {
+      ...todo,
+      id: "todo_39102cb2935e49da",
+      supervision: { mode: "auto" } as never,
+      agents: [{ machine_id: "mac", session_id: "s-dispatched", linked_at: "2026-11-22T09:00:00Z" }],
+    };
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/api/v1/todos")) return json({ todos: [supervisedTodo] });
+      if (url.endsWith("/api/v1/sessions")) return json({ sessions: [agent, dispatchedWorker, manualChat] });
       if (url.endsWith("/api/v1/machines")) return json({ machines: [mac] });
       return json({});
-    });
-    vi.stubGlobal("fetch", slow);
-    connect();
-    const sock = FakeSocket.all[FakeSocket.all.length - 1];
-    sock.open();
-    sock.push({ type: "hello", server_version: "v1" });
-    sock.push({ type: "machines", machines: [mac] });
-    sock.push({ type: "sessions", machine_id: "mac", sessions: [agent] });
+    }));
+    await refresh();
     await render();
-    expect(agentsBlock().textContent).not.toContain("加载中…");
-    expect(agentsBlock().textContent).toContain("天气 App 发 1.3 版");
-    expect(agentsBlock().textContent).toContain("改发布脚本");
+    expect(segments().map((b) => b.textContent)).toEqual(["状态", "仓库"]);
+    expect(checked()).toBe("按状态");
+    expect(agentsBlock().textContent).toContain("进行中");
+    expect(agentsBlock().textContent).toContain("派出任务");
+    expect(agentsBlock().textContent).toContain("修复 Persona 的 Codex 实例问题");
+    expect(agentsBlock().textContent).toContain("最近");
+    expect(agentsBlock().textContent).toContain("本地日常调试会话");
+    expect(agentsBlock().querySelector('[data-persona-dispatched]')?.textContent).toBe("派出");
   });
 
-  it("does not wait under another grouping", async () => {
+  it("migrates legacy machine/space preferences to 仓库 and todo to 状态", async () => {
     localStorage.setItem("persona.agentGrouping", "machine");
-    vi.stubGlobal("fetch", hub(() => new Promise<Response>(() => {})));
-    connect();
-    const sock = FakeSocket.all[FakeSocket.all.length - 1];
-    sock.open();
-    sock.push({ type: "hello", server_version: "v1" });
-    sock.push({ type: "machines", machines: [mac] });
-    sock.push({ type: "sessions", machine_id: "mac", sessions: [agent] });
+    vi.stubGlobal("fetch", hub(() => json({ todos: [todo] })));
+    await refresh();
     await render();
-    expect(checked()).toBe("按机器");
+    expect(checked()).toBe("按仓库");
     expect(agentsBlock().textContent).not.toContain("加载中…");
-    expect(agentsBlock().textContent).toContain("工作电脑");
   });
 });
 
 describe("group controls in every Agents view", () => {
-  it.each(["todo", "machine", "repo", "space", "state"])("opens and folds all levels in %s without folding the block", async (mode) => {
+  it.each(["state", "repo"])("opens and folds all levels in %s without folding the block", async (mode) => {
     localStorage.setItem("persona.agentGrouping", mode);
     vi.stubGlobal("fetch", hub(() => json({ todos: [todo] })));
     await refresh();
@@ -224,9 +212,9 @@ describe("the fold-all button keeps the Agents controls", () => {
     await flush();
   };
 
-  it.each(["todo", "machine", "repo", "space", "state"])("folds %s to its group headings and opens it again, the controls staying", async (mode) => {
+  it.each(["state", "repo"])("folds %s to its group headings and opens it again, the controls staying", async (mode) => {
     localStorage.setItem("persona.agentGrouping", mode);
-    const expectedControls = mode === "state" ? { tabs: false, filters: false, filter: true } : everyControl;
+    const expectedControls = mode === "state" ? { tabs: true, filters: false, filter: true } : everyControl;
     vi.stubGlobal("fetch", hub(() => json({ todos: [todo] })));
     await refresh();
     await render();
@@ -240,9 +228,6 @@ describe("the fold-all button keeps the Agents controls", () => {
     expect(headings().length).toBeGreaterThan(0);
     expect(headings().every((b) => b.getAttribute("aria-expanded") === "false")).toBe(true);
     expect(agentShown()).toBe(false);
-    // by to-do, each to-do is one row, its agents folded under it (no project or repository level above it, #6458)
-    if (mode === "todo") expect(agentsBlock().querySelector('[data-tree-branch="todo:td1"] [data-tree-branch-row]')?.textContent).toContain(todo.title);
-    if (mode === "todo") expect(onScreen(agentsBlock().querySelector('[data-tree-branch="todo:td1"] [data-tree-branch-row]'))).toBe(true);
     expect(foldAll()!.getAttribute("aria-label")).toBe("全部展开");
     expect(shows()).toBe(glyph("unfoldToggle"));
 
@@ -254,7 +239,7 @@ describe("the fold-all button keeps the Agents controls", () => {
   });
 
   it("has no button in the chat-list view, whose rows stay under the controls", async () => {
-    localStorage.setItem("persona.agentGrouping", "machine");
+    localStorage.setItem("persona.agentGrouping", "repo");
     localStorage.setItem("persona.agentChatList", "1");
     vi.stubGlobal("fetch", hub(() => json({ todos: [todo] })));
     await refresh();
@@ -266,67 +251,20 @@ describe("the fold-all button keeps the Agents controls", () => {
   });
 });
 
-describe("按待办's 最近（未运行）", () => {
-  it("has no ⓘ, its name saying what it holds, and is listed only with something in it (#6447)", async () => {
-    localStorage.setItem("persona.agentGrouping", "todo");
-    const gone: Session = { ...agent, session_id: "s2", title: "旧的发布检查", status: "offline", state: "offline" };
-    let sessions = [agent, gone];
-    vi.stubGlobal("fetch", vi.fn((url: string) => {
-      if (url.endsWith("/api/v1/todos")) return json({ todos: [todo] });
-      if (url.endsWith("/api/v1/sessions")) return json({ sessions });
-      if (url.endsWith("/api/v1/machines")) return json({ machines: [mac] });
-      return json({});
-    }));
-    await refresh();
-    await render();
-    const about = (branch: string) => agentsBlock().querySelector(`[data-tree-branch="${branch}"] [data-tree-branch-row] [aria-label^="${t("ui-atoms.about", { name: "" }).slice(0, 2)}"]`);
-    const recent = () => agentsBlock().querySelector('[data-tree-branch="recent"] [data-tree-branch-row]');
-    expect(recent()?.textContent).toContain(t("sidebar.recent"));
-    expect(about("recent")).toBeNull();
-    // the groups whose names do not say it keep theirs
-    expect(about("todo:none")).not.toBeNull();
-
-    // the same hub with nothing stopped: no 最近（未运行） row at all
-    act(() => root.unmount());
-    reset();
-    root = createRoot(host);
-    sessions = [agent];
-    await refresh();
-    await render();
-    expect(recent()).toBeNull();
-    expect(agentsBlock().querySelector('[data-tree-branch="todo:none"]')).not.toBeNull();
-  });
-});
-
 describe("a hub without todos (GET /todos 404)", () => {
-  it("opens on urgency cleanly without 加载中… and omits 按待办 from the list menu", async () => {
+  it("opens on 状态 cleanly with the 2-tab bar and omits legacy groupings from the list menu", async () => {
     vi.stubGlobal("fetch", hub(() => json({ error: "not found" }, 404)));
     await refresh();
     await render();
-    expect(grouping()).toBeNull();
+    expect(segments().map((b) => b.textContent)).toEqual(["状态", "仓库"]);
+    expect(checked()).toBe("按状态");
     expect(agentsBlock().textContent).toContain("进行中");
     expect(agentsBlock().textContent).toContain("改发布脚本");
     expect(agentsBlock().textContent).not.toContain("加载中…");
     expect(localStorage.getItem("persona.agentGrouping")).toBeNull();
     act(() => host.querySelector<HTMLButtonElement>('button[aria-label="Agent 列表选项"]')!.click());
     const labels = [...document.querySelectorAll<HTMLElement>('[role="menuitemradio"]')].map((el) => el.textContent);
-    expect(labels).toEqual(["按机器", "按仓库", "按项目", "按状态"]);
-  });
-
-  it("keeps a 按待办 chosen before and shows it again once the hub has todos", async () => {
-    localStorage.setItem("persona.agentGrouping", "todo");
-    vi.stubGlobal("fetch", hub(() => json({ error: "not found" }, 404)));
-    await refresh();
-    await render();
-    expect(checked()).toBe("按机器");
-    expect(localStorage.getItem("persona.agentGrouping")).toBe("todo");
-
-    vi.stubGlobal("fetch", hub(() => json({ todos: [todo] })));
-    await act(async () => { await refresh(); });
-    await flush();
-    expect(segments()[0].getAttribute("aria-label")).toBe("按待办");
-    expect(checked()).toBe("按待办");
-    expect(agentsBlock().textContent).toContain("天气 App 发 1.3 版");
+    expect(labels).toEqual(["按状态", "按仓库"]);
   });
 });
 
