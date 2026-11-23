@@ -32,6 +32,8 @@ describe("the sidebar's machine projection", () => {
     { hub_name: "Renamed hub" },
     { error_code: "never_connected" },
     { trust: "pending" },
+    { home: "/Users/example" },
+    { home_real: "/data00/home/example" },
   ])("updates a changed sidebar field: %j", (patch) => {
     const machines = computers();
     const before = selectSidebarMachines({ machines });

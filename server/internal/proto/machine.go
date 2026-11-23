@@ -21,6 +21,7 @@ type Machine struct {
 	OS            string    `json:"os,omitempty"`
 	Arch          string    `json:"arch,omitempty"`
 	Home          string    `json:"home,omitempty"`
+	HomeReal      string    `json:"home_real,omitempty"`
 	HerdrVersion  string    `json:"herdr_version,omitempty"`
 	ClaudeVersion string    `json:"claude_version,omitempty"`
 	LastSeen      time.Time `json:"last_seen,omitempty"`

@@ -4,6 +4,7 @@ import { hubWaits } from "./work";
 import type { AgentState, Machine, Session } from "./types";
 import { byTime } from "./times";
 import { stateName } from "./state-labels";
+import { isNonRepoSession } from "./agent-repos";
 
 export type AgentGrouping = "repo" | "space" | "state" | "machine" | "todo";
 export type SidebarGrouping = "state" | "repo";
@@ -87,8 +88,10 @@ export function isRepoOfflineRetained(
   onlineMachineIds: ReadonlySet<string>,
   knownTodoKeys?: ReadonlySet<string>,
   codexProjectMachines?: ReadonlySet<string>,
+  machine?: Pick<Machine, "home" | "home_real">,
 ): boolean {
   if (s.archived || !onlineMachineIds.has(s.machine_id)) return false;
+  if (isNonRepoSession(s, machine)) return false;
   if (CATALOG_WORKSPACE_HOSTS.has(s.space_kind || s.host || sessionHost(s))) return false;
   if (s.space_kind === "claude_desktop") return true;
   if (s.space_kind === "codex_app") {

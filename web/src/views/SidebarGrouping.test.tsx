@@ -266,9 +266,10 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
     offPreset();
   });
 
-  it("aligns By repo on Mac with Codex App + Claude Desktop + Persona-created chats without home-workspace swallowing or scratch probes", async () => {
+  it("aligns By repo on Mac with Codex App + Claude Desktop + Persona-created chats while excluding bare-home and ~/.persona/scratch sessions", async () => {
     localStorage.setItem("persona.agentGrouping", "repo");
-    const mac: Machine = { id: "mac", name: "Mac", online: true };
+    const mac: Machine = { id: "mac", name: "Mac", online: true, home: "/Users/demo" };
+    const devbox: Machine = { id: "devbox", name: "ARM DevBox", online: true, home: "/home/demo", home_real: "/data00/home/demo" };
     const homeTask: Session = {
       machine_id: "mac",
       session_id: "s-home-migrate",
@@ -282,6 +283,26 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
       status: "idle",
       state: "idle",
       updated_at: "2026-11-23T02:20:00Z",
+    };
+    const symlinkHomeTask: Session = {
+      machine_id: "devbox",
+      session_id: "s-symlink-home",
+      title: "修复远程主页直起会话",
+      cwd: "/data00/home/demo",
+      started_by_persona: true,
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-23T02:25:00Z",
+    };
+    const personaScratchTask: Session = {
+      machine_id: "mac",
+      session_id: "s-persona-scratch",
+      title: "默认隐藏临时目录调研",
+      cwd: "/Users/demo/.persona/scratch/todo_scratch",
+      started_by_persona: true,
+      status: "working",
+      state: "working",
+      updated_at: "2026-11-23T02:30:00Z",
     };
     const codexNewChat: Session = {
       machine_id: "mac",
@@ -330,14 +351,17 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
       const path = new URL(url, "http://hub").pathname;
       if (path === "/api/v1/todos") {
         return json({
-          todos: [{ id: "todo_1", title: "测试任务", status: "done", agents: [{ machine_id: "mac", session_id: "s-persona-todo" }] }],
+          todos: [
+            { id: "todo_1", title: "测试任务", status: "done", origin: "conv1", agents: [{ machine_id: "mac", session_id: "s-persona-todo" }] },
+            { id: "todo_scratch", title: "临时调研", status: "running", origin: "conv1", agents: [{ machine_id: "mac", session_id: "s-persona-scratch" }] },
+          ],
         });
       }
-      if (path === "/api/v1/machines") return json({ machines: [mac] });
+      if (path === "/api/v1/machines") return json({ machines: [mac, devbox] });
       if (path === "/api/v1/sessions") {
         return json({
-          sessions: [homeTask, codexNewChat, personaTodoOffline, codexTmpProbe, randomOfflineCli],
-          total: 5,
+          sessions: [homeTask, symlinkHomeTask, personaScratchTask, codexNewChat, personaTodoOffline, codexTmpProbe, randomOfflineCli],
+          total: 7,
           has_more: false,
           revision: "r2",
         });
@@ -357,10 +381,21 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
     expect(text).toContain("new-chat-1");
     expect(text).toContain("论文写作启动");
     expect(text).toContain("补充项目任务结论");
-    expect(text).toContain("demo");
-    expect(text).toContain("收窄迁移范围至应用可见会话");
+    expect(text).not.toContain("收窄迁移范围至应用可见会话");
+    expect(text).not.toContain("修复远程主页直起会话");
+    expect(text).not.toContain("默认隐藏临时目录调研");
+    expect(text).not.toContain("todo_scratch");
     expect(text).not.toContain("临时探测脚本");
     expect(text).not.toContain("随手终端历史");
+
+    // Switching to By status still shows the active ~/.persona/scratch task in 进行中!
+    await act(async () => {
+      segments()[0]!.click();
+      await Promise.resolve();
+    });
+    await flush();
+    const stateText = agentsBlock().textContent ?? "";
+    expect(stateText).toContain("默认隐藏临时目录调研");
   });
 });
 

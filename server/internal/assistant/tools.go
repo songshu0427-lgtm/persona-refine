@@ -535,7 +535,15 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		if err != nil {
 			return "", fmt.Errorf("%w; no agent was started", err)
 		}
-		a.Cwd = proto.ExpandHome(a.Cwd, am.Home)
+		branch := strings.TrimSpace(a.Worktree.Branch)
+		if isBareHomeCwd(a.Cwd, am) {
+			if branch != "" {
+				return "", fmt.Errorf("worktree requires a Git repository directory in cwd; no agent was started")
+			}
+			a.Cwd = scratchDirFor(am, "agent_"+randomHex(8))
+		} else {
+			a.Cwd = proto.ExpandHome(a.Cwd, am.Home)
+		}
 		own := startPick{launcher: strings.TrimSpace(a.Launcher), effort: strings.TrimSpace(a.Effort)} // before the tier
 		// The tier is resolved first (an unknown one asks and starts nothing), then Model Settings' Agents laid over it as
 		// the start lays it: what runs is said on the card (a hand-off from the health space asks) and in the answer.
@@ -587,7 +595,6 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		if err := s.checkAgentStart(ctx, am.ID, s.startLauncher(ctx, gated)); err != nil {
 			return "", fmt.Errorf("%w; no agent was started", err)
 		}
-		branch := strings.TrimSpace(a.Worktree.Branch)
 		where := am.Name + " · " + a.Cwd
 		if branch != "" {
 			where += i18n.T(s.lang(ctx), "assistant-tools.new_worktree", i18n.Args{"branch": branch})
@@ -735,6 +742,9 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 				values.wipe() // no retry can need them again
 			}
 			note += hand.granted(approvedBy)
+		}
+		if ensured, prepErr := s.ensureScratchDir(sctx, am, a.Cwd); prepErr == nil && ensured != "" {
+			a.Cwd, params["cwd"] = ensured, ensured
 		}
 		err = s.call(sctx, am.ID, DeviceSessionStart, params, &res)
 		if reason, refused := s.ultracodeRefusal(ctx, err, params); refused {

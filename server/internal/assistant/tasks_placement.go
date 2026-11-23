@@ -33,13 +33,25 @@ func (t *PlanTask) normalizeMachinePolicy() error {
 	return nil
 }
 
-// placeTask names t's machine by its id and makes ~ in its directory that machine's home; false: no such machine.
+// placeTask names t's machine by its id and makes ~ in its directory that machine's home; omitted or bare-home cwds
+// redirect into ~/.persona/scratch/<todo_id> so Agent sessions never run directly in the home root. False: no such machine.
 func (s *Service) placeTask(ctx context.Context, t *PlanTask) bool {
 	m, ok := s.machineByName(ctx, t.Machine)
 	if !ok {
 		return false
 	}
 	t.Machine = m.ID
+	if t.ReservedTodoID == "" {
+		t.ReservedTodoID = firstNonEmpty(t.ReuseTodo, t.TodoID, "todo_"+randomHex(8))
+	}
+	if isBareHomeCwd(t.Cwd, m) {
+		if t.Workspace != nil && t.Workspace.Mode == workspaceExisting && !isBareHomeCwd(t.Workspace.Existing, m) {
+			t.Cwd = proto.ExpandHome(t.Workspace.Existing, m.Home)
+			return true
+		}
+		t.Cwd = scratchDirFor(m, t.ReservedTodoID)
+		return true
+	}
 	t.Cwd = proto.ExpandHome(t.Cwd, m.Home)
 	return true
 }
@@ -162,6 +174,9 @@ func (s *Service) readonlyLaunchersOn(ctx context.Context, m Device) []string {
 // taskDirectoryExists checks the mapped directory before a flexible task changes machines. Missing, denied or
 // unreadable paths (including a node too old to answer fs.stat) keep that machine out of the detour.
 func (s *Service) taskDirectoryExists(ctx context.Context, machine, dir string) bool {
+	if m, ok := s.machineByName(ctx, machine); ok && isScratchDir(dir, m) && m.Home != "" {
+		dir = m.Home
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	var res struct {
@@ -402,6 +417,9 @@ func (s *Service) startTaskAgent(ctx context.Context, t *PlanTask, retry bool) (
 	s.setPlanThen(ctx, m.ID, params)
 	if err := s.checkContinuationScope(t); err != nil {
 		return "", "", err
+	}
+	if ensured, prepErr := s.ensureScratchDir(ctx, m, t.Cwd); prepErr == nil && ensured != "" {
+		t.Cwd, params["cwd"] = ensured, ensured
 	}
 	sentAt := time.Now()
 	err = s.call(ctx, m.ID, DeviceSessionStart, params, &res)

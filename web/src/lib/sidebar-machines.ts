@@ -3,7 +3,7 @@ import type { Machine } from "./types";
 // The fields read by the sidebar's groups, labels, terminal tree and machine menus. In particular, error_code
 // distinguishes a computer that has never connected from one that is temporarily offline. Pending computers also
 // use last_seen's presence for that distinction; the sidebar never displays its timestamp.
-const fields = ["id", "name", "online", "hub_id", "hub_name", "error_code", "trust"] as const;
+const fields = ["id", "name", "online", "hub_id", "hub_name", "error_code", "trust", "home", "home_real"] as const;
 type SidebarMachine = Pick<Machine, (typeof fields)[number] | "last_seen">;
 
 let source: Machine[] | undefined;
@@ -19,7 +19,18 @@ export function selectSidebarMachines({ machines }: { machines: Machine[] }): Si
     const old = previous.get(m.id);
     const kept = old && fields.every((key) => old[key] === m[key]) && Boolean(old.last_seen) === Boolean(m.last_seen)
       ? old
-      : { id: m.id, name: m.name, online: m.online, hub_id: m.hub_id, hub_name: m.hub_name, error_code: m.error_code, trust: m.trust, last_seen: m.last_seen };
+      : {
+          id: m.id,
+          name: m.name,
+          online: m.online,
+          hub_id: m.hub_id,
+          hub_name: m.hub_name,
+          error_code: m.error_code,
+          trust: m.trust,
+          home: m.home,
+          home_real: m.home_real,
+          last_seen: m.last_seen,
+        };
     same &&= kept === projection[i];
     return kept;
   });

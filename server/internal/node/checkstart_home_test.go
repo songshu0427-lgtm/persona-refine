@@ -32,4 +32,12 @@ func TestCheckStartExpandsHome(t *testing.T) {
 	if _, _, err := n.checkStart("~/missing", "", "", "", "", ""); err == nil {
 		t.Error("checkStart accepted a directory that does not exist")
 	}
+	scratchWant := filepath.Join(home, ".persona", "scratch", "todo_auto")
+	gotScratch, _, err := n.checkStart("~/.persona/scratch/todo_auto", "", "", "", "", "")
+	if err != nil || gotScratch != scratchWant {
+		t.Fatalf("checkStart scratch = %q, %v; want %q, nil", gotScratch, err, scratchWant)
+	}
+	if st, err := os.Stat(scratchWant); err != nil || !st.IsDir() {
+		t.Fatalf("checkStart did not create scratch dir %q: %v", scratchWant, err)
+	}
 }

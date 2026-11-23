@@ -383,7 +383,33 @@ export interface RepoCatalogOptions {
   hiddenSources?: readonly string[];
 }
 
-const HOME_DIR_RE = /^(?:\/(?:Users|home)\/[^/]+|[a-z]:\/Users\/[^/]+)$/i;
+const HOME_DIR_RE = /^(?:\/(?:Users|home|data\d*\/home)\/[^/]+|[a-z]:\/Users\/[^/]+)$/i;
+const PERSONA_STATE_SEGMENT_RE = /(?:^|\/)\.persona(?:\/|$)/i;
+
+/** Whether a path is a bare user home root (including symlinked homes like /data00/home/<user>) or inside Persona's
+ *  hidden ~/.persona directory (such as ~/.persona/scratch/<id> for non-repository tasks). */
+export function isNonRepoSessionDirectory(path: string | undefined, machine?: Pick<Machine, "home" | "home_real">): boolean {
+  const clean = catalogPath(path);
+  if (!clean || clean === "/") return false;
+  if (PERSONA_STATE_SEGMENT_RE.test(clean)) return true;
+  if (HOME_DIR_RE.test(clean)) return true;
+  for (const rawHome of [machine?.home, machine?.home_real]) {
+    const home = catalogPath(rawHome);
+    if (home && home !== "/" && clean.toLowerCase() === home.toLowerCase()) return true;
+  }
+  return false;
+}
+
+/** Sessions running in ~/.persona/scratch/<id> or directly in a bare home root with no real repository/project root
+ *  belong to By status and Todo cards, never as synthetic repository groups in By repo. */
+export function isNonRepoSession(s: Session, machine?: Pick<Machine, "home" | "home_real">): boolean {
+  if (orcaSpace(s)) return false;
+  const deskRoot = desktopProjectRoot(s);
+  if (deskRoot && !isNonRepoSessionDirectory(deskRoot, machine)) return false;
+  if (s.repo_root && !isNonRepoSessionDirectory(s.repo_root, machine)) return false;
+  if (s.worktree && !isNonRepoSessionDirectory(s.worktree, machine)) return false;
+  return isNonRepoSessionDirectory(s.cwd, machine);
+}
 
 /** Exact runtime placement always wins. Directory inference is allowed only for an unbound Agent and a unique
  *  deepest containing directory. Host-owned bindings never fall through to a different runtime at the same path,
@@ -465,9 +491,11 @@ function legacyNavigationRepos(sessions: Session[], machineId: string, options: 
   return buildRepos(navigation, machineId, options.compareSessions).map((repo) => ({ ...repo, count: repo.worktrees.flatMap(fill).length }));
 }
 
-function catalogRepos(sessions: Session[], machineId: string, options: RepoCatalogOptions): RepoTree[] {
+function catalogRepos(sessions: Session[], machine: Machine, options: RepoCatalogOptions): RepoTree[] {
+  const machineId = machine.id;
   // session-directory rows are the server's compatibility fallback, not host-owned workspaces or action targets.
-  const inventory = options.workspaces.filter((w) => w.machine_id === machineId && w.source !== "session-directory");
+  const inventory = options.workspaces.filter((w) => w.machine_id === machineId && w.source !== "session-directory"
+    && !(isNonRepoSessionDirectory(w.cwd, machine) && (!w.project_path || isNonRepoSessionDirectory(w.project_path, machine))));
   const catalog = inventory.filter((w) => !options.hiddenSources?.includes(w.source));
   if (!catalog.length) return legacyNavigationRepos(sessions, machineId, options);
   const keyOf = (w: HostWorkspace) => workspaceKey(w, options.owner, options.manager);
@@ -558,10 +586,12 @@ function catalogRepos(sessions: Session[], machineId: string, options: RepoCatal
 }
 
 export function buildRepoMachineTree(all: Session[], machines: Machine[], options?: RepoCatalogOptions): RepoMachine[] {
+  const machineById = new Map(machines.map((m) => [m.id, m]));
   const online = new Set(machines.filter((m) => m.online).map((m) => m.id));
   const byMachine = new Map<string, Session[]>();
   for (const s of all) {
-    if (s.assistant || (!online.has(s.machine_id) && !(options && hasWorkspacePin(s, options.workspaces, options.manager)))) continue;
+    const machine = machineById.get(s.machine_id);
+    if (s.assistant || isNonRepoSession(s, machine) || (!online.has(s.machine_id) && !(options && hasWorkspacePin(s, options.workspaces, options.manager)))) continue;
     let list = byMachine.get(s.machine_id);
     if (!list) {
       list = [];
@@ -570,13 +600,18 @@ export function buildRepoMachineTree(all: Session[], machines: Machine[], option
     list.push(s);
   }
 
+  const filteredOptions = options?.navigationSessions
+    ? { ...options, navigationSessions: options.navigationSessions.filter((s) => !isNonRepoSession(s, machineById.get(s.machine_id))) }
+    : options;
+
   const out: RepoMachine[] = [];
   for (const m of machines) {
     const sessions = byMachine.get(m.id);
-    const workspaces = options?.workspaces.some((w) => w.machine_id === m.id && w.source !== "session-directory");
-    const navigation = m.online && options?.navigationSessions?.some((s) => !s.assistant && s.machine_id === m.id);
+    const workspaces = filteredOptions?.workspaces.some((w) => w.machine_id === m.id && w.source !== "session-directory"
+      && !(isNonRepoSessionDirectory(w.cwd, m) && (!w.project_path || isNonRepoSessionDirectory(w.project_path, m))));
+    const navigation = m.online && filteredOptions?.navigationSessions?.some((s) => !s.assistant && s.machine_id === m.id);
     if ((!sessions || sessions.length === 0) && !workspaces && !navigation) continue;
-    const repos = options ? catalogRepos(sessions ?? [], m.id, options) : buildRepos(sessions!, m.id);
+    const repos = filteredOptions ? catalogRepos(sessions ?? [], m, filteredOptions) : buildRepos(sessions!, m.id);
     if (!repos.length) continue;
     out.push({
       key: `repo-machine:${m.id}`,

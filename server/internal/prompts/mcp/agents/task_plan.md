@@ -27,7 +27,6 @@ Workspace policy: "new" makes an isolated checkout; {"new":{"branch":"task/my-ch
           "title",
           "prompt",
           "machine",
-          "cwd",
           "readonly",
           "user_requested",
           "why"
@@ -52,7 +51,7 @@ Workspace policy: "new" makes an isolated checkout; {"new":{"branch":"task/my-ch
           },
           "cwd": {
             "type": "string",
-            "description": "the project directory: absolute path or ~/…"
+            "description": "project path; omit for non-repo work (uses a hidden scratch folder)"
           },
           "workspace": {
             "type": ["string", "object"],

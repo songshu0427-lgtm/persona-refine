@@ -293,7 +293,7 @@ func (m *Machine) snapshot() proto.Machine {
 	}
 	return proto.Machine{
 		ID: m.cfg.ID, Name: m.name(), Kind: m.cfg.Kind, Icon: icon, SSHHost: m.cfg.SSHHost, Online: m.online || warm, Error: m.err,
-		Hostname: m.info.Hostname, OS: m.info.OS, Arch: m.info.Arch, Home: m.info.Home,
+		Hostname: m.info.Hostname, OS: m.info.OS, Arch: m.info.Arch, Home: m.info.Home, HomeReal: m.info.HomeReal,
 		HerdrVersion: m.info.HerdrVersion, ClaudeVersion: m.info.ClaudeVersion, LastSeen: m.lastSeen,
 		NodeVersion: m.info.Version, NodeMismatch: m.online && nodeMismatch(version, m.info),
 		NodeProtocol: m.info.Protocol, NodeIncompatible: incompatible,

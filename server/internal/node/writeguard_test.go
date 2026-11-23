@@ -31,7 +31,7 @@ func writeNode(t *testing.T) (*Node, string) {
 func TestWritableDir(t *testing.T) {
 	n, home := writeNode(t)
 	outside := t.TempDir()
-	for _, d := range []string{".persona/data", ".persona", "Library/Preferences", ".ssh", "proj/sub"} {
+	for _, d := range []string{".persona/data", ".persona/scratch/todo_1", ".persona", "Library/Preferences", ".ssh", "proj/sub"} {
 		if err := os.MkdirAll(filepath.Join(home, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -44,7 +44,7 @@ func TestWritableDir(t *testing.T) {
 	}
 	ok := []struct{ path, cwd string }{
 		{"~", ""}, {"~/proj", ""}, {home + "/proj/sub", ""}, {"sub", home + "/proj"}, {"~/inlink", ""},
-		{"~/proj/sub/..", ""},
+		{"~/proj/sub/..", ""}, {"~/.persona/scratch", ""}, {"~/.persona/scratch/todo_1", ""},
 	}
 	for _, c := range ok {
 		if _, _, err := n.writableDir(c.path, c.cwd); err != nil {

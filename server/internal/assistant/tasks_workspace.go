@@ -111,6 +111,23 @@ func (s *Service) resolveTaskWorkspace(ctx context.Context, t *PlanTask) error {
 	if t.ReservedTodoID == "" {
 		t.ReservedTodoID = firstNonEmpty(t.ReuseTodo, t.TodoID, "todo_"+randomHex(8))
 	}
+	m, hasMachine := s.machineByName(ctx, t.Machine)
+	if hasMachine && t.Workspace != nil && t.Workspace.Mode == workspaceExisting && isBareHomeCwd(t.Workspace.Existing, m) {
+		t.Cwd = scratchDirFor(m, t.ReservedTodoID)
+		t.Workspace = &TaskWorkspace{Mode: workspaceNone}
+		t.WorkspaceInferred = true
+	}
+	if hasMachine && isScratchDir(t.Cwd, m) {
+		if t.Workspace != nil && t.Workspace.Mode == workspaceNew {
+			return fmt.Errorf("workspace %q requires a Git repository directory in cwd", workspaceNew)
+		}
+		if t.Workspace == nil || t.WorkspaceInferred {
+			t.Workspace = &TaskWorkspace{Mode: workspaceNone}
+			t.WorkspaceInferred = true
+			t.WorkspaceResolved = &TaskWorkspaceResolved{Machine: t.Machine, Path: proto.NodeClean(t.Cwd)}
+			return nil
+		}
+	}
 	var sourceCwd string // the inferred cwd's workspace, and the other task that writes there
 	var owner *Todo
 	t.cwdStatus, t.cwdStatusOf = nil, "" // never an answer about a folder an earlier resolve asked of
@@ -186,6 +203,9 @@ func (s *Service) resolveTaskWorkspace(ctx context.Context, t *PlanTask) error {
 			return i18n.ErrEnglish("assistant-tasks_workspace.unavailable", i18n.Args{"path": selected})
 		}
 		res.Path = proto.NodeClean(resolved.Cwd)
+		if !proto.NodeAbs(t.Cwd) {
+			t.Cwd = res.Path
+		}
 	case workspaceNew:
 		res.Branch = firstNonEmpty(t.Workspace.Branch, "task/"+firstNonEmpty(t.TodoID, t.ReservedTodoID))
 		var prep proto.WorktreePrepare

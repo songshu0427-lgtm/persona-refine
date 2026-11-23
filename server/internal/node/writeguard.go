@@ -63,6 +63,9 @@ func (n *Node) writable(real string) error {
 		}
 		return errReadOnly(real)
 	}
+	if isScratchRel(rel) {
+		return nil
+	}
 	for _, d := range noWriteDirs {
 		if d = strings.ToLower(d); rel == d || strings.HasPrefix(rel, d+"/") {
 			return errReadOnly(real)
@@ -72,10 +75,45 @@ func (n *Node) writable(real string) error {
 	// finds it (#5694). With PERSONA_HOME=~ it is the home itself, which stays writable.
 	for _, dir := range n.dataDirs() {
 		if !isHome(dir, n.home) && (p == dir || strings.HasPrefix(p, dir+"/")) {
+			if p == dir+"/scratch" || strings.HasPrefix(p, dir+"/scratch/") {
+				continue
+			}
 			return errReadOnly(real)
 		}
 	}
 	return nil
+}
+
+// isScratchRel reports whether rel (folded, relative to HOME) is the non-repository Agent scratch directory
+// (~/.persona/scratch or its subfolders). The rest of ~/.persona stays read-only.
+func isScratchRel(rel string) bool {
+	for _, state := range []string{".persona", strings.ToLower(compat.StateDir)} {
+		prefix := state + "/scratch"
+		if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// isScratchDir reports whether dir (expanded against n.home) is inside the node's scratch directory (~/.persona/scratch
+// or <PERSONA_HOME>/scratch), which session starts create on demand.
+func (n *Node) isScratchDir(dir string) bool {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return false
+	}
+	p := fold(filepath.Clean(dir))
+	if n.home != "" {
+		if rel, ok := homeRel(p, n.home); ok && isScratchRel(rel) {
+			return true
+		}
+	}
+	for _, dataDir := range n.dataDirs() {
+		if !isHome(dataDir, n.home) && (p == dataDir+"/scratch" || strings.HasPrefix(p, dataDir+"/scratch/")) {
+			return true
+		}
+	}
+	return false
 }
 
 // isHome: the folded path p is the home itself, as written or with its links followed.

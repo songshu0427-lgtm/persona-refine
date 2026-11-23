@@ -401,6 +401,9 @@ func (n *Node) checkStart(cwd, launcher, resume, mode, effort, agentType string)
 	if cwd == "" {
 		cwd = n.home
 	}
+	if n.isScratchDir(cwd) {
+		_ = os.MkdirAll(cwd, 0o755)
+	}
 	if st, err := os.Stat(cwd); err != nil || !st.IsDir() {
 		return "", "", fmt.Errorf("directory %s does not exist", cwd)
 	}

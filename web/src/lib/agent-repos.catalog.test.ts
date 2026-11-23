@@ -310,9 +310,13 @@ describe("catalog-backed By repo projection", () => {
       space_index: 3,
       cwd: "/Users/demo/code/b/hybrid-app",
     });
-    const tree = buildRepoMachineTree([codexSubproject, boundHome, hybridA1, hybridA2, hybridB1], machines, options([homeWs]));
+    const scratchTask = session("scratch-task", "", {
+      space_kind: undefined,
+      cwd: "/Users/demo/.persona/scratch/todo_abc",
+      started_by_persona: true,
+    });
+    const tree = buildRepoMachineTree([codexSubproject, boundHome, homeTask, scratchTask, hybridA1, hybridA2, hybridB1], machines, options([homeWs]));
     expect(tree[0].repos.map((r) => [r.name, r.count]).sort()).toEqual([
-      ["demo", 1],
       ["hybrid-app", 3],
       ["new-chat-1", 1],
     ]);

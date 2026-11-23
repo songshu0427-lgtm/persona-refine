@@ -718,15 +718,16 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const knownTodoKeys = useMemo(() => todoSessionKeys(todos), [todos]);
   const codexProjectMachines = useMemo(() => codexMachinesWithSidebarProjects(listed), [listed]);
   const onlineMachineIds = useMemo(() => new Set(machines.filter((m) => m.online).map((m) => m.id)), [machines]);
+  const machinesById = useMemo(() => new Map(machines.map((m) => [m.id, m])), [machines]);
   // In By repo, desktop app projects (Codex App / Claude Desktop) and Persona-created sessions stay inside their folder, and pinned catalog workspaces keep theirs.
   const { live, recent: offline } = useMemo(() => splitAgentSessions(
     dimFiltered,
     machines,
     shownGrouping === "repo" && !chatList
-      ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) || isRepoOfflineRetained(s, onlineMachineIds, knownTodoKeys, codexProjectMachines)
+      ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) || isRepoOfflineRetained(s, onlineMachineIds, knownTodoKeys, codexProjectMachines, machinesById.get(s.machine_id))
       : undefined,
     shownGrouping === "state" && !chatList ? (s) => isDispatchedSession(s, dispatchedKeys) : undefined,
-  ), [dimFiltered, machines, shownGrouping, chatList, catalog, onlineMachineIds, knownTodoKeys, codexProjectMachines, dispatchedKeys]);
+  ), [dimFiltered, machines, shownGrouping, chatList, catalog, onlineMachineIds, knownTodoKeys, codexProjectMachines, machinesById, dispatchedKeys]);
   const seeded = useRef(false);
   useEffect(() => {
     // a filter saved in this browser starts from what it matches once the list has loaded

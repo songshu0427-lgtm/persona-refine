@@ -13,7 +13,6 @@ Give `ultracode: true` for a large task: one that spans many files or needs chec
   "type": "object",
   "required": [
     "machine",
-    "cwd",
     "prompt"
   ],
   "properties": {
@@ -22,7 +21,7 @@ Give `ultracode: true` for a large task: one that spans many files or needs chec
     },
     "cwd": {
       "type": "string",
-      "description": "absolute path or ~/…; with worktree, a directory of the repository to branch from"
+      "description": "project path (~/…), or repo path for worktree; omit for a hidden scratch folder"
     },
     "prompt": {
       "type": "string"

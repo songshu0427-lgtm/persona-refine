@@ -861,7 +861,6 @@
       "type": "object",
       "required": [
         "machine",
-        "cwd",
         "prompt"
       ],
       "properties": {
@@ -870,7 +869,7 @@
         },
         "cwd": {
           "type": "string",
-          "description": "absolute path or ~/…; with worktree, a directory of the repository to branch from"
+          "description": "project path (~/…), or repo path for worktree; omit for a hidden scratch folder"
         },
         "prompt": {
           "type": "string"
@@ -2301,7 +2300,6 @@
               "title",
               "prompt",
               "machine",
-              "cwd",
               "readonly",
               "user_requested",
               "why"
@@ -2329,7 +2327,7 @@
               },
               "cwd": {
                 "type": "string",
-                "description": "the project directory: absolute path or ~/…"
+                "description": "project path; omit for non-repo work (uses a hidden scratch folder)"
               },
               "workspace": {
                 "type": [

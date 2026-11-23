@@ -45,6 +45,7 @@ export interface Machine {
   kind?: string;
   arch?: string;
   home?: string;
+  home_real?: string;
   last_seen?: string;
   /** Interconnected hubs (docs/archive/operations/plan-hub-mesh.md 2.6): the hub that owns this computer, and the way there. */
   hub_id?: string;

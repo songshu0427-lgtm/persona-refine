@@ -196,7 +196,7 @@ func (m *Machine) snapshot() proto.Machine {
 			icon = "laptop"
 		}
 		s = proto.Machine{ID: m.cfg.ID, Name: m.name(), Kind: m.kind(), Icon: icon, SSHHost: m.cfg.SSHHost,
-			Hostname: m.info.Hostname, OS: m.info.OS, Arch: m.info.Arch, Home: m.info.Home, HerdrVersion: m.info.HerdrVersion,
+			Hostname: m.info.Hostname, OS: m.info.OS, Arch: m.info.Arch, Home: m.info.Home, HomeReal: m.info.HomeReal, HerdrVersion: m.info.HerdrVersion,
 			ClaudeVersion: m.info.ClaudeVersion, LastSeen: m.lastSeen, NodeVersion: m.info.Version, Engine: cmp.Or(m.engine, proto.EngineHerdr),
 			Tailcat: m.cfg.TailcatAddr != ""}
 		s.Engines = []proto.Engine{}

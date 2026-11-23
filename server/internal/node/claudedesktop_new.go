@@ -322,6 +322,12 @@ func (n *Node) desktopStartDir(dir string) (string, error) {
 		return scratch, nil
 	}
 	dir = filepath.Clean(proto.ExpandHome(dir, n.home))
+	if n.isScratchDir(dir) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", fmt.Errorf("建不了文件夹 %s：%v", dir, err)
+		}
+		return dir, nil
+	}
 	if st, err := os.Stat(dir); err == nil {
 		if !st.IsDir() {
 			return "", fmt.Errorf("%s is not a directory", dir)
