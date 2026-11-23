@@ -103,8 +103,14 @@ describe("全部对话's background supervisor (#5082)", () => {
 describe("全部对话's filters and marks (#5195)", () => {
   const mark = (title: string) => [...host.querySelectorAll("a")].find((a) => a.getAttribute("title")?.startsWith(title))!.querySelector("[data-origin-mark]");
 
-  it("opens on 全部, every chat with the mark of the filter it is under", async () => {
+  it("opens on 我的 by default, and /history/all shows every chat with the mark of the filter it is under", async () => {
     await mount();
+    const defaultPressed = [...host.querySelectorAll('[role="group"] button[aria-pressed="true"]')].map((b) => b.textContent?.trim());
+    expect(defaultPressed).toEqual(["我的"]);
+    expect(titles()).toEqual(["主对话", "对话 mine"]);
+
+    act(() => root.unmount());
+    await mount("all");
     const pressed = [...host.querySelectorAll('[role="group"] button[aria-pressed="true"]')].map((b) => b.textContent?.trim());
     expect(pressed).toEqual(["全部"]);
     expect(mark("对话 morning")?.getAttribute("data-origin-mark")).toBe("task");
@@ -117,7 +123,7 @@ describe("全部对话's filters and marks (#5195)", () => {
     const list = [conv("main"), conv("bg", { title: "后台督办" }), conv("mine", { origin: "user" })];
     hub.fetched = list;
     hub.state = { ...hub.state, assistant: { ...(hub.state.assistant as object), conversations: list }, sessions: { server: list } };
-    await mount();
+    await mount("all");
     expect(mark("后台督办")?.getAttribute("data-origin-mark")).toBe("task");
   });
 });

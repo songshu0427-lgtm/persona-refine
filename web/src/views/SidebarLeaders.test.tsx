@@ -189,12 +189,24 @@ describe("the leader conversations in the sidebar", () => {
     expect(row("lead-a").textContent).toContain("Growth");
   });
 
-  it("leave 最近 and 全部对话 when the hub has none", async () => {
+  it("hides the secondary Persona chats block when there are no 常驻 leaders on home or history, and shows it only when a secondary Persona chat is open", async () => {
     leaders = undefined;
     await renderSidebar();
+    expect(rowIds()).toEqual([]);
+    expect(headings()).toEqual([]);
+    expect(host.querySelector('a[href="/history"]')).toBeNull();
+
+    // Opening 全部 Persona 对话 (/history) does not pop open a ghost Persona 对话 section in the sidebar either
+    act(() => root.render(<Sidebar route={{ name: "history" }} onSearch={() => {}} onNewAgent={() => {}} />));
+    await flush();
+    expect(rowIds()).toEqual([]);
+    expect(host.querySelector('a[href="/history"]')).toBeNull();
+
+    // Opening a secondary Persona chat directly shows its context in the sidebar
+    act(() => root.render(<Sidebar route={{ name: "persona", sid: "mine" }} onSearch={() => {}} onNewAgent={() => {}} />));
+    await flush();
     expect(rowIds()).toEqual(["newest", "lead-a", "lead-b", "mine"]);
     expect(headings()).toEqual([t("sidebar.recent_chats")]);
-    expect(host.querySelector('a[href="/history"]')).not.toBeNull();
   });
 
   it("leave 最近 out when every other chat is 常驻", async () => {

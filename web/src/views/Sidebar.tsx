@@ -298,8 +298,8 @@ export function Sidebar({ route, onSearch, onNewAgent, onNavigate, workspaceActi
   const directionNames = useDirectionNames(directions.map((c) => `${c.session_id}\u0000${c.title ?? ""}`).join("\u0001"));
   const counts = useLeaderCounts();
   const leaderTotal = totalCounts(counts, leaders);
-  // Single-main-chat convergence: show the secondary Persona chats block only when pinned 常驻 leaders exist or a non-main Persona page/chat is open
-  const chats = !!assistant && (directions.length > 0 || activeKey === "history" || activeKey.startsWith("j:"));
+  // Single-main-chat convergence: show the secondary Persona chats block only when pinned 常驻 leaders exist or a secondary Persona chat is open
+  const chats = !!assistant && (directions.length > 0 || activeKey.startsWith("j:"));
   // a conversation row's ⋯ / right click (iOS: its long press)
   const [convMenu, setConvMenu] = useState<{ s: Session; anchor: HTMLElement; at?: MenuAt } | null>(null);
   // one function for the sidebar's life: the conversation rows and the main row keep their memo across pushes

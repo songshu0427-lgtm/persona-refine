@@ -33,9 +33,10 @@ describe("conversation origins (docs/protocol/protocol.md「Origin of assistant 
     ]);
   });
 
-  it("filters 全部对话 by an address's filter", () => {
-    expect(parseOriginFilter(undefined)).toBe("all");
-    expect(parseOriginFilter("bogus")).toBe("all");
+  it("filters 全部对话 by an address's filter, defaulting to mine", () => {
+    expect(parseOriginFilter(undefined)).toBe("mine");
+    expect(parseOriginFilter("bogus")).toBe("mine");
+    expect(parseOriginFilter("all")).toBe("all");
     expect(parseOriginFilter("mine")).toBe("mine");
     expect(parseOriginFilter("inbox")).toBe("inbox");
     expect(matchesOrigin(conv("a", { origin: "inbox" }), "mine")).toBe(false);

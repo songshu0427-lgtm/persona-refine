@@ -84,9 +84,10 @@ export function externalOpening(s: Pick<Session, "origin"> | undefined, items: r
   return first ? { id: first.id, origin } : undefined;
 }
 
-/** The filter of a `/history/<filter>` address; anything else is all of them. */
+/** The filter of a `/history/<filter>` address; `/history` defaults to the user's own chats (`mine`), while `/history/all` shows everything. */
 export function parseOriginFilter(v: string | undefined): OriginFilter {
-  return v === "mine" || (AUTO_ORIGINS as readonly string[]).includes(v ?? "") ? (v as OriginFilter) : "all";
+  if (v === "all") return "all";
+  return v === "mine" || (AUTO_ORIGINS as readonly string[]).includes(v ?? "") ? (v as OriginFilter) : "mine";
 }
 
 export function matchesOrigin(s: Pick<Session, "origin"> & { session_id?: string }, filter: OriginFilter, background?: string): boolean {

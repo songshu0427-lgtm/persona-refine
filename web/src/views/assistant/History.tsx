@@ -161,7 +161,7 @@ export function History({ origin, onToggleSidebar }: { origin?: string; onToggle
   const tagChoices = useMemo(() => inUseTags(all), [all]);
   const visible = useMemo(() => withTag(hits, activeTag), [hits, activeTag]);
   const { main, days, archived } = useMemo(() => arrange(visible, assistant?.main, new Date(nowMs)), [visible, assistant?.main, nowMs]);
-  const total = all.filter((s) => !s.archived).length;
+  const total = visible.filter((s) => !s.archived).length;
   const searching = query.trim() !== "";
 
   const after = async () => {
@@ -254,10 +254,10 @@ export function History({ origin, onToggleSidebar }: { origin?: string; onToggle
             {query && <IconButton icon="x" label={t("assistant-history.clear_search")} size={22} iconSize={12} onClick={() => setQuery("")} />}
           </label>
 
-          {(sources.length > 0 || filter !== "all") && (
+          {(sources.length > 0 || filter !== "mine") && (
             <div role="group" aria-label={t("assistant-conversations.origin_filter")} className="-mt-2 mb-5 flex flex-wrap gap-1.5">
-              {(["all", "mine", ...sources.map((g) => g.origin)] as OriginFilter[]).map((f) => (
-                <Chip key={f} on={filter === f} onClick={() => navigate({ name: "history", origin: f === "all" ? undefined : f }, true)}>
+              {(["mine", "all", ...sources.map((g) => g.origin)] as OriginFilter[]).map((f) => (
+                <Chip key={f} on={filter === f} onClick={() => navigate({ name: "history", origin: f === "mine" ? undefined : f }, true)}>
                   {f === "all" ? t("assistant-conversations.origin_all") : f === "mine" ? t("assistant-conversations.origin_mine") : originLabel(f)}
                   {f !== "all" && f !== "mine" && <span className="ml-1 tabular-nums opacity-60">{sources.find((g) => g.origin === f)?.count}</span>}
                 </Chip>
