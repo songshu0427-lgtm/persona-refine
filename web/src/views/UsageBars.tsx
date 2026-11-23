@@ -47,7 +47,7 @@ export function UsageBars({ accounts, unconnected = EMPTY_UNCONNECTED, now = Dat
     };
   }, [open]);
 
-  if (!top.length && !unconnected.length) return null;
+  if (!top.length) return null;
   return (
     <div ref={ref} className="relative shrink-0 px-2.5 pb-2.5 pt-1" data-usage-bars>
       {open && <UsagePopover accounts={live} unconnected={unconnected} onClose={() => setOpen(false)} />}
@@ -73,12 +73,6 @@ export function UsageBars({ accounts, unconnected = EMPTY_UNCONNECTED, now = Dat
             </span>
           );
         })}
-        {unconnected.slice(0, 4 - top.length || 1).map((p) => (
-          <span key={`_${p.id}`} data-usage-unconnected={p.id} className="flex items-baseline gap-2 text-xs text-ink-3">
-            <span className="min-w-0 flex-1 truncate">{p.title}</span>
-            <span className="shrink-0">{tr("usage.not_connected")}</span>
-          </span>
-        ))}
       </button>
     </div>
   );
@@ -90,15 +84,17 @@ export function SidebarUsage() {
 }
 
 function SidebarUsageInner({ accounts }: { accounts: UsageAccount[] }) {
+  const hasLive = liveAccounts(accounts).length > 0;
   const [, setLoaded] = useState(() => Boolean(LoadedUnconnected));
   const [unconnected, setUnconnected] = useState(EMPTY_UNCONNECTED);
   useEffect(() => {
-    if (LoadedUnconnected) return;
+    if (!hasLive || LoadedUnconnected) return;
     void import("./UsageUnconnected").then((m) => {
       LoadedUnconnected = m.UsageUnconnected;
       setLoaded(true);
     });
-  }, []);
+  }, [hasLive]);
+  if (!hasLive) return null;
   return (
     <>
       {LoadedUnconnected && <LoadedUnconnected accounts={accounts} onChange={setUnconnected} />}

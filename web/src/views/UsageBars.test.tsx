@@ -27,6 +27,19 @@ const account = (id: string, used5: number, used7: number, o: Partial<UsageAccou
 describe("the sidebar's usage strip", () => {
   it("is not drawn without data", () => {
     expect(renderToStaticMarkup(<UsageBars accounts={[]} now={NOW} />)).toBe("");
+    // unconnected launchers alone never draw the sidebar strip
+    expect(
+      renderToStaticMarkup(
+        <UsageBars
+          accounts={[]}
+          unconnected={[
+            { id: "claude", title: "Claude Code", agent: "claude" },
+            { id: "codex", title: "Codex", agent: "codex" },
+          ]}
+          now={NOW}
+        />,
+      ),
+    ).toBe("");
     // all samples older than three days
     expect(renderToStaticMarkup(<UsageBars accounts={[account("a", 10, 10, { sampled_at: iso(-80 * H) })]} now={NOW} />)).toBe("");
   });
@@ -158,9 +171,9 @@ describe("where the numbers came from (#2595)", () => {
 
     const strip = renderToStaticMarkup(<UsageBars accounts={live} unconnected={unconnected} now={NOW} />);
     expect(strip).toContain("Codex Pro");
-    expect(strip).toContain("Claude Code");
-    expect(strip).toContain("Antigravity");
-    expect(strip).toContain("未接入");
+    expect(strip).not.toContain("Claude Code");
+    expect(strip).not.toContain("Antigravity");
+    expect(strip).not.toContain("未接入");
 
     const host = document.createElement("div");
     document.body.appendChild(host);
