@@ -12,7 +12,7 @@ import { applyDimensionFilters, buildAgentFacets, DEFAULT_DIMENSION_FILTERS, has
 import { setAgentListFilters, useAgentListFilters } from "../lib/agent-list-filters";
 import { AGENT_SORT_KEY, AGENT_SORTS, agentSort, byUpdated, repoMachinesByUpdate, type AgentSort } from "../lib/agent-sort";
 import { AgentChatListRow, AgentFilterButton, AgentFilterChips } from "./agents/AgentChatListControls";
-import { type AgentGrouping, buildAgentGroups, byRepoActivity, dispatchedSessionKeys, isDispatchedSession, isRepoOfflineRetained, sessionHost, SIDEBAR_GROUPINGS, sidebarGrouping, splitAgentSessions, type AgentGroup } from "../lib/agent-groups";
+import { type AgentGrouping, buildAgentGroups, byRepoActivity, codexMachinesWithSidebarProjects, dispatchedSessionKeys, isDispatchedSession, isRepoOfflineRetained, sessionHost, SIDEBAR_GROUPINGS, sidebarGrouping, splitAgentSessions, todoSessionKeys, type AgentGroup } from "../lib/agent-groups";
 import { buildRepoMachineTree, hasWorkspacePin } from "../lib/agent-repos";
 import { useWorkspaceCatalog } from "../lib/workspace-catalog";
 import { keyedRefs } from "../lib/keyed-refs";
@@ -715,16 +715,18 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
     [listed, dimFilters, evalCtx, facets],
   );
   const dispatchedKeys = useMemo(() => dispatchedSessionKeys(todos), [todos]);
+  const knownTodoKeys = useMemo(() => todoSessionKeys(todos), [todos]);
+  const codexProjectMachines = useMemo(() => codexMachinesWithSidebarProjects(listed), [listed]);
   const onlineMachineIds = useMemo(() => new Set(machines.filter((m) => m.online).map((m) => m.id)), [machines]);
-  // In By repo, desktop/native project histories stay inside their project folder and pinned catalog workspaces keep theirs.
+  // In By repo, desktop app projects (Codex App / Claude Desktop) and Persona-created sessions stay inside their folder, and pinned catalog workspaces keep theirs.
   const { live, recent: offline } = useMemo(() => splitAgentSessions(
     dimFiltered,
     machines,
     shownGrouping === "repo" && !chatList
-      ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) || isRepoOfflineRetained(s, onlineMachineIds)
+      ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) || isRepoOfflineRetained(s, onlineMachineIds, knownTodoKeys, codexProjectMachines)
       : undefined,
     shownGrouping === "state" && !chatList ? (s) => isDispatchedSession(s, dispatchedKeys) : undefined,
-  ), [dimFiltered, machines, shownGrouping, chatList, catalog, onlineMachineIds, dispatchedKeys]);
+  ), [dimFiltered, machines, shownGrouping, chatList, catalog, onlineMachineIds, knownTodoKeys, codexProjectMachines, dispatchedKeys]);
   const seeded = useRef(false);
   useEffect(() => {
     // a filter saved in this browser starts from what it matches once the list has loaded

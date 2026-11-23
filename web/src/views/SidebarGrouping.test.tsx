@@ -265,6 +265,103 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
     expect(openedPresets).toEqual([{ machineId: "mac", cwd: "/Users/demo/code/business-meta", launcher: "claude-desktop" }]);
     offPreset();
   });
+
+  it("aligns By repo on Mac with Codex App + Claude Desktop + Persona-created chats without home-workspace swallowing or scratch probes", async () => {
+    localStorage.setItem("persona.agentGrouping", "repo");
+    const mac: Machine = { id: "mac", name: "Mac", online: true };
+    const homeTask: Session = {
+      machine_id: "mac",
+      session_id: "s-home-migrate",
+      title: "收窄迁移范围至应用可见会话",
+      cwd: "/Users/demo",
+      space_kind: "herdr",
+      workspace_id: "w8",
+      space_id: "w8",
+      space_name: "demo",
+      started_by_persona: true,
+      status: "idle",
+      state: "idle",
+      updated_at: "2026-11-23T02:20:00Z",
+    };
+    const codexNewChat: Session = {
+      machine_id: "mac",
+      session_id: "s-new-chat-1",
+      title: "论文写作启动",
+      cwd: "/Users/demo/work/chats/2026-09-16/new-chat-1",
+      space_kind: "codex_app",
+      space_id: "codex-project:/Users/demo/work/chats/2026-09-16/new-chat-1",
+      space_name: "new-chat-1",
+      space_index: 1,
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-22T15:00:00Z",
+    };
+    const personaTodoOffline: Session = {
+      machine_id: "mac",
+      session_id: "s-persona-todo",
+      title: "补充项目任务结论",
+      cwd: "/Users/demo/work/chats/2026-09-16/new-chat-1",
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-22T16:00:00Z",
+    };
+    const codexTmpProbe: Session = {
+      machine_id: "mac",
+      session_id: "s-tmp-probe",
+      title: "临时探测脚本",
+      cwd: "/private/tmp/probe-run",
+      space_kind: "codex_app",
+      space_id: "codex-project:/private/tmp/probe-run",
+      space_name: "probe-run",
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-22T17:00:00Z",
+    };
+    const randomOfflineCli: Session = {
+      machine_id: "mac",
+      session_id: "s-random-cli",
+      title: "随手终端历史",
+      cwd: "/Users/demo/misc-scratch",
+      status: "offline",
+      state: "offline",
+      updated_at: "2026-11-22T18:00:00Z",
+    };
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      const path = new URL(url, "http://hub").pathname;
+      if (path === "/api/v1/todos") {
+        return json({
+          todos: [{ id: "todo_1", title: "测试任务", status: "done", agents: [{ machine_id: "mac", session_id: "s-persona-todo" }] }],
+        });
+      }
+      if (path === "/api/v1/machines") return json({ machines: [mac] });
+      if (path === "/api/v1/sessions") {
+        return json({
+          sessions: [homeTask, codexNewChat, personaTodoOffline, codexTmpProbe, randomOfflineCli],
+          total: 5,
+          has_more: false,
+          revision: "r2",
+        });
+      }
+      if (path === "/api/v1/workspaces") {
+        return json({
+          workspaces: [{ machine_id: "mac", source: "herdr", workspace_id: "w8", title: "demo", cwd: "/Users/demo", workspace_kind: "folder", available: true }],
+        });
+      }
+      return json({});
+    }));
+    await refresh();
+    await render();
+    await flush();
+
+    const text = agentsBlock().textContent ?? "";
+    expect(text).toContain("new-chat-1");
+    expect(text).toContain("论文写作启动");
+    expect(text).toContain("补充项目任务结论");
+    expect(text).toContain("demo");
+    expect(text).toContain("收窄迁移范围至应用可见会话");
+    expect(text).not.toContain("临时探测脚本");
+    expect(text).not.toContain("随手终端历史");
+  });
 });
 
 describe("group controls in every Agents view", () => {

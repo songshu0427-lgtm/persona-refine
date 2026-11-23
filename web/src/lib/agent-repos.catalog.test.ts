@@ -261,4 +261,60 @@ describe("catalog-backed By repo projection", () => {
     const agent = session("legacy", "", { cwd: "/code/legacy", space_kind: undefined });
     expect(buildRepoMachineTree([agent], machines, options([]))).toEqual(buildRepoMachineTree([agent], machines));
   });
+
+  it("never lets a home-directory or ancestor catalog workspace swallow deeper Codex App / repo projects", () => {
+    const homeWs = workspace("w8", { source: "herdr", workspace_kind: "folder", cwd: "/Users/demo", title: "demo", project_id: "", project_name: "" });
+    const parentWs = workspace("w-parent", { source: "herdr", workspace_kind: "folder", cwd: "/Users/demo/code", title: "code", project_id: "", project_name: "" });
+    const codexSubproject = session("codex-sub", "codex-project:/Users/demo/chats/2026-09-16/new-chat-1", {
+      space_kind: "codex_app",
+      space_name: "new-chat-1",
+      space_index: 1,
+      cwd: "/Users/demo/chats/2026-09-16/new-chat-1",
+    });
+    const repoAgent = session("repo-agent", "", {
+      space_kind: undefined,
+      cwd: "/Users/demo/code/cloudcli/src",
+      repo_root: "/Users/demo/code/cloudcli",
+    });
+    const homeTask = session("home-task", "", {
+      space_kind: undefined,
+      cwd: "/Users/demo",
+      started_by_persona: true,
+    });
+    const boundHome = session("bound-home", "w8", {
+      space_kind: "herdr",
+      workspace_id: "w8",
+      cwd: "/Users/demo",
+    });
+    expect(sessionWorkspace(codexSubproject, [homeWs, parentWs])).toBeUndefined();
+    expect(sessionWorkspace(repoAgent, [homeWs, parentWs])).toBeUndefined();
+    expect(sessionWorkspace(homeTask, [homeWs])?.source_id).toBe("w8");
+    expect(sessionWorkspace(boundHome, [homeWs])?.source_id).toBe("w8");
+
+    // Multi-root Codex App projects sharing (space_index, space_name) merge into one folder
+    const hybridA1 = session("h1", "codex-project:/Users/demo/code/a/hybrid-app", {
+      space_kind: "codex_app",
+      space_name: "hybrid-app",
+      space_index: 3,
+      cwd: "/Users/demo/code/a/hybrid-app",
+    });
+    const hybridA2 = session("h2", "codex-project:/Users/demo/code/a/hybrid-app", {
+      space_kind: "codex_app",
+      space_name: "hybrid-app",
+      space_index: 3,
+      cwd: "/Users/demo/code/a/hybrid-app",
+    });
+    const hybridB1 = session("h3", "codex-project:/Users/demo/code/b/hybrid-app", {
+      space_kind: "codex_app",
+      space_name: "hybrid-app",
+      space_index: 3,
+      cwd: "/Users/demo/code/b/hybrid-app",
+    });
+    const tree = buildRepoMachineTree([codexSubproject, boundHome, hybridA1, hybridA2, hybridB1], machines, options([homeWs]));
+    expect(tree[0].repos.map((r) => [r.name, r.count]).sort()).toEqual([
+      ["demo", 1],
+      ["hybrid-app", 3],
+      ["new-chat-1", 1],
+    ]);
+  });
 });

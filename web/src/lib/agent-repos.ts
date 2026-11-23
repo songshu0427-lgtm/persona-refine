@@ -263,6 +263,7 @@ type RepoBucket = { tree: RepoTree; orca: boolean; git: boolean; bySpace: Map<st
 function buildRepos(sessions: Session[], machineId: string, compareSessions: (a: Session, b: Session) => number = byAttention): RepoTree[] {
   const known = new Map<string, OrcaWorktree>();
   const desktopRoots = new Set<string>();
+  const codexProjectCounts = new Map<string, Map<string, number>>();
   for (const s of sessions) {
     const worktree = orcaSpace(s);
     if (worktree && !known.has(worktree.path)) known.set(worktree.path, worktree);
@@ -271,6 +272,22 @@ function buildRepos(sessions: Session[], machineId: string, compareSessions: (a:
       if (candidate && segments(candidate).length >= 3 && !WORKTREE_SEGMENTS.some(([marker]) => candidate.includes(marker))) {
         desktopRoots.add(candidate);
       }
+      if (s.space_kind === "codex_app" && (s.space_index ?? 0) > 0 && s.space_name) {
+        const root = desktopProjectRoot(s) || trimmed(s.repo_root);
+        if (root) {
+          const id = `${s.space_index}\u0000${s.space_name}`;
+          let counts = codexProjectCounts.get(id);
+          if (!counts) codexProjectCounts.set(id, (counts = new Map()));
+          counts.set(root, (counts.get(root) ?? 0) + 1);
+        }
+      }
+    }
+  }
+  const canonicalCodexRoot = new Map<string, string>();
+  for (const [id, counts] of codexProjectCounts) {
+    if (counts.size > 1) {
+      const best = [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]?.[0];
+      if (best) canonicalCodexRoot.set(id, best);
     }
   }
   const orderedDesktopRoots = [...desktopRoots].sort((a, b) => a.length - b.length);
@@ -278,9 +295,20 @@ function buildRepos(sessions: Session[], machineId: string, compareSessions: (a:
   for (const s of sessions) {
     let where = placementOf(s, known);
     if (!where.spaceId && isDesktopProjectSession(s) && where.repo) {
-      const enclosing = orderedDesktopRoots.find((root) => where.repo !== root && where.repo.startsWith(`${root}/`)
-        && !WORKTREE_SEGMENTS.some(([marker]) => where.repo.slice(root.length + 1).startsWith(marker.slice(1))));
-      if (enclosing) where = { repo: enclosing, name: baseName(enclosing), worktree: enclosing, path: enclosing, main: true, git: where.git };
+      const canon = s.space_kind === "codex_app" && (s.space_index ?? 0) > 0 && s.space_name
+        ? canonicalCodexRoot.get(`${s.space_index}\u0000${s.space_name}`)
+        : undefined;
+      if (canon && canon !== where.repo) {
+        where = { repo: canon, name: s.space_name!, worktree: canon, path: canon, main: true, git: where.git };
+      } else {
+        const enclosing = orderedDesktopRoots.find((root) => where.repo !== root && where.repo.startsWith(`${root}/`)
+          && !WORKTREE_SEGMENTS.some(([marker]) => where.repo.slice(root.length + 1).startsWith(marker.slice(1))));
+        if (enclosing) {
+          where = { repo: enclosing, name: baseName(enclosing), worktree: enclosing, path: enclosing, main: true, git: where.git };
+        } else if (s.space_name && where.repo === (desktopProjectRoot(s) || trimmed(s.repo_root))) {
+          where = { ...where, name: s.space_name };
+        }
+      }
     }
     const key = `${machineId}\u0000${where.repo}`;
     let bucket = repos.get(key);
@@ -355,8 +383,11 @@ export interface RepoCatalogOptions {
   hiddenSources?: readonly string[];
 }
 
+const HOME_DIR_RE = /^(?:\/(?:Users|home)\/[^/]+|[a-z]:\/Users\/[^/]+)$/i;
+
 /** Exact runtime placement always wins. Directory inference is allowed only for an unbound Agent and a unique
- *  deepest containing directory. Host-owned bindings never fall through to a different runtime at the same path. */
+ *  deepest containing directory. Host-owned bindings never fall through to a different runtime at the same path,
+ *  and an ancestor/home workspace never swallows a deeper project root. */
 export function sessionWorkspace(s: Session, catalog: readonly HostWorkspace[], manager?: string): HostWorkspace | undefined {
   if (manager && s.manager && s.manager !== manager) return undefined;
   const local = catalog.filter((w) => w.machine_id === s.machine_id);
@@ -369,12 +400,16 @@ export function sessionWorkspace(s: Session, catalog: readonly HostWorkspace[], 
     if (exact.length > 1 || s.workspace_id || host !== "codex_app") return undefined;
   }
   if (["herdr", "herdr-core", "botmux", "orca", "paseo"].includes(host)) return undefined;
+  const ownProject = catalogPath(desktopProjectRoot(s) || s.repo_root);
   for (const raw of [s.cwd, s.workspace_cwd]) {
     const cwd = catalogPath(raw);
     if (!cwd) continue;
     const candidates = local.filter((w) => {
       const path = catalogPath(w.cwd);
-      if (!path || (cwd !== path && !(path === "/" ? cwd.startsWith("/") : cwd.startsWith(`${path}/`)))) return false;
+      if (!path) return false;
+      if (HOME_DIR_RE.test(path)) return cwd === path && (!ownProject || ownProject === path);
+      if (cwd !== path && !(path === "/" ? cwd.startsWith("/") : cwd.startsWith(`${path}/`))) return false;
+      if (ownProject && ownProject !== path && (path === "/" ? ownProject.startsWith("/") : ownProject.startsWith(`${path}/`))) return false;
       const below = cwd === path ? "" : cwd.slice(path === "/" ? 1 : path.length + 1);
       return !WORKTREE_SEGMENTS.some(([marker]) => below.startsWith(marker.slice(1)));
     });

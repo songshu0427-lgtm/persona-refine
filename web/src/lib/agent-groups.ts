@@ -55,13 +55,49 @@ export function isDispatchedSession(s: Session, dispatchedKeys?: ReadonlySet<str
   return isTaskWorktreePath(s.cwd);
 }
 
+export function todoSessionKeys(todos: readonly { agents?: readonly { machine_id: string; session_id: string }[] }[]): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const td of todos) {
+    for (const a of td.agents ?? []) {
+      if (a.machine_id && a.session_id) out.add(`${a.machine_id}/${a.session_id}`);
+      if (a.session_id) out.add(a.session_id);
+    }
+  }
+  return out;
+}
+
+export function codexMachinesWithSidebarProjects(sessions: readonly Session[]): ReadonlySet<string> {
+  const out = new Set<string>();
+  for (const s of sessions) {
+    if (s.space_kind === "codex_app" && (s.space_index ?? 0) > 0) out.add(s.machine_id);
+  }
+  return out;
+}
+
+export function isPersonaCreatedSession(s: Session, knownTodoKeys?: ReadonlySet<string>): boolean {
+  return Boolean(s.started_by_persona || isDispatchedSession(s, knownTodoKeys));
+}
+
 const CATALOG_WORKSPACE_HOSTS = new Set(["herdr", "herdr-core", "botmux", "orca", "paseo"]);
 
-/** Native folder / desktop project sessions (Claude Desktop, Codex App, CLI history) stay inside their project folder
- *  in By repo even when stopped; workspace-catalog hosts keep their own workspace pin rules (`hasWorkspacePin`). */
-export function isRepoOfflineRetained(s: Session, onlineMachineIds: ReadonlySet<string>): boolean {
+/** In By repo, offline sessions stay inside their folder only when they belong to a desktop app project (Claude Desktop /
+ *  Codex App sidebar projects) or were created by Persona; workspace-catalog hosts keep their own pin rules (`hasWorkspacePin`). */
+export function isRepoOfflineRetained(
+  s: Session,
+  onlineMachineIds: ReadonlySet<string>,
+  knownTodoKeys?: ReadonlySet<string>,
+  codexProjectMachines?: ReadonlySet<string>,
+): boolean {
   if (s.archived || !onlineMachineIds.has(s.machine_id)) return false;
-  return !CATALOG_WORKSPACE_HOSTS.has(s.space_kind || s.host || sessionHost(s));
+  if (CATALOG_WORKSPACE_HOSTS.has(s.space_kind || s.host || sessionHost(s))) return false;
+  if (s.space_kind === "claude_desktop") return true;
+  if (s.space_kind === "codex_app") {
+    if (codexProjectMachines?.has(s.machine_id)) {
+      return (s.space_index ?? 0) > 0 || Boolean(s.space_id?.startsWith("codex-chats:")) || isPersonaCreatedSession(s, knownTodoKeys);
+    }
+    return true;
+  }
+  return isPersonaCreatedSession(s, knownTodoKeys);
 }
 
 const REPO_ATTENTION_RANK: Record<AgentState, number> = {
