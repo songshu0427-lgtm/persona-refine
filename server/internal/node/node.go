@@ -215,6 +215,8 @@ type Node struct {
 	ccPlugins ccPluginRegistry
 	// ccPerms: open PermissionRequest bridges from Persona's Claude Code plugin (ccplugin_permission.go).
 	ccPerms ccPluginPermRegistry
+	// outsideQueues: owner messages held on the node while an outside Claude session is busy (claudeoutside_queue.go).
+	outsideQueues outsideQueueRegistry
 	// freshForks: branches nothing has started yet, which a message may start (stopped.go); a stopped agent may not.
 	freshForks map[string]bool
 	starts     startLog       // sessions starting in the background (starting.go)
@@ -1775,9 +1777,12 @@ func (n *Node) handle(ctx context.Context, method string, params json.RawMessage
 			return ok(n.assistantInterrupt(p.SessionID))
 		}
 		if _, live := n.agent(p.SessionID); !live {
-			// A claude outside Persona's panes (the desktop app's, another terminal's): through its inbox (claudebg.go).
-			if handled, err := n.interruptOutside(ctx, p.SessionID); handled {
-				return ok(err)
+			// A claude outside Persona's panes (the desktop app's, another terminal's): through its plugin or inbox (claudebg.go).
+			if handled, withdrawn, err := n.interruptOutside(ctx, p.SessionID); handled {
+				if err != nil || len(withdrawn) == 0 {
+					return ok(err)
+				}
+				return map[string]any{"ok": true, "withdrawn": withdrawn}, nil
 			}
 		}
 		over := n.turnOver(p.SessionID) // before the key: the Escape itself may end a turn
@@ -2348,14 +2353,25 @@ func (n *Node) handle(ctx context.Context, method string, params json.RawMessage
 		if n.isAssistantSession(p.SessionID) { // a Persona conversation's queue is claude's, over stream-json (#4342)
 			return n.assistantEditQueue(ctx, p.SessionID, a.Keep)
 		}
+		if handled, queue, err := n.editOutsideQueue(ctx, p.SessionID, a.Keep); handled {
+			return map[string]any{"queue": queue}, err
+		}
 		queue, err := n.editQueue(ctx, p.SessionID, a.Keep)
 		return map[string]any{"queue": queue}, err
 	case "session.queue.send_now": // #6088
-		send := n.sendQueuedNow
 		if n.isAssistantSession(p.SessionID) {
-			send = n.assistantSendNow // #4342
+			if err := n.assistantSendNow(ctx, p.SessionID); err != nil {
+				return nil, err
+			}
+			return map[string]any{"sent": true}, nil
 		}
-		if err := send(ctx, p.SessionID); err != nil {
+		if handled, err := n.sendOutsideQueuedNow(ctx, p.SessionID); handled {
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"sent": true}, nil
+		}
+		if err := n.sendQueuedNow(ctx, p.SessionID); err != nil {
 			return nil, err
 		}
 		return map[string]any{"sent": true}, nil

@@ -43,6 +43,7 @@ type echoRecord struct {
 	Line        string            `json:"line,omitempty"`    // the line found: its items' id before "#" (one of In's)
 	Before      []string          `json:"before,omitempty"`  // replayable history entries already present before this send
 	Desktop     *codexDesktopEcho `json:"desktop,omitempty"` // the real dispatch boundary and exact batch proof
+	Group       []string          `json:"group,omitempty"`   // client_msg_ids dispatched together on Send now
 	// In is where AfterSeq and Line count: echoInTranscript or echoInRuntime. A record sent after nothing (a start's
 	// first message) or handed back by a hub from before #8358 has none: it is looked for and tagged wherever the
 	// items come from, as before, and counts where it is found from then on.
@@ -162,6 +163,39 @@ func (l *echoLog) forget(id, clientMsgID string) {
 	l.recs[id] = slices.DeleteFunc(l.recs[id], func(r *echoRecord) bool { return r.ClientMsgID == clientMsgID })
 }
 
+// prepareDispatched refreshes SentAt when a node-held message is finally handed to the session, and ties batched
+// Send-now messages so every client_msg_id resolves when the combined user line lands in the transcript.
+func (l *echoLog) prepareDispatched(id string, clientMsgIDs []string, joined string) {
+	if len(clientMsgIDs) == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	set := make(map[string]bool, len(clientMsgIDs))
+	for _, cid := range clientMsgIDs {
+		if cid != "" {
+			set[cid] = true
+		}
+	}
+	var head *echoRecord
+	for _, r := range l.recs[id] {
+		if !set[r.ClientMsgID] {
+			continue
+		}
+		r.SentAt = now
+		r.scanned = 0
+		if head == nil {
+			head = r
+		}
+	}
+	if head != nil && len(set) > 1 {
+		head.Text = echoClip(joined)
+		head.Literal = ""
+		head.Group = slices.Clone(clientMsgIDs)
+	}
+}
+
 // waitingFrom is the seq after which the session's records expected among items from in (echoRecord.In) look for
 // their lines; false when none is expected.
 func (l *echoLog) waitingFrom(id, in string) (int, bool) {
@@ -236,6 +270,14 @@ func (l *echoLog) match(id, in string, items []proto.Item) []echoRecord {
 				r.Line, r.In, taken[ln.key] = ln.key, in, true
 				if r.Desktop != nil {
 					found = append(found, tieDesktopGroup(recs, r, ln.key, in)...)
+				} else if len(r.Group) > 1 {
+					for _, o := range recs {
+						if o != r && o.Line == "" && slices.Contains(r.Group, o.ClientMsgID) {
+							o.Line, o.In = ln.key, in
+							found = append(found, *o)
+						}
+					}
+					found = append(found, *r)
 				} else {
 					found = append(found, *r)
 				}

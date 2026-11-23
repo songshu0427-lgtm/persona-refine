@@ -214,7 +214,16 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 				s.Efforts = slices.Clone(proto.EffortLevels)
 			}
 		}
-		if s.Capabilities != nil && (effStatus == "busy" || effStatus == "waiting") && n.ccPlugins.interruptCapable(id, c.pid) {
+		heldQueue := n.outsideQueuedTexts(id)
+		var revSz int64
+		if st != nil {
+			revSz = st.Size()
+		}
+		if (status == proto.StatusIdle || status == proto.StatusDone) && outsidePane(c) == "" && n.outsideQueueWorking(id, revSz) {
+			status = proto.StatusWorking
+			s.Status = proto.StatusWorking
+		}
+		if s.Capabilities != nil && (effStatus == "busy" || effStatus == "waiting" || len(heldQueue) > 0) && n.ccPlugins.interruptCapable(id, c.pid) {
 			s.Capabilities.Interrupt = true
 		}
 		// A claude in a tmux pane says where it runs ("tmux":"orc:@11.%11") and no hooks of Persona's run there: the
@@ -269,9 +278,11 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 		s.Activity, s.ActivityAt = m.activityOf()
 		s.PermissionMode, s.Effort = n.currentModes(id, m)
 		m.turnErr.set(&s)
+		var nativeQueue []string
 		if status == proto.StatusWorking || status == proto.StatusBlocked {
-			s.Queued = m.queue
+			nativeQueue = m.queue
 		}
+		s.Queued = combineOutsideQueued(nativeQueue, heldQueue)
 		s.WokeByTask = m.wake
 		n.setBackground(&s, m) // as for a pane's session
 		s.BackgroundWaiting = n.backgroundWaits(&s)
@@ -393,15 +404,18 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 		} else if asking(cEff, meta) && n.ccPlugins.interruptCapable(id, c.pid) {
 			_, _ = n.ccPluginInterrupt(ctx, cEff, id)
 			cEff.Status = "idle"
+		} else if n.shouldHoldOutsideOwnerSend(cEff, id, offset) {
+			n.enqueueOutsideOwner(ctx, id, text)
+			log.Printf("send %s: held owner message in outside queue while claude %d (%s) is busy", id, c.pid, c.Entrypoint)
+			owner.as, owner.reason = deliveredUserInput, ""
+			return true, nil
 		}
 		ok, why := n.ccPluginSend(ctx, cEff, id, text)
 		if !ok {
 			return true, uncertain(fmt.Errorf("Persona 插件未能提交这条消息（%s），请稍后重试", why))
 		}
 		log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
-		if cEff.Status == "busy" || cEff.Status == "waiting" {
-			markSendQueued(ctx)
-		}
+		n.noteOutsideTurnStarted(id, offset)
 		owner.as, owner.reason = deliveredUserInput, ""
 		return true, nil
 	}
@@ -551,25 +565,44 @@ func asking(c claudeProc, m quickMeta) bool {
 // interruptOutside stops the turn a claude outside Persona's panes runs, through its inbox: a message at priority now
 // cuts the turn (or ends a question or permission prompt it waits on) and asks it to stop (prompts.PeerStop). handled false for any other
 // session, and one a tmux pane runs (its Esc goes to the pane). A session at rest has nothing to stop: done, nothing sent.
-func (n *Node) interruptOutside(ctx context.Context, id string) (handled bool, err error) {
+func (n *Node) interruptOutside(ctx context.Context, id string) (handled bool, withdrawn []string, err error) {
 	c, ok := n.outsideClaude(id)
 	if !ok || outsidePane(c) != "" {
-		return false, nil
+		if !ok && ownerDeliveryOf(ctx) != nil {
+			if w := n.commitOutsideQueueStop(id); len(w) > 0 {
+				return true, w, nil
+			}
+		}
+		return false, nil, nil
+	}
+	hasHeld := false
+	finishStop := func(h bool, e error) (bool, []string, error) {
+		if !h || e != nil {
+			if hasHeld {
+				n.resumeOutsideQueueAfterStop(id)
+			}
+			return h, nil, e
+		}
+		return true, n.commitOutsideQueueStop(id), nil
 	}
 	if ownerDeliveryOf(ctx) != nil {
+		hasHeld = n.pauseOutsideQueueForStop(id)
 		if n.outsidePermInterrupt(ctx, id, c.pid) {
-			return true, nil
+			return finishStop(true, nil)
 		}
 		if handled, err := n.ccPluginInterrupt(ctx, c, id); handled {
-			return true, err
+			return finishStop(true, err)
 		}
 	}
 	p, has := peerOf(c)
 	if !has {
-		return true, refusal(peerUnsupported, peerNoInboxMsg, nil)
+		if hasHeld && c.Status != "busy" && c.Status != "waiting" {
+			return finishStop(true, nil)
+		}
+		return finishStop(true, refusal(peerUnsupported, peerNoInboxMsg, nil))
 	}
 	if c.Status != "busy" && c.Status != "waiting" {
-		return true, nil // at rest already (a Stop from a list a moment old): nothing to stop, nothing sent
+		return finishStop(true, nil) // at rest already (a Stop from a list a moment old): nothing to stop, nothing sent
 	}
 	var offset int64
 	if st, err := os.Stat(n.transcriptPath(id)); err == nil {
@@ -580,19 +613,19 @@ func (n *Node) interruptOutside(ctx context.Context, id string) (handled bool, e
 	err = peerSendAt(ctx, p, id, stop, peerNow)
 	var pe *errPeer
 	if asPeer(err, &pe) {
-		return true, refusal(pe.code, pe.msg, map[string]any{"pid": c.pid})
+		return finishStop(true, refusal(pe.code, pe.msg, map[string]any{"pid": c.pid}))
 	}
 	if peerTaken(ctx, func() string { return n.transcriptPath(id) }, offset, stop, peerConfirmWait) {
 		log.Printf("interrupt %s: claude %d took the stop through its inbox", id, c.pid)
-		return true, nil
+		return finishStop(true, nil)
 	}
 	if err != nil {
-		return true, uncertain(err)
+		return finishStop(true, uncertain(err))
 	}
 	if peerHeldSeen(n.transcriptPath(id), offset) {
-		return true, heldOnComputer()
+		return finishStop(true, heldOnComputer())
 	}
-	return true, unconfirmed()
+	return finishStop(true, unconfirmed())
 }
 
 // heldOnComputer is the outcome of a message the session did not take and wrote that it holds for approval at the

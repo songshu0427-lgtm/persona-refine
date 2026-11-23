@@ -847,6 +847,101 @@ func (n *Node) ccPluginSend(ctx context.Context, c claudeProc, id, text string) 
 	}
 }
 
+// ccPluginAbortAndSend powers "Send now" for outside Claude sessions: when a turn is running it hands both an interrupt
+// and (when text != nil) the queued prompt in a single poll delivery so register.ts aborts the running turn and submits
+// the queued prompt immediately without marking the session idle. When text == nil it aborts the running turn without
+// markAborted so Claude Code's own native prompt queue runs next. pickedUp reports whether the plugin received the poll.
+func (n *Node) ccPluginAbortAndSend(ctx context.Context, c claudeProc, id string, text *string) (pickedUp bool, err error) {
+	if n.ccPlugins.session(id, c.pid) == nil {
+		return false, refusal(peerUnsupported, "Persona 插件未连接，无法立即发送", nil)
+	}
+	path := n.transcriptPath(id)
+	offset := fileSizeOrZero(path)
+	eff := n.effectiveOutsideStatus(c, path, offset)
+	busy := eff == "busy" || eff == "waiting"
+	if busy && !n.ccPlugins.interruptCapable(id, c.pid) {
+		return false, refusal(peerUnsupported, "当前会话的 Persona 插件版本不支持立即打断并发送", nil)
+	}
+	if text == nil {
+		if !busy {
+			return true, nil
+		}
+		req := ccPluginInterrupt{
+			ID:         strings.ReplaceAll(newUUID(), "-", ""),
+			DeadlineMS: time.Now().Add(ccPluginSubmitWait).UnixMilli(),
+		}
+		acks := n.ccPlugins.expect(id, req.ID)
+		defer n.ccPlugins.settle(id, req.ID)
+		if !n.ccPlugins.handOver(ctx, id, c.pid, ccPluginDelivery{Messages: []ccPluginMessage{}, Interrupt: &req}, ccPluginPickupWait) {
+			return false, uncertain(fmt.Errorf("Persona 插件未能在 %s 内接收立即发送指令", ccPluginPickupWait))
+		}
+		select {
+		case <-acks:
+			n.ccPlugins.clearAborted(id, c.pid)
+			return true, nil
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-time.After(ccPluginSubmitWait):
+			return true, uncertain(fmt.Errorf("Persona 插件立即发送等待确认超时"))
+		}
+	}
+	if !busy {
+		cIdle := c
+		cIdle.Status = "idle"
+		ok, why := n.ccPluginSend(ctx, cIdle, id, *text)
+		if !ok {
+			return why != relayUnavailable && why != relayNoPlugin, uncertain(fmt.Errorf("Persona 插件未能提交这条消息（%s），请稍后重试", why))
+		}
+		return true, nil
+	}
+	req := ccPluginInterrupt{
+		ID:         strings.ReplaceAll(newUUID(), "-", ""),
+		DeadlineMS: time.Now().Add(ccPluginSubmitWait).UnixMilli(),
+	}
+	m := ccPluginMessage{
+		ID:         strings.ReplaceAll(newUUID(), "-", ""),
+		Text:       *text,
+		DeadlineMS: time.Now().Add(ccPluginSubmitWait).UnixMilli(),
+	}
+	intAcks := n.ccPlugins.expect(id, req.ID)
+	msgAcks := n.ccPlugins.expect(id, m.ID)
+	defer n.ccPlugins.settle(id, req.ID)
+	defer n.ccPlugins.settle(id, m.ID)
+	if !n.ccPlugins.handOver(ctx, id, c.pid, ccPluginDelivery{Messages: []ccPluginMessage{m}, Interrupt: &req}, ccPluginPickupWait) {
+		return false, uncertain(fmt.Errorf("Persona 插件未能在 %s 内接收立即发送指令", ccPluginPickupWait))
+	}
+	needle := ccPluginNeedle(*text)
+	deadline := time.Now().Add(ccPluginConfirmWait)
+	submitted := false
+	for {
+		if path == "" {
+			path = n.transcriptPath(id)
+		}
+		if path != "" && ccPluginSeen(path, offset, needle) {
+			n.ccPlugins.clearAborted(id, c.pid)
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			if submitted {
+				n.ccPlugins.clearAborted(id, c.pid)
+				return true, nil
+			}
+			return true, uncertain(fmt.Errorf("Persona 插件已接收立即发送指令，但尚未确认写入会话"))
+		}
+		select {
+		case <-intAcks:
+		case a := <-msgAcks:
+			if !a.Submitted {
+				return true, uncertain(fmt.Errorf("Persona 插件未能提交排队消息（%s）", a.Reason))
+			}
+			submitted = true
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // ccPluginInterrupt asks Persona's plugin in claude c to abort the running main-loop turn via $.turn.abort.
 // When an interrupt-capable plugin is connected to session id, handled is always true so interruptOutside never falls
 // back to the peer inbox (which would wake an idle session if `sessions/<pid>.json` had a stale `"busy"` status).

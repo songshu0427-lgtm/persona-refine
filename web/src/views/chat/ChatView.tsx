@@ -108,7 +108,7 @@ import { appArchiveDeps, deleteInsteadOfArchive, restoreAgent, useArchived } fro
 import { UltracodeLostNote } from "./Ultracode";
 import { isUltracodeQueued, ultracodeQueueDone } from "../../lib/ultracode";
 import { ChatActionsContext, liveValue, type ChatActions } from "./chat-actions";
-import { QueueStrip } from "./QueueStrip";
+import { QueueStrip, restoreQueued } from "./QueueStrip";
 import type { LoadOutcome } from "./ChatSearch";
 import { forgetReveals, revealItem, undoReveals, clearReveal } from "./search-reveal";
 import { jumpWhenOpen, openForward, peekJump, takeJump, type ForwardChat, type ForwardPick } from "../../lib/forward";
@@ -116,7 +116,7 @@ import { pickParts } from "./picking-parts";
 import type { MessagePick } from "../../lib/message-pick";
 import { foldHolding, lineOfItem, loadEarlierForSearch, untilStill, type ChatSearchHit, type SearchLoadOutcome } from "../../lib/chat-search";
 import { chatFiles } from "../../lib/mentions";
-import { pairPhotoOnly, sameMessage } from "../../lib/queue";
+import { pairPhotoOnly, parseQueued, sameMessage } from "../../lib/queue";
 import { DeliveryStatus, OutboxBubbles } from "./OutboxBubbles";
 import { useQueuedMessages } from "./useQueuedMessages";
 import { MainRuntimeSlot } from "../assistant/MainRuntimeSlot";
@@ -467,6 +467,14 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
     forgetOutgoing(outboxKey(mid, sid), gone.id);
     setPending((ps) => ps.filter((p) => p.id !== gone.id));
   }, [pending, photoOnly, mid, sid]);
+  const withdrawStoppedNow = useRef<(items: readonly string[]) => void>(() => {});
+  withdrawStoppedNow.current = (items) => {
+    const base = getSession(mid, sid) ?? session;
+    for (const raw of items) {
+      withdrawn(raw);
+      if (base) void restoreQueued(draftKey, base, parseQueued(raw));
+    }
+  };
   const outgoing = shownPending.length + outbox.filter((e) => e.state !== "failed").length;
   const persona = usePersona();
   const state = session ? stateOf(session) : "unknown";
@@ -1292,9 +1300,10 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
     const waited = unansweredNow.current;
     try {
       // the hub gives the computer 90 s: past that the link is dead, and a request that never ends must not hold the block
-      const r = await apiOp<{ state?: string }>(`${sessionPath(mid, sid)}/interrupt`, { method: "POST", timeout: pastHub(90_000) });
+      const r = await apiOp<{ state?: string; withdrawn?: string[] }>(`${sessionPath(mid, sid)}/interrupt`, { method: "POST", timeout: pastHub(90_000) });
       // a repeat after a gap can read as a success: the hub lost track of the first try, so nothing says it stopped
       if (r.state === "unknown") throw new Error(t("lib-new-agent.outcome_unknown"));
+      if (r.withdrawn?.length) withdrawStoppedNow.current(r.withdrawn);
       toast(t("chat-chatview.interrupted"));
       stopMessageFeedback(mid, sid);
       if (waited) {

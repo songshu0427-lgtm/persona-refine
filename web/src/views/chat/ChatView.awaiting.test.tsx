@@ -482,6 +482,33 @@ describe("a message waiting for its turn to start (#2450)", () => {
     expect(host.querySelector('[data-running-status="on"]')).not.toBeNull();
   });
 
+  it("restores withdrawn queued messages into the composer when Interrupt stops a busy session", async () => {
+    const now = new Date().toISOString();
+    captured.session = {
+      ...captured.session,
+      status: "busy",
+      state: "working",
+      source_kind: "claude_desktop",
+      queued: ["原来的fasttext模型怎么这么大？"],
+      capabilities: { read: true, send: true, interrupt: true, plugin_input: true },
+    };
+    transcript.items = [
+      { id: "u1", seq: 1, role: "user", kind: "text", text: "First turn", ts: now },
+      { id: "a1", seq: 2, role: "assistant", kind: "text", text: "Streaming...", ts: now },
+    ];
+    fetcher.mockImplementation(async (url) =>
+      String(url).endsWith("/interrupt")
+        ? new Response(JSON.stringify({ ok: true, withdrawn: ["原来的fasttext模型怎么这么大？"] }), { status: 200, headers: { "Content-Type": "application/json" } })
+        : new Response("{}"),
+    );
+    act(() => root.render(<ChatView mid="hub" sid="c1" />));
+    await flush();
+    act(() => stopButton()!.click());
+    await flush();
+    expect(interrupts()).toHaveLength(1);
+    expect(host.querySelector<HTMLTextAreaElement>("textarea")!.value).toBe("原来的fasttext模型怎么这么大？");
+  });
+
   it("keeps awaiting intact when the interrupt request fails", async () => {
     fetcher.mockImplementation(async (url) =>
       String(url).endsWith("/interrupt")

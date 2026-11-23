@@ -144,8 +144,13 @@ func waitPolling(t *testing.T, n *Node, session string) {
 
 func shortPluginWaits(t *testing.T) {
 	oldPick, oldSubmit, oldConfirm := ccPluginPickupWait, ccPluginSubmitWait, ccPluginConfirmWait
+	oldQueuePoll, oldQueueGrace := outsideQueuePoll, outsideQueueStartGrace
 	ccPluginPickupWait, ccPluginSubmitWait, ccPluginConfirmWait = 500*time.Millisecond, 300*time.Millisecond, 600*time.Millisecond
-	t.Cleanup(func() { ccPluginPickupWait, ccPluginSubmitWait, ccPluginConfirmWait = oldPick, oldSubmit, oldConfirm })
+	outsideQueuePoll, outsideQueueStartGrace = 25*time.Millisecond, 80*time.Millisecond
+	t.Cleanup(func() {
+		ccPluginPickupWait, ccPluginSubmitWait, ccPluginConfirmWait = oldPick, oldSubmit, oldConfirm
+		outsideQueuePoll, outsideQueueStartGrace = oldQueuePoll, oldQueueGrace
+	})
 }
 
 // The owner's own message to a Claude at rest in the desktop app goes in through Persona's plugin, as the person's
@@ -424,9 +429,9 @@ func TestCCPluginQueuesBusyOwnerMessageAndAbortsTurn(t *testing.T) {
 				queuedMsgs = append(queuedMsgs, text)
 				mu.Unlock()
 				line, _ := json.Marshal(map[string]any{
-					"type":      "queue-operation",
-					"operation": "enqueue",
-					"content":   text,
+					"type":    "user",
+					"uuid":    "u-" + fmt.Sprint(m["id"]),
+					"message": map[string]any{"role": "user", "content": text},
 				})
 				if tf, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
 					_, _ = tf.Write(append(line, '\n'))
@@ -438,32 +443,115 @@ func TestCCPluginQueuesBusyOwnerMessageAndAbortsTurn(t *testing.T) {
 	}()
 	waitPolling(t, n, sidA)
 
-	res, err := request(t, n, "session.send", map[string]any{
-		"session_id":    sidA,
-		"text":          "keep going and check tests",
-		"client_msg_id": "m-busy-1",
-		"owner_input":   true,
+	// 1. Busy owner messages stay held on the node so Edit / Delete / Reorder / Stop all work cleanly.
+	for i, txt := range []string{"first queued check", "keep going and check tests"} {
+		res, err := request(t, n, "session.send", map[string]any{
+			"session_id":    sidA,
+			"text":          txt,
+			"client_msg_id": fmt.Sprintf("m-busy-%d", i+1),
+			"owner_input":   true,
+		})
+		if err != nil {
+			t.Fatalf("busy owner send %d: %v", i+1, err)
+		}
+		if res["ok"] != true || res["delivered_as"] != "user_input" || res["queued"] != true {
+			t.Fatalf("busy owner send %d result: %v", i+1, res)
+		}
+	}
+	if got := byID(listSessions(t, n))[sidA].Queued; len(got) != 2 || got[0] != "first queued check" || got[1] != "keep going and check tests" {
+		t.Fatalf("session.Queued after busy sends: %v", got)
+	}
+	mu.Lock()
+	if len(queuedMsgs) != 0 {
+		mu.Unlock()
+		t.Fatalf("busy messages must stay held on node until turn end or send_now, got early submit: %v", queuedMsgs)
+	}
+	mu.Unlock()
+
+	// 2. Reorder and delete queued messages via session.queue.edit without HTTP 502.
+	editRes, err := request(t, n, "session.queue.edit", map[string]any{
+		"session_id": sidA,
+		"keep":       []int{1, 0},
 	})
 	if err != nil {
-		t.Fatalf("busy owner send: %v", err)
+		t.Fatalf("session.queue.edit reorder: %v", err)
 	}
-	if res["ok"] != true || res["delivered_as"] != "user_input" || res["queued"] != true {
-		t.Fatalf("busy owner send result: %v", res)
+	if q, _ := editRes["queue"].([]any); len(q) != 2 || q[0] != "keep going and check tests" || q[1] != "first queued check" {
+		t.Fatalf("reordered queue: %v", editRes)
+	}
+	delRes, err := request(t, n, "session.queue.edit", map[string]any{
+		"session_id": sidA,
+		"keep":       []int{0},
+	})
+	if err != nil {
+		t.Fatalf("session.queue.edit delete: %v", err)
+	}
+	if q, _ := delRes["queue"].([]any); len(q) != 1 || q[0] != "keep going and check tests" {
+		t.Fatalf("queue after delete: %v", delRes)
 	}
 
+	// 3. OwnerInterrupt stops the running turn and withdraws held messages instead of firing them!
 	waitPolling(t, n, sidA)
-	if _, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA}); err != nil {
+	stopRes, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{"session_id": sidA})
+	if err != nil {
 		t.Fatalf("owner interrupt: %v", err)
+	}
+	withdrawn, _ := stopRes["withdrawn"].([]any)
+	if len(withdrawn) != 1 || withdrawn[0] != "keep going and check tests" {
+		t.Fatalf("expected withdrawn message on stop, got: %v", stopRes)
+	}
+	if got := byID(listSessions(t, n))[sidA].Queued; len(got) != 0 {
+		t.Fatalf("queue should be empty after stop, got: %v", got)
+	}
+	mu.Lock()
+	if len(queuedMsgs) != 0 || len(interrupts) != 1 {
+		gotMsgs, gotInts := append([]string(nil), queuedMsgs...), append([]string(nil), interrupts...)
+		mu.Unlock()
+		t.Fatalf("after stop: msgs=%v interrupts=%v", gotMsgs, gotInts)
+	}
+	mu.Unlock()
+
+	// 4. Send now aborts a busy turn and immediately submits the queued message.
+	appendLines(t, p, `{"type":"user","uuid":"u-turn2","message":{"role":"user","content":"start second turn"}}`)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "busy", inbox, nil)
+	if _, err := request(t, n, "session.send", map[string]any{
+		"session_id":    sidA,
+		"text":          "send this right now",
+		"client_msg_id": "m-send-now",
+		"owner_input":   true,
+	}); err != nil {
+		t.Fatalf("queue before send_now: %v", err)
+	}
+	waitPolling(t, n, sidA)
+	if _, err := request(t, n, "session.queue.send_now", map[string]any{"session_id": sidA}); err != nil {
+		t.Fatalf("session.queue.send_now: %v", err)
 	}
 	mu.Lock()
 	gotMsgs, gotInts := append([]string(nil), queuedMsgs...), append([]string(nil), interrupts...)
 	mu.Unlock()
-	if len(gotMsgs) != 1 || gotMsgs[0] != "keep going and check tests" {
-		t.Fatalf("queued messages: %v", gotMsgs)
+	if len(gotMsgs) != 1 || gotMsgs[0] != "send this right now" {
+		t.Fatalf("messages after send_now: %v", gotMsgs)
 	}
-	if len(gotInts) != 1 {
-		t.Fatalf("interrupts: %v", gotInts)
+	if len(gotInts) != 2 {
+		t.Fatalf("interrupts after send_now: %v", gotInts)
 	}
+
+	// 5. Natural turn completion drains a held message automatically.
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "busy", inbox, nil)
+	if _, err := request(t, n, "session.send", map[string]any{
+		"session_id":    sidA,
+		"text":          "run after turn ends",
+		"client_msg_id": "m-drain",
+		"owner_input":   true,
+	}); err != nil {
+		t.Fatalf("queue before natural drain: %v", err)
+	}
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "idle", inbox, nil)
+	waitFor(t, "natural drain of outside queue", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(queuedMsgs) == 2 && queuedMsgs[1] == "run after turn ends"
+	})
 	if len(inbox.users()) != 0 {
 		t.Fatalf("peer inbox should not have been used: %v", inbox.users())
 	}

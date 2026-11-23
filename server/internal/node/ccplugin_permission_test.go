@@ -391,32 +391,35 @@ func TestStalledDesktopHostMCPAllowsRemoteInterruptAndSteer(t *testing.T) {
 		t.Fatalf("expected stalled desktop status blocked, got status=%s attention=%q", s.Status, s.AttentionReason)
 	}
 
-	// Owner can steer via busy_input and interrupt the stalled host-MCP turn from phone!
-	if _, err := request(t, n, "session.send", map[string]any{
+	// Owner queues a steering reply while stalled on host MCP, then clicks Send now to interrupt and submit it immediately!
+	sendRes, err := request(t, n, "session.send", map[string]any{
 		"session_id":  sidA,
 		"text":        "不用开预览服务了，直接发静态文件路径就行",
 		"owner_input": true,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("session.send while stalled on host MCP: %v", err)
 	}
-	select {
-	case got := <-queuedMsg:
-		if got != "不用开预览服务了，直接发静态文件路径就行" {
-			t.Fatalf("unexpected queued text: %q", got)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for busy_input delivery")
+	if sendRes["queued"] != true {
+		t.Fatalf("expected busy send to queue on node, got: %v", sendRes)
 	}
-
-	if _, err := request(t, n, nodeproto.OwnerInterrupt, map[string]any{
+	if _, err := request(t, n, "session.queue.send_now", map[string]any{
 		"session_id": sidA,
 	}); err != nil {
-		t.Fatalf("OwnerInterrupt while stalled on host MCP: %v", err)
+		t.Fatalf("session.queue.send_now while stalled on host MCP: %v", err)
 	}
 	select {
 	case <-interrupted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for plugin interrupt")
+	}
+	select {
+	case got := <-queuedMsg:
+		if got != "不用开预览服务了，直接发静态文件路径就行" {
+			t.Fatalf("unexpected steered text: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for steered message delivery")
 	}
 }
 
