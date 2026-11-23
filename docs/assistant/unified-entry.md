@@ -780,19 +780,24 @@ personad tool task_spawn '{"title":"Check the regression","prompt":"Inspect the 
 - **Ownership**: the node resolves the Agent currently in the calling pane. For Codex shell tools, the runtime's
   per-turn `CODEX_THREAD_ID` takes precedence over a shared daemon's potentially stale pane environment: it must
   match exactly one thread in the node's registry (ambiguous or unknown IDs are refused, not matched by directory).
-  The manager verifies its active link to
+  The manager verifies its active link as a top-level assigned Agent (`source: manual` or `leader`) on
   an open supervised to-do, starts the child on that computer in that directory, and records `source: spawned`,
   `via: <parent machine>/<parent session>` on the **same to-do** before returning the child, to-do and supervisor IDs.
   The child participates in the existing task's progress, completion review and retirement. No new task, task-leader
   role or supervision level is created. An ordinary worker still cannot use a leader's `task_plan` or `task_review`.
+- **Depth and concurrency gates**: `task_spawn` is capped at depth 1 (already-spawned sessions and a task leader's leaf
+  workers cannot list or call `task_spawn`, and their assignment prompts omit nested `task_spawn` entries), refuses a
+  concurrent spawn while an existing `source: spawned` session on the same to-do is actively working or waiting in that
+  checkout, and caps active `source: spawned` sessions at two per to-do so sequential context handoffs work without
+  runaway fan-out. Routine or single-command work and bounded helper lookups belong in the caller or its native
+  in-session subagents, and a caller must leave files its spawned child edits alone rather than polling or waiting on it.
 - **Scope**: only `title` and `prompt` are accepted, and the assignment must remain within the current task. Task,
   supervisor, parent, machine, directory and permissions cannot be supplied by the Agent. The current launcher and
   effort are reused. For the model, an original plan assignment that names one wins for its own Agent while it still
   runs on that assignment's launcher (the default launcher when it named none), instead of carrying over a model
   switched in the app after the start; otherwise the parent's current model is reused (#10557). Permission comes from
   the live parent, or its persisted original plan assignment when Codex does not expose it; unknown permission stays in
-  plan mode, never a writable owner default. Another spawned session with unknown permission cannot borrow the original
-  Agent's plan permission.
+  plan mode, never a writable owner default.
 - **Failure**: an unbound pane, unrelated Agent, completed task, guest or work-trust computer cannot dispatch this
   way. A known Codex thread needs no pane. Other `personad tool` calls retain the assistant-only connector gate.
   If ownership changes while the child

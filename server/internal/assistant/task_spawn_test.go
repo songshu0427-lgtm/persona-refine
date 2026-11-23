@@ -59,9 +59,14 @@ func TestTaskSpawnStaysOnCallersSupervisedTodo(t *testing.T) {
 		t.Fatalf("child escaped the parent's machine/directory/permission: %+v", start)
 	}
 	prompt, _ := start["prompt"].(string)
-	for _, guard := range []string{"task_spawn", "create_thread", "~/.persona/hub.json", "/api/v1", "never read"} {
+	for _, guard := range []string{"leaf assignment", "create_thread", "~/.persona/hub.json", "/api/v1", "never read"} {
 		if !strings.Contains(prompt, guard) {
 			t.Errorf("assignment lacks %q: %s", guard, prompt)
+		}
+	}
+	for _, forbidden := range []string{"task_spawn", "/test/persona-node"} {
+		if strings.Contains(prompt, forbidden) {
+			t.Errorf("spawned leaf child advertised %q: %s", forbidden, prompt)
 		}
 	}
 }
@@ -114,17 +119,30 @@ func TestTaskSpawnRefusesUnscopedArgumentsAndCallers(t *testing.T) {
 }
 
 func TestTaskSpawnDoesNotElevatePermissions(t *testing.T) {
-	for _, tc := range []struct{ launcher, mode, source, want string }{
-		{"codex", "plan", "manual", "plan"},
-		{"claude", "default", "manual", "default"},
-		{"claude", "plan", "manual", "plan"},
-		{"codex", "", "manual", "bypassPermissions"}, // the original assignment's persisted mode
-		{"codex", "", "spawned", "plan"},             // an unknown child cannot borrow that assignment's mode
+	for _, tc := range []struct {
+		name, launcher, mode, source string
+		dropPlan                     bool
+		want                         string
+	}{
+		{"codex-plan", "codex", "plan", "manual", false, "plan"},
+		{"claude-default", "claude", "default", "manual", false, "default"},
+		{"claude-plan", "claude", "plan", "manual", false, "plan"},
+		{"leader-plan", "codex", "plan", sourceLeader, false, "plan"},
+		{"persisted-assignment", "codex", "", "manual", false, "bypassPermissions"}, // the original assignment's persisted mode
+		{"unplanned-manual", "codex", "", "manual", true, "plan"},                   // an adopted/manual Agent without a plan stays read-only
 	} {
-		t.Run(tc.launcher+"/"+tc.mode+"/"+tc.source, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			s, f, todo := spawnFixture(t, tc.launcher, tc.mode)
+			if tc.dropPlan {
+				if err := s.patchPlanTask(context.Background(), todo.PlanID, 0, func(task *PlanTask) { task.TodoID = "" }); err != nil {
+					t.Fatal(err)
+				}
+			}
 			s.todos.mu.Lock()
 			s.todos.todos[todo.ID].Agents[0].Source = tc.source
+			if tc.dropPlan {
+				s.todos.todos[todo.ID].PlanID = ""
+			}
 			s.todos.mu.Unlock()
 			res := s.mcpCall(context.Background(), "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
 			if res.IsError {
@@ -200,22 +218,146 @@ func TestTaskSpawnUsesOriginalAssignmentModelWithDefaultLauncher(t *testing.T) {
 func TestTaskSpawnNonAssignmentAgentKeepsReportedModel(t *testing.T) {
 	s, f, todo := spawnFixture(t, "claude", "default")
 	ctx := context.Background()
-	s.todos.mu.Lock()
-	s.todos.todos[todo.ID].Agents[0].Source = "spawned"
-	s.todos.mu.Unlock()
-	f.setSessions("box", proto.Session{MachineID: "box", SessionID: "s1", Agent: "claude", Launcher: "claude",
-		Cwd: "/code/app", PermissionMode: "default", Model: "upstream/model-x", Status: proto.StatusWorking})
 	if err := s.patchPlanTask(ctx, todo.PlanID, 0, func(task *PlanTask) {
-		task.Launcher, task.Model = "claude", "relay/model-x-1m"
+		task.TodoID, task.Launcher, task.Model = "", "claude", "relay/model-x-1m"
 	}); err != nil {
 		t.Fatal(err)
 	}
+	s.todos.mu.Lock()
+	s.todos.todos[todo.ID].PlanID = ""
+	s.todos.mu.Unlock()
+	f.setSessions("box", proto.Session{MachineID: "box", SessionID: "s1", Agent: "claude", Launcher: "claude",
+		Cwd: "/code/app", PermissionMode: "default", Model: "upstream/model-x", Status: proto.StatusWorking})
 	res := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
 	if res.IsError {
 		t.Fatal(res.Content)
 	}
 	if got := f.starts[len(f.starts)-1]["model"]; got != "upstream/model-x" {
 		t.Fatalf("child model = %v, want the parent's unchanged upstream/model-x", got)
+	}
+}
+
+func TestTaskSpawnRefusesNestedSpawnedAndLeafWorkerSources(t *testing.T) {
+	for _, tc := range []struct {
+		source string
+		substr string
+	}{
+		{sourceSpawned, "depth limit 1"},
+		{sourceWorker, "report_to_supervisor"},
+		{sourceReview, "directly assigned Agent"},
+		{"space", "directly assigned Agent"},
+		{"chat", "directly assigned Agent"},
+	} {
+		t.Run(tc.source, func(t *testing.T) {
+			s, f, todo := spawnFixture(t, "claude", "default")
+			ctx := context.Background()
+			s.todos.mu.Lock()
+			s.todos.todos[todo.ID].Agents[0].Source = tc.source
+			s.todos.mu.Unlock()
+			if toolListed(s.sessionMCPTools(ctx, "box", "s1", false, false), "task_spawn") {
+				t.Fatalf("source %q unexpectedly listed task_spawn", tc.source)
+			}
+			n := len(f.starts)
+			res := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
+			if !res.IsError || len(f.starts) != n || len(onlyTodo(s).Agents) != 1 || !strings.Contains(res.Content[0].Text, tc.substr) {
+				t.Fatalf("source %q was not refused with %q: %+v", tc.source, tc.substr, res)
+			}
+		})
+	}
+
+	t.Run("end-to-end-spawned-child-cannot-recurse", func(t *testing.T) {
+		s, f, _ := spawnFixture(t, "claude", "default")
+		ctx := context.Background()
+		first := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
+		if first.IsError {
+			t.Fatal(first.Content)
+		}
+		f.setSessions("box",
+			proto.Session{MachineID: "box", SessionID: "s1", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusIdle},
+			proto.Session{MachineID: "box", SessionID: "s2", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusWorking},
+		)
+		if toolListed(s.sessionMCPTools(ctx, "box", "s2", false, false), "task_spawn") {
+			t.Fatal("spawned child listed task_spawn")
+		}
+		n := len(f.starts)
+		second := s.mcpCall(ctx, "box", "s2", "task_spawn", json.RawMessage(spawnArgs), false)
+		if !second.IsError || len(f.starts) != n || !strings.Contains(second.Content[0].Text, "depth limit 1") {
+			t.Fatalf("spawned child recursed: %+v", second)
+		}
+	})
+}
+
+func TestTaskSpawnBlocksConcurrentActiveChildAndCapsPerTodo(t *testing.T) {
+	s, f, _ := spawnFixture(t, "claude", "default")
+	ctx := context.Background()
+	first := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
+	if first.IsError {
+		t.Fatal(first.Content)
+	}
+	// While s2 is working in the same directory, s1 cannot spawn another concurrent session.
+	f.setSessions("box",
+		proto.Session{MachineID: "box", SessionID: "s1", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusWorking},
+		proto.Session{MachineID: "box", SessionID: "s2", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusWorking},
+	)
+	if toolListed(s.sessionMCPTools(ctx, "box", "s1", false, false), "task_spawn") {
+		t.Fatal("parent still listed task_spawn while spawned child was working")
+	}
+	n := len(f.starts)
+	concurrent := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
+	if !concurrent.IsError || len(f.starts) != n || !strings.Contains(concurrent.Content[0].Text, "already working") {
+		t.Fatalf("concurrent spawn was not blocked: %+v", concurrent)
+	}
+
+	// Once s2 finishes its turn (idle), one sequential continuation spawn (s3) is allowed up to spawnedTodoMost (2).
+	f.setSessions("box",
+		proto.Session{MachineID: "box", SessionID: "s1", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusWorking},
+		proto.Session{MachineID: "box", SessionID: "s2", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusIdle},
+	)
+	if !toolListed(s.sessionMCPTools(ctx, "box", "s1", false, false), "task_spawn") {
+		t.Fatal("parent could not list task_spawn after first child became idle")
+	}
+	second := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
+	if second.IsError {
+		t.Fatal(second.Content)
+	}
+
+	// Even after s3 becomes idle, a third spawned session on the same to-do is refused.
+	f.setSessions("box",
+		proto.Session{MachineID: "box", SessionID: "s1", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusWorking},
+		proto.Session{MachineID: "box", SessionID: "s2", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusIdle},
+		proto.Session{MachineID: "box", SessionID: "s3", Agent: "claude", Launcher: "claude", Cwd: "/code/app", PermissionMode: "default", Status: proto.StatusIdle},
+	)
+	if toolListed(s.sessionMCPTools(ctx, "box", "s1", false, false), "task_spawn") {
+		t.Fatal("parent still listed task_spawn after reaching per-todo cap")
+	}
+	n = len(f.starts)
+	third := s.mcpCall(ctx, "box", "s1", "task_spawn", json.RawMessage(spawnArgs), false)
+	if !third.IsError || len(f.starts) != n || !strings.Contains(third.Content[0].Text, "limit reached") {
+		t.Fatalf("per-todo spawn cap was not enforced: %+v", third)
+	}
+}
+
+func TestTaskLeaderWorkerPromptSuppressesNestedTaskSpawn(t *testing.T) {
+	s, f := newQuietService(t)
+	h := &taskHandoffTestHub{fakeHub: f, info: map[string]proto.NodeInfo{"box": {Executable: "/test/persona-node"}}}
+	s.hub = h
+	f.launcherList = []proto.Launcher{{Name: "claude", Agent: "claude", Source: "zshrc"}}
+	_ = startTaskLeader(t, s, f)
+	worker := planWorker(t, s, f, nil)
+	workerSession := worker.Agents[0].SessionID
+	start := f.starts[len(f.starts)-1]
+	prompt, _ := start["prompt"].(string)
+	for _, guard := range []string{"leaf assignment", "create_thread", "~/.persona/hub.json", "/api/v1", "never read"} {
+		if !strings.Contains(prompt, guard) {
+			t.Errorf("leader worker prompt lost %q: %s", guard, prompt)
+		}
+	}
+	if strings.Contains(prompt, "task_spawn") || strings.Contains(prompt, "/test/persona-node") {
+		t.Fatalf("leader worker prompt advertised nested task_spawn: %s", prompt)
+	}
+	tools := s.sessionMCPTools(context.Background(), "box", workerSession, false, false)
+	if toolListed(tools, "task_spawn") || !toolListed(tools, "report_to_supervisor") {
+		t.Fatalf("leader worker tools = %+v, want report_to_supervisor without task_spawn", tools)
 	}
 }
 

@@ -178,6 +178,8 @@ type PlanTask struct {
 	rememberKind bool
 	// task_spawn preserves the caller's mode instead of applying a fresh task's Claude-family permission default.
 	preservePermission bool
+	// spawnedChild marks a child session started by task_spawn so startTaskAgent suppresses further task_spawn entries.
+	spawnedChild bool
 	// planFirst: start defaults asked for the self-planning constraint in the prompt (start_defaults.go); never
 	// serialized, this try only.
 	planFirst bool

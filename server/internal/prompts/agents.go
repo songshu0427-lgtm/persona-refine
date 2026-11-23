@@ -263,6 +263,7 @@ type TaskHandoff struct {
 	Language   string // the caller's reply language; empty keeps the existing default
 	MCP        bool   // the selected launcher has the existing scoped Persona MCP tools
 	Executable string // a verified node executable, encoded as a JSON string, never shell code
+	NoSpawn    bool   // leaf or already-spawned session: omit task_spawn while keeping credential/thread guards
 }
 
 func RenderTaskHandoff(h TaskHandoff) string { return render("agents/task_handoff", h) }

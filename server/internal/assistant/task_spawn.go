@@ -13,6 +13,8 @@ import (
 	"github.com/nwverse/persona/server/internal/proto"
 )
 
+const spawnedTodoMost = 2 // active spawned sessions allowed on one supervised to-do
+
 // taskSpawn keeps a separate coding session on its caller's task. Unlike a leader's task_plan, it creates no task,
 // role or supervision level. The node supplies the caller; none of those identities come from tool arguments.
 func (s *Service) taskSpawn(ctx context.Context, machine, session string, args json.RawMessage) (string, error) {
@@ -33,29 +35,23 @@ func (s *Service) taskSpawn(ctx context.Context, machine, session string, args j
 		return "", errors.New("task_spawn requires title and prompt; nothing was started")
 	}
 	machine = s.canonical(machine)
-	t, ok := s.spawnTask(ctx, machine, session)
-	if !ok {
-		return "", errors.New("task_spawn requires an active Agent on an open supervised task; ask your supervisor to assign one")
+	t, _, err := s.spawnCaller(ctx, machine, session)
+	if err != nil {
+		return "", err
 	}
 	parent, ok := s.session(ctx, machine, session)
 	if !ok || parent.Assistant || parent.Cwd == "" || parent.Launcher == "" {
 		return "", errors.New("Persona cannot verify this Agent's directory and launcher; ask your supervisor, nothing was started")
 	}
+	if err := s.spawnGate(ctx, t, parent.Cwd); err != nil {
+		return "", err
+	}
 	// Unknown permission is read-only, never the owner's writable default. Codex does not expose PermissionMode, so
 	// the persisted assignment supplies it when this is that assignment's original Agent.
 	mode := parent.PermissionMode
-	assigned := false
-	for _, agent := range t.Agents {
-		if agent.MachineID == machine && agent.SessionID == session && agent.active() &&
-			(agent.Source == "manual" || agent.Source == sourceLeader || agent.Source == sourceWorker) {
-			assigned = true
-		}
-	}
 	var assignment *PlanTask
-	if assigned {
-		if p, i, err := s.currentPlanAssignment(ctx, t); err == nil && p.Tasks[i].Machine == machine {
-			assignment = &p.Tasks[i]
-		}
+	if p, i, err := s.currentPlanAssignment(ctx, t); err == nil && p.Tasks[i].Machine == machine {
+		assignment = &p.Tasks[i]
 	}
 	if mode == "" {
 		mode = "plan"
@@ -65,7 +61,7 @@ func (s *Service) taskSpawn(ctx context.Context, machine, session string, args j
 	}
 	child := PlanTask{TodoID: t.ID, Title: a.Title, Prompt: a.Prompt, Machine: machine, Cwd: parent.Cwd,
 		Launcher: parent.Launcher, Model: s.taskSpawnModel(ctx, parent, assignment), Effort: parent.Effort,
-		Permission: mode, Readonly: mode == "plan", preservePermission: true}
+		Permission: mode, Readonly: mode == "plan", preservePermission: true, spawnedChild: true}
 	// A caller disconnecting must not abandon a start before its ownership is recorded.
 	startCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
 	defer cancel()
@@ -78,11 +74,11 @@ func (s *Service) taskSpawn(ctx context.Context, machine, session string, args j
 	if err != nil {
 		return "", fmt.Errorf("task_spawn: %w; do not retry an uncertain start, ask your supervisor", err)
 	}
-	current, active := s.spawnTask(startCtx, machine, session)
-	if !active || current.ID != t.ID {
+	current, _, callerErr := s.spawnCaller(startCtx, machine, session)
+	if callerErr != nil || current.ID != t.ID {
 		err = errors.New("the caller's task changed or closed during the start")
 	} else {
-		err = s.linkTodoAgentWithSource(startCtx, t.ID, mid, sid, a.Title, child.Cwd, "", "", "spawned", machine+"/"+session)
+		err = s.linkTodoAgentWithSource(startCtx, t.ID, mid, sid, a.Title, child.Cwd, "", "", sourceSpawned, machine+"/"+session)
 	}
 	if err != nil {
 		stopCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
@@ -113,9 +109,63 @@ func (s *Service) spawnTask(ctx context.Context, machine, session string) (Todo,
 	return t, session != "" && ok && !t.Cancelled() && t.Supervision != nil && t.Supervision.Supervisor != ""
 }
 
-func (s *Service) spawnTools(ctx context.Context, machine, session string) []proto.Tool {
-	if _, ok := s.spawnTask(ctx, s.canonical(machine), session); ok {
-		return toolsNamed([]string{"task_spawn"})
+// spawnCaller verifies that machine/session is a top-level assigned Agent ("manual" or "leader") on an open supervised
+// task. Already-spawned children (depth limit 1), a task leader's leaf workers, and review/space links are refused.
+func (s *Service) spawnCaller(ctx context.Context, machine, session string) (Todo, TodoAgent, error) {
+	t, ok := s.spawnTask(ctx, machine, session)
+	if !ok {
+		return Todo{}, TodoAgent{}, errors.New("task_spawn requires an active Agent on an open supervised task; ask your supervisor to assign one")
+	}
+	for _, agent := range t.Agents {
+		if agent.MachineID == machine && agent.SessionID == session && agent.active() {
+			switch agent.Source {
+			case "manual", sourceLeader:
+				return t, agent, nil
+			case sourceSpawned:
+				return Todo{}, TodoAgent{}, errors.New("task_spawn is not available in an already-spawned session (depth limit 1): finish your assigned part here and report to your supervisor, or use bounded in-session subagents; nothing was started")
+			case sourceWorker:
+				return Todo{}, TodoAgent{}, errors.New("task_spawn is not available to a task leader's worker: do this work yourself (bounded in-session subagents are fine) or report to your leader via report_to_supervisor; nothing was started")
+			default:
+				return Todo{}, TodoAgent{}, errors.New("task_spawn requires the task's directly assigned Agent; ask your supervisor to assign one")
+			}
+		}
+	}
+	return Todo{}, TodoAgent{}, errors.New("task_spawn requires an active Agent on an open supervised task; ask your supervisor to assign one")
+}
+
+// spawnGate enforces per-todo spawned session count and prevents concurrent active spawned children in the same checkout.
+func (s *Service) spawnGate(ctx context.Context, t Todo, cwd string) error {
+	spawned := 0
+	for _, agent := range t.Agents {
+		if !agent.active() || agent.Source != sourceSpawned {
+			continue
+		}
+		spawned++
+		if live, ok := s.session(ctx, agent.MachineID, agent.SessionID); ok && !live.Archived &&
+			(live.Status == proto.StatusWorking || live.Status == proto.StatusBlocked) {
+			return fmt.Errorf("task_spawn refused: spawned session %s/%s is already working in %s on task %s; leave its files alone and finish your part without spawning concurrently",
+				agent.MachineID, agent.SessionID, cwd, t.ID)
+		}
+	}
+	if spawned >= spawnedTodoMost {
+		return fmt.Errorf("task_spawn limit reached (%d spawned sessions on task %s): finish the remaining part yourself or ask your supervisor to plan workers with a task leader; nothing was started",
+			spawnedTodoMost, t.ID)
 	}
 	return nil
+}
+
+func (s *Service) spawnTools(ctx context.Context, machine, session string) []proto.Tool {
+	machine = s.canonical(machine)
+	t, _, err := s.spawnCaller(ctx, machine, session)
+	if err != nil {
+		return nil
+	}
+	cwd := ""
+	if parent, ok := s.session(ctx, machine, session); ok {
+		cwd = parent.Cwd
+	}
+	if s.spawnGate(ctx, t, cwd) != nil {
+		return nil
+	}
+	return toolsNamed([]string{"task_spawn"})
 }

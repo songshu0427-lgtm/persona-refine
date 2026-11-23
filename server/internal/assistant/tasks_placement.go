@@ -319,7 +319,7 @@ func (s *Service) startTaskAgent(ctx context.Context, t *PlanTask, retry bool) (
 		prompt += "\n\n" + prompts.RenderTaskDoneWhen(t.DoneWhen)
 	}
 	if t.TodoID != "" && !s.isWorkMachine(m.ID) {
-		prompt += "\n\n" + s.taskHandoff(ctx, m.ID, fit)
+		prompt += "\n\n" + s.taskHandoffFor(ctx, m.ID, fit, t.Parent != "" || t.spawnedChild)
 	}
 	switch {
 	case t.Role == roleLeader: // what it may hand out, and how its workers reach it (task_leader.go)
