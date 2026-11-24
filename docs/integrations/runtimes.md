@@ -436,6 +436,7 @@ end to end in `integrations/dsh/e2e/assistant.mjs`.
 | opencode (`opencode-<pid>`) | `integrations/opencode`: opencode plugin (one connection per opencode server process; list and chats read from opencode.db, live updates over the event stream, control through the plugin API) | `docs/integrations/opencode.md` |
 | Grok CLI (`grok-chat`) | `integrations/grok/companion.mjs`: optional standalone ACP companion with assistant tools, permission hooks, native renaming and restart recovery; also lists conversations started in a terminal (read-only while the terminal holds them) | `integrations/grok/README.md` |
 | Antigravity CLI (`antigravity`) | `integrations/antigravity/companion.mjs`: companion process; reads CLI transcripts and runs terminal-less Agent and assistant sessions through `agy acp` | "Antigravity CLI" below |
+| Antigravity Desktop (`antigravity-desktop`) | `integrations/antigravity/desktop.mjs`: macOS companion for existing App conversations, independent of the CLI | "Antigravity Desktop" below |
 | echo (example) | `integrations/runtime-sdk/examples/echo-runtime.mjs` (with `--listen <port>` it's a daemon) | "Minimal example" in this doc, `docs/integrations/daemons.md` |
 
 ### Antigravity CLI
@@ -454,7 +455,7 @@ fields, including a subscription reset timestamp supplied in native quota metada
 that result. Rejected ACP prompts also publish their failure through the session's error state.
 The history token includes the error format so connected clients refresh items cached before this representation.
 
-The implemented integration is for the **Antigravity CLI (`agy`)**, not the Antigravity desktop app. When `personad node`
+This companion is for the **Antigravity CLI (`agy`)**; the separate desktop bridge is described below. When `personad node`
 runs (`--attach` or `--stdio`), `agy` is installed, Node.js 22.5+ (`node:sqlite`) is available, and no external `agy`
 runtime is connected on `runtime.sock`, the node automatically writes out the embedded `persona-antigravity-runtime`
 package and supervises `antigravity/companion.mjs` (passing `--no-update --parent-stdin`), yielding whenever an external
@@ -529,6 +530,30 @@ normal page limits to complete native records and serves larger items through th
 scope includes `:full` to invalidate previously cached compact pages. Parsed files are cached by file identity, size
 and nanosecond modification/change times, bounded to 16 files and 64 MiB of source data. Files modified within the
 last second bypass the cache because rapid same-size writes can share a filesystem timestamp tick.
+
+### Antigravity Desktop (macOS, experimental)
+
+The node independently supervises `integrations/antigravity/desktop.mjs` on macOS when
+`~/.gemini/antigravity/daemon` exists and Node.js 22+ is available. It does not require the `agy` CLI, launch the
+App, or change App settings. The desktop companion uses runtime/agent ID `antigravity-desktop` and session prefix
+`desktop-agy-`, separate from CLI sessions. An already-connected desktop runtime prevents a second managed bridge.
+Stopping the bridge or its parent stops only the bridge, never the App or its native invocation.
+
+Keep Antigravity Desktop running and send the first message there. Persona then discovers existing conversations,
+reads their native transcript exports, follows updates, sends text and interrupts the selected conversation.
+Approvals must still be handled in the App. Desktop session creation, image input, model/mode switching,
+rewind/fork, rename/close and the assistant launcher are not supported.
+
+The bridge validates the private, same-user `daemon/hub_<port>.json` descriptor and its PID's exact loopback listener,
+then uses authenticated native RPC. Sending reuses the conversation's last native user configuration rather than
+inventing model defaults. This private protocol is version-dependent; read-only discovery was checked with Desktop
+2.35.0. Send/interrupt routing is covered with fake native RPC tests, not prompts sent to a user's conversation.
+Tool-result media with no image resolver is omitted; Read/view_file previews retain their file-path metadata.
+
+For a manual bridge, run `node integrations/antigravity/desktop.mjs` from the repository root. `--desktop-dir` and
+`--socket` override the native data directory and runtime socket. The node passes `--parent-stdin` so parent-pipe EOF
+shuts down its companion. Implementation: `integrations/antigravity/lib/desktop.js` and
+`server/internal/node/agydesktopbridge.go`; shipped in `persona-antigravity-runtime` beside the CLI companion.
 
 ### Runtime token usage
 

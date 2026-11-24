@@ -41,15 +41,18 @@ type agyBridge struct {
 	done   chan struct{}
 }
 
-// EnableAutoCompanions turns on automatic supervision of built-in CLI companions (Antigravity `agy`) once Listen runs.
+// EnableAutoCompanions turns on automatic supervision of built-in Antigravity companions once Listen runs.
 // Production nodes (`personad node --attach` and `personad node --stdio`) enable this; unit test fixtures leave it off
-// so the host machine's installed CLIs never join synthetic runtime tests.
+// so the host machine's installed CLI and desktop app never join synthetic runtime tests.
 func (rh *RuntimeHost) EnableAutoCompanions() {
 	rh.autoCompanions = true
 }
 
 func (rh *RuntimeHost) setAgyBridge(on bool) {
-	b := &rh.agy
+	rh.agy.set(rh.ctx, on, rh.agyBridgeLoop)
+}
+
+func (b *agyBridge) set(base context.Context, on bool, loop func(context.Context, chan struct{})) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if on == (b.cancel != nil) {
@@ -64,13 +67,12 @@ func (rh *RuntimeHost) setAgyBridge(on bool) {
 		b.mu.Lock()
 		return
 	}
-	base := rh.ctx
 	if base == nil {
 		base = context.Background()
 	}
 	ctx, cancel := context.WithCancel(base)
 	b.cancel, b.done = cancel, make(chan struct{})
-	go rh.agyBridgeLoop(ctx, b.done)
+	go loop(ctx, b.done)
 }
 
 // findAgyExecutable finds an installed `agy` CLI binary without spawning a login shell.
@@ -115,7 +117,7 @@ func agyJSVersion(ctx context.Context, js jsRuntime) (string, error) {
 	return v, nil
 }
 
-func findAgyJSRuntime(ctx context.Context) (jsRuntime, error) {
+func agyJSCandidates() []jsRuntime {
 	var cands []jsRuntime
 	if p := strings.TrimSpace(os.Getenv("PERSONA_NODEJS")); p != "" {
 		cands = append(cands, jsRuntime{Path: p, Electron: !isNodeBinary(p), From: "PERSONA_NODEJS"})
@@ -126,9 +128,13 @@ func findAgyJSRuntime(ctx context.Context) (jsRuntime, error) {
 	for _, p := range commonNodePaths() {
 		cands = append(cands, jsRuntime{Path: p, From: "installed"})
 	}
+	return cands
+}
+
+func findAgyJSRuntime(ctx context.Context) (jsRuntime, error) {
 	seen := map[string]bool{}
 	var tried []string
-	for _, c := range cands {
+	for _, c := range agyJSCandidates() {
 		if seen[c.Path] {
 			continue
 		}
@@ -150,17 +156,25 @@ func findAgyJSRuntime(ctx context.Context) (jsRuntime, error) {
 	return jsRuntime{}, errors.New("no Node.js found (set PERSONA_NODEJS)")
 }
 
-var agyBridgeCommand = func(ctx context.Context, rh *RuntimeHost, agyBin string) (*exec.Cmd, error) {
+func (rh *RuntimeHost) installAgyPackage() (string, error) {
 	pkg, err := runtimepkg.Load(agyPackage)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if pkg == nil {
-		return nil, errors.New("this personad carries no Antigravity runtime package (built without go generate ./internal/runtimepkg)")
+		return "", errors.New("this personad carries no Antigravity runtime package (built without go generate ./internal/runtimepkg)")
 	}
 	dir, err := writePackage(filepath.Join(filepath.Dir(rh.path), "runtime-packages", agyPackage), pkg)
 	if err != nil {
-		return nil, fmt.Errorf("write Antigravity runtime: %w", err)
+		return "", fmt.Errorf("write Antigravity runtime: %w", err)
+	}
+	return dir, nil
+}
+
+var agyBridgeCommand = func(ctx context.Context, rh *RuntimeHost, agyBin string) (*exec.Cmd, error) {
+	dir, err := rh.installAgyPackage()
+	if err != nil {
+		return nil, err
 	}
 	js, err := findAgyJSRuntime(ctx)
 	if err != nil {
@@ -173,13 +187,13 @@ var agyBridgeCommand = func(ctx context.Context, rh *RuntimeHost, agyBin string)
 	return cmd, nil
 }
 
-func (rh *RuntimeHost) agyConnected() bool {
+func (rh *RuntimeHost) agyCompanionConnected(id string) bool {
 	if rh.reg == nil {
 		return false
 	}
 	rh.reg.mu.Lock()
 	defer rh.reg.mu.Unlock()
-	return rh.reg.byRuntime(agyRuntimeID) != nil
+	return rh.reg.byRuntime(id) != nil
 }
 
 func (rh *RuntimeHost) agyBridgeLoop(ctx context.Context, done chan struct{}) {
@@ -188,7 +202,7 @@ func (rh *RuntimeHost) agyBridgeLoop(ctx context.Context, done chan struct{}) {
 	loggedMissingJS := false
 	for ctx.Err() == nil {
 		agyBin := findAgyExecutable()
-		if agyBin == "" || rh.agyConnected() {
+		if agyBin == "" || rh.agyCompanionConnected(agyRuntimeID) {
 			select {
 			case <-ctx.Done():
 				return

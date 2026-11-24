@@ -117,6 +117,7 @@ func AttachWithTransport(ctx context.Context, newNode func() (*Node, error), ext
 			runtimes = nil // each connection's Node opens its own, as without a resident node
 		} else {
 			defer runtimes.setAgyBridge(false)
+			defer runtimes.setAgyDesktopBridge(false)
 		}
 	}
 	relayed := make(chan net.Conn)

@@ -56,7 +56,9 @@ type RuntimeHost struct {
 	// cindy runs the Cindy bridge while the machine's engine is Cindy (cindybridge.go).
 	cindy cindyBridgeState
 	// agy runs the Antigravity CLI companion when agy is installed and autoCompanions is enabled (agybridge.go).
-	agy            agyBridge
+	agy agyBridge
+	// agyDesktop runs the independent macOS desktop companion when its daemon directory exists.
+	agyDesktop     agyBridge
 	autoCompanions bool
 }
 
@@ -121,6 +123,7 @@ func (rh *RuntimeHost) Listen(ctx context.Context) error {
 	rh.startDaemons(ctx)
 	if rh.autoCompanions {
 		rh.setAgyBridge(true)
+		rh.setAgyDesktopBridge(true)
 	}
 	go func() {
 		t := time.NewTicker(15 * time.Second)

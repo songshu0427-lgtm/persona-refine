@@ -543,6 +543,7 @@ func (n *Node) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	} else {
 		defer func() {
 			rh.setAgyBridge(false)
+			rh.setAgyDesktopBridge(false)
 			rh.detach(n)
 		}()
 	}

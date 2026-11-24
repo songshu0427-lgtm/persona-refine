@@ -51,7 +51,7 @@ test('selfPackage: a module run from a store version (through current) knows its
   assert.equal(fromStore.store, realpathSync(store)) // through current, to the version's real directory
 })
 
-test('persona-antigravity-runtime hashes companion, mcp-proxy, lib and runtime-sdk identically across checkout and store', (t) => {
+test('persona-antigravity-runtime hashes CLI and desktop companions, mcp-proxy, lib and runtime-sdk identically across checkout and store', (t) => {
   const store = mkdtempSync(join(tmpdir(), 'jrt-pkg-'))
   const checkout = mkdtempSync(join(tmpdir(), 'jrt-co-'))
   t.after(() => {
@@ -61,6 +61,7 @@ test('persona-antigravity-runtime hashes companion, mcp-proxy, lib and runtime-s
   for (const f of [
     'antigravity/package.json',
     'antigravity/companion.mjs',
+    'antigravity/desktop.mjs',
     'antigravity/mcp-proxy.mjs',
     'antigravity/lib/runtime.js',
     'antigravity/install.mjs',
@@ -75,6 +76,7 @@ test('persona-antigravity-runtime hashes companion, mcp-proxy, lib and runtime-s
   assert.deepEqual(files.map((f) => f.path), [
     'antigravity/package.json',
     'antigravity/companion.mjs',
+    'antigravity/desktop.mjs',
     'antigravity/mcp-proxy.mjs',
     'antigravity/lib/runtime.js',
     'runtime-sdk/package.json',

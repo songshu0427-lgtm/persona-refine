@@ -39,6 +39,17 @@ describe('antigravity transcript and tool mapping', () => {
     assert.equal(items.at(-1).text, tools[1].content)
   })
 
+  it('omits unresolvable tool media but preserves Read preview metadata', () => {
+    const { items } = stepsToItems([
+      { step_index: 0, type: 'PLANNER_RESPONSE', tool_calls: [{ name: 'view_file', args: { AbsolutePath: '/tmp/chart.png' } }] },
+      { step_index: 1, type: 'GENERIC', content: 'Image loaded', media: [{ mime_type: 'image/png' }] },
+    ])
+    assert.equal(items.filter(item => item.kind === 'image').length, 0)
+    assert.equal(items[0].tool_name, 'Read')
+    assert.equal(items[0].tool_input.file_path, '/tmp/chart.png')
+    assert.equal(items.at(-1).text, 'Image loaded')
+  })
+
   it('converts session ids between persona and agy', () => {
     assert.equal(toPersonaId('ad40e999-0253-4097-8ee2-a70f9259e88b'), 'agy-ad40e999-0253-4097-8ee2-a70f9259e88b')
     assert.equal(toPersonaId('agy-ad40e999-0253-4097-8ee2-a70f9259e88b'), 'agy-ad40e999-0253-4097-8ee2-a70f9259e88b')
