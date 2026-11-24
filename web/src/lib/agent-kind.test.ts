@@ -75,6 +75,13 @@ describe("providerAgent", () => {
 });
 
 describe("markId", () => {
+  it("maps desktop artwork without changing runtime identity or capabilities", () => {
+    expect(markId("antigravity-desktop")).toBe("agy");
+    expect(markId("custom-runtime", "Antigravity Desktop")).toBe("agy");
+    expect(markId("Antigravity CLI")).toBe("agy");
+    expect(agentId("antigravity-desktop")).toBe("antigravity-desktop");
+  });
+
   it("draws the mark a name says when the agent has none of its own (#8142)", () => {
     expect(["Cursor", "TRAE CLI", "OpenCode", "Pi", "Gemini"].map((l) => markId("paseo", l))).toEqual(["cursor", "trae", "opencode", "pi", "gemini"]);
     expect(markId("paseo", "Grok · Official")).toBe("grok");

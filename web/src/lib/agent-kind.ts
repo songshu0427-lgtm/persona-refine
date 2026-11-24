@@ -27,6 +27,7 @@ const MARK_ALIASES: Record<string, MarkedAgent> = {
   grokcli: "grok",
   antigravity: "agy",
   antigravitycli: "agy",
+  antigravitydesktop: "agy",
   googleantigravity: "agy",
   deepseekharness: "dsh",
   kimicli: "kimi",

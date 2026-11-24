@@ -1,8 +1,8 @@
 // The mark of the agent that runs in a row, a header, a pane or a launcher (#3391): drawn as the owner publishes it, like
 // BrandMark (CLAUDE.md: brand marks are not redrawn), in a fixed box so a column of rows lines up, centred, at the share
 // of the box its shape takes. Next to the state dot, never in its place. The one-color marks are templates drawn in
-// the text color, so they read in light and dark and in a selected button; Claude keeps its coral (Anthropic's mark is
-// coral on neutral). An agent with no mark of its own (a compatible CLI, a runtime, whatever else herdr reports) draws its first
+// the text color, so they read in light and dark and in a selected button; Claude keeps its coral and Antigravity keeps
+// its supplied multicolor artwork. An agent with no mark of its own (a compatible CLI, a runtime, whatever else herdr reports) draws its first
 // letter on a plain tile of the same box.
 //
 // Where each mark comes from (also in THIRD_PARTY_NOTICES.md). Simple Icons (SI) releases the files under CC0; the
@@ -14,7 +14,8 @@
 //   gemini    SI `googlegemini.svg`; source gemini.google.com (no brand kit found)
 //   pi        SI `pi.svg`; source pi.dev/favicon.svg (no licence text found)
 //   trae      SI `trae.svg`; source trae.ai (TRAE, ByteDance's coding agent; not TRAEX, which keeps its letter)
-//   grok, agy  Lobe Icons 1.104.0 Grok and Antigravity monochrome marks
+//   grok      Lobe Icons 1.104.0 Grok monochrome mark
+//   agy       user-supplied multicolor star; background removed and cropped to the glyph
 //   dsh, kimi, copilot  SI 16.36.0 DeepSeek, Kimi and GitHub Copilot marks
 // viewBoxes of opencode, cursor and trae are cropped to the glyph (CLAUDE.md: assets carry no padding); nothing else is changed.
 import { t } from "../i18n";
@@ -28,7 +29,7 @@ import opencodeMark from "./brands/opencode.svg";
 import piMark from "./brands/pi.svg";
 import traeMark from "./brands/trae.svg";
 import grokMark from "./brands/grok.svg?no-inline";
-import agyMark from "./brands/agy.svg?no-inline";
+import agyMark from "./brands/agy-color.png?no-inline";
 import dshMark from "./brands/dsh.svg?no-inline";
 import kimiMark from "./brands/kimi.svg?no-inline";
 import copilotMark from "./brands/copilot.svg?no-inline";
@@ -44,7 +45,7 @@ const MARKS: Record<MarkedAgent, { src: string; template?: boolean; fit: number 
   cursor: { src: cursorMark, template: true, fit: 0.92 },
   trae: { src: traeMark, template: true, fit: 0.92 },
   grok: { src: grokMark, template: true, fit: 1 },
-  agy: { src: agyMark, template: true, fit: 1 },
+  agy: { src: agyMark, fit: 1 },
   dsh: { src: dshMark, template: true, fit: 1 },
   kimi: { src: kimiMark, template: true, fit: 0.88 },
   copilot: { src: copilotMark, template: true, fit: 1 },

@@ -38,6 +38,7 @@ redrawn.
 | `web/src/ui/brands/pi.svg`, `brand-pi` | Pi, agent mark | Simple Icons 16.36.0 `pi.svg` (CC0 for the file); upstream pi.dev/favicon.svg, no licence text found | Pi's trademark |
 | `grok.svg` and `brand-grok` | Grok, agent mark | Lobe Icons 1.104.0 `grok.svg` (MIT license below) | xAI's trademark |
 | `agy.svg` and `brand-agy` | Antigravity CLI, agent mark | Lobe Icons 1.104.0 `antigravity.svg` (MIT license below) | Google brand terms |
+| `web/src/ui/brands/agy-color.png` | Custom Antigravity web agent mark | User-supplied multicolor star artwork; neutral background removed, cropped and downscaled | Third-party artwork; no additional license grant claimed |
 | `dsh.svg` and `brand-dsh` | DeepSeek Harness, agent mark | Simple Icons 16.36.0 `deepseek.svg` (CC0 for the file) | DeepSeek's trademark |
 | `kimi.svg` and `brand-kimi` | Kimi CLI, agent mark | Simple Icons 16.36.0 `kimi.svg` (CC0 for the file) | Moonshot AI's trademark |
 | `copilot.svg` and `brand-copilot` | GitHub Copilot, agent mark | Simple Icons 16.36.0 `githubcopilot.svg` (CC0 for the file) | GitHub's logo usage terms |

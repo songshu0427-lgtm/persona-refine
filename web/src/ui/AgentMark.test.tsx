@@ -16,14 +16,16 @@ describe("AgentMark", () => {
     expect(draw("gemini-cli")).toBe(draw("gemini"));
   });
 
-  it("draws the one-color marks as templates in the text color and Claude in its own color", () => {
-    for (const a of MARKED_AGENTS.filter((x) => x !== "claude")) {
+  it("draws one-color marks as templates and preserves Claude and Antigravity colors", () => {
+    for (const a of MARKED_AGENTS.filter((x) => x !== "claude" && x !== "agy")) {
       const html = draw(a);
       expect(html).toContain("bg-current");
       expect(html).toContain("mask");
       expect(html).not.toContain("<img");
     }
     expect(draw("claude")).toContain("<img");
+    expect(draw("agy")).toContain("<img");
+    expect(draw("agy")).not.toContain("mask");
     expect(draw("codex")).toContain("text-ink-2"); // read in light and dark: the text color, not a fixed one
     expect(draw("codex", { className: "text-current" })).not.toContain("text-ink-2");
   });
@@ -57,7 +59,7 @@ describe("AgentMark", () => {
   it("keeps every mark in a box of the size asked, centred, whatever its shape", () => {
     for (const a of [...MARKED_AGENTS, "traex"]) {
       const html = draw(a, { size: 18 });
-      expect(html).toMatch(/^<span [^>]*class="relative inline-flex shrink-0 items-center justify-center/);
+      expect(html).toMatch(/^(?:<link[^>]*\/>)*<span [^>]*class="relative inline-flex shrink-0 items-center justify-center/);
       expect(html).toContain("width:18px;height:18px");
     }
   });
@@ -96,6 +98,18 @@ describe("SessionMark", () => {
   it("badges a session whose agent runs on the command line", () => {
     expect(renderToStaticMarkup(<SessionMark s={{ agent: "codex", agent_surface: "cli" }} size={14} />)).toBe(draw("codex", { surface: "cli" }));
     expect(renderToStaticMarkup(<SessionMark s={{ agent: "codex", agent_surface: "web" }} size={14} />)).toBe(draw("codex"));
+  });
+
+  it("uses the supplied color artwork for Antigravity Desktop and CLI, not a letter", () => {
+    for (const agent of ["agy", "antigravity", "antigravity-desktop"]) {
+      const html = renderToStaticMarkup(<SessionMark s={{ agent, agent_label: "Antigravity Desktop", source_kind: "runtime" }} size={14} />);
+      expect(html).toContain('data-agent-mark="agy"');
+      expect(html).toContain("<img");
+      expect(src(html)).toBe(src(draw("agy")));
+      expect(src(html)).toContain("agy-color.png");
+      expect(html).not.toContain('data-agent-mark="letter"');
+      expect(html).not.toContain("mask");
+    }
   });
 
   it("is the mark of the session's agent", () => {
