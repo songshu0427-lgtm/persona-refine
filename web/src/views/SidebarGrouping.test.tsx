@@ -14,6 +14,7 @@ import { t } from "../i18n";
 import { filterAgentList, resetAgentListFilters } from "../lib/agent-list-filters";
 import { onOpenNewAgent, type NewAgentPreset } from "../lib/new-agent";
 import { refresh, reset } from "../lib/store";
+import { setSideFold } from "../lib/side-fold";
 import type { Todo } from "../lib/todos";
 import type { Machine, Session } from "../lib/types";
 import { Icon, type IconName } from "../ui/icons";
@@ -135,8 +136,37 @@ describe("persistent 2-tab grouping (状态 | 仓库) and dispatched tasks", () 
     expect(agentsBlock().textContent).toContain("派出任务");
     expect(agentsBlock().textContent).toContain("修复 Persona 的 Codex 实例问题");
     expect(agentsBlock().textContent).toContain("最近");
+    expect(agentsBlock().textContent!.indexOf("最近")).toBeLessThan(agentsBlock().textContent!.indexOf("派出任务"));
     expect(agentsBlock().textContent).toContain("本地日常调试会话");
     expect(agentsBlock().querySelector('[data-persona-dispatched]')?.textContent).toBe("派出");
+  });
+
+  it.each([false, true])("expands status children once with side folding %s and preserves manual collapse", async (foldSides) => {
+    const parent: Session = { ...agent, session_id: "parent", title: "Parent chat", children: { total: 2, working: 1, sides: 1, sides_working: 1 } };
+    const side: Session = { ...agent, session_id: "side", title: "Side chat", folded_as: "side", folded_under: "parent", parent_agent_id: "parent" };
+    const child: Session = { ...agent, session_id: "child", title: "Child agent", state: "idle", status: "idle", is_subagent: true, folded_under: "parent" };
+    vi.stubGlobal("fetch", vi.fn((url: string) => {
+      if (url.endsWith("/api/v1/sessions")) return json({ sessions: [parent, side, child] });
+      if (url.endsWith("/api/v1/machines")) return json({ machines: [mac] });
+      return json({});
+    }));
+    await refresh();
+    setSideFold(foldSides);
+    await render();
+    const block = agentsBlock().querySelector('[data-sidebar-session="mac/parent"]')!;
+    expect(block).not.toBeNull();
+    for (const title of ["Side chat", "Child agent"]) {
+      const links = [...agentsBlock().querySelectorAll("a")].filter((a) => a.textContent?.includes(title));
+      expect(links).toHaveLength(1);
+      expect(block.contains(links[0])).toBe(true);
+      expect(links[0].closest("[inert]")).toBeNull();
+    }
+    const toggle = block.querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    act(() => toggle.click());
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
   });
 
   it("migrates legacy machine/space preferences to 仓库 and todo to 状态", async () => {

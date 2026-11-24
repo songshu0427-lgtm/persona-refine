@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -236,10 +237,77 @@ func TestCodexDesktopTurnFromRolloutTail(t *testing.T) {
 	if got := n.codexDesktopTurn(p); got != proto.StatusWorking {
 		t.Fatalf("running turn = %s", got)
 	}
+	// Heavy tool output (>512 KiB) in the middle of a running turn must not drop StatusWorking on incremental or cold reads.
+	toolLine := `{"type":"response_item","payload":{"type":"function_call_output","output":"` + strings.Repeat("x", 32<<10) + `"}}`
+	for range 20 {
+		write(toolLine)
+	}
+	if got := n.codexDesktopTurn(p); got != proto.StatusWorking {
+		t.Fatalf("incremental >512KiB turn = %s", got)
+	}
+	codexTurnMarks.Delete(p)
+	if got := n.codexDesktopTurn(p); got != proto.StatusWorking {
+		t.Fatalf("cold-start >512KiB turn = %s", got)
+	}
+	// Also verify when task_started straddles an exact 256 KiB backward-chunk boundary.
+	pBoundary := filepath.Join(t.TempDir(), "boundary.jsonl")
+	started := `{"type":"event_msg","payload":{"type":"task_started"}}` + "\n"
+	suffixLine := `{"type":"response_item","payload":{"output":"` + strings.Repeat("y", (256<<10)-70) + `"}}` + "\n"
+	prefix := `{"type":"session_meta","payload":{"pad":"` + strings.Repeat("z", 128) + `"}}` + "\n"
+	if err := os.WriteFile(pBoundary, []byte(prefix+started+suffixLine), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.codexDesktopTurn(pBoundary); got != proto.StatusWorking {
+		t.Fatalf("boundary-straddling turn = %s", got)
+	}
 	write(`{"type":"event_msg","payload":{"type":"task_complete"}}`)
 	if got := n.codexDesktopTurn(p); got != proto.StatusDone {
 		t.Fatalf("finished turn = %s", got)
 	}
+}
+
+func TestCodexDesktopTurnLargeAndPartialRecords(t *testing.T) {
+	n := &Node{}
+	p := filepath.Join(t.TempDir(), "rollout.jsonl")
+	write := func(text string, appendOnly bool) {
+		t.Helper()
+		flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+		if appendOnly {
+			flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+		}
+		f, err := os.OpenFile(p, flags, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		if _, err := f.WriteString(text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(want string) {
+		t.Helper()
+		for range 2 { // unchanged-size cache returns the same state
+			if got := n.codexDesktopTurn(p); got != want {
+				t.Fatalf("got %s, want %s", got, want)
+			}
+		}
+	}
+	started := `{"type":"event_msg","payload":{"type":"task_started"}}` + "\n"
+	write(started, false)
+	check(proto.StatusWorking)
+	// Completion itself can carry a large final reply and be written in pieces.
+	write(`{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"`+strings.Repeat("x", 600<<10), true)
+	check(proto.StatusWorking)
+	write(`"}}`+"\n", true)
+	check(proto.StatusDone)
+	codexTurnMarks.Delete(p)
+	check(proto.StatusDone)
+	write(started, true)
+	check(proto.StatusWorking)
+	write(`{"type":"event_msg","payload":{"type":"turn_aborted"}}`+"\n", true)
+	check(proto.StatusDone)
+	write(started, false) // truncated rollout must not retain the completed mark
+	check(proto.StatusWorking)
 }
 
 func TestCodexDesktopFollowsTheAppsSidebar(t *testing.T) {

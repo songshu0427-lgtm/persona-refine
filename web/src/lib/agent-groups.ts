@@ -269,15 +269,14 @@ function byDate(a: Session, b: Session): number {
   return byTime(date(b), date(a)) || a.session_id.localeCompare(b.session_id) || a.machine_id.localeCompare(b.machine_id);
 }
 
-// Urgency + source hierarchy: 需要你 → 进行中 → 派出任务 (Persona-dispatched tasks, unfolded with cap) → 最近 (manual
-// chats, unfolded with cap) → 已屏蔽 (folded).
+// Status order: needs you, in progress, recent chats, dispatched tasks, muted (folded).
 export function buildAgentGroups(all: Session[], machines: Machine[], _grouping: "state", mutes: AgentMutes = { spaces: [], sessions: [] }, offlineRecent: Session[] = [], dispatchedKeys?: ReadonlySet<string>): AgentGroup[] {
   const { live } = splitAgentSessions(all, machines);
   const groups: AgentGroup[] = [
     { key: "state:needs", name: stateName("needs_you"), state: "needs_you", sessions: [] },
     { key: "state:working", name: t("sidebar.in_progress"), state: "working", sessions: [] },
-    { key: "state:dispatched-tasks", name: t("sidebar.dispatched_done"), state: "idle", sessions: [], initialLimit: 5 },
     { key: "state:recent", name: t("sidebar.recent_chats"), sessions: [], initialLimit: 8 },
+    { key: "state:dispatched-tasks", name: t("sidebar.dispatched_done"), state: "idle", sessions: [], initialLimit: 5 },
     { key: "state:muted", name: t("lib-agent-groups.state_muted"), sessions: [], folded: true },
   ];
   for (const s of live) {
@@ -287,12 +286,12 @@ export function buildAgentGroups(all: Session[], machines: Machine[], _grouping:
     const index = state === "needs_you" || awaitsReply(s, mutes) ? 0
       : isMuted(s, mutes) && (state === "working" || state === "unread" || waiting) ? 4
       : state === "working" || backgroundWaiting(s) || waiting ? 1
-      : dispatched ? 2
-      : 3;
+      : dispatched ? 3
+      : 2;
     groups[index].sessions.push(s);
   }
   for (const s of offlineRecent) {
-    groups[isDispatchedSession(s, dispatchedKeys) ? 2 : 3].sessions.push(s);
+    groups[isDispatchedSession(s, dispatchedKeys) ? 3 : 2].sessions.push(s);
   }
   return groups.filter((g) => g.sessions.length).map((g) => ({
     ...g,

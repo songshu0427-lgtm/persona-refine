@@ -58,7 +58,8 @@ import { ListError } from "../ui/ListError";
 import { NoComputers, useAddComputer } from "./machines/AddComputerEntry";
 import { BADGE_CLASS, DOT_CLASS, type GoFn, GroupCount, holdsRow, morePagesMenu, type NavPage, type RegFn, rowKey, type RowMenuFn, Section, SidebarGroup, GroupFoldButton, useActiveKey, useGo, useNavPages } from "./SidebarParts";
 import { NavRow, PersonalAgents, PersonaRow, SessionRow, SubHeading } from "./SidebarRows";
-import { RepoMachineSection, SessionTally, type WorkspaceTreeActions } from "./SidebarTree";
+import { RepoMachineSection, SidebarSessionItem, SessionTally, type WorkspaceTreeActions } from "./SidebarTree";
+import { sidebarSessionChildren } from "../lib/side-sessions";
 import { CollapseButton, PagesTally } from "./SidebarRail";
 import type { PageSection } from "../lib/sidebar-pages";
 import { WindowedRows } from "./WindowedRows";
@@ -714,6 +715,12 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
     () => applyDimensionFilters(listed, dimFilters, evalCtx, facets),
     [listed, dimFilters, evalCtx, facets],
   );
+  const { roots: groupedSessions, children: sideChildren } = useMemo(() => {
+    const nested = sidebarSessionChildren(dimFiltered, unfoldedScoped.filter(isSidebarAgent));
+    const cmp = byUpdate ? byUpdated : byRepoActivity;
+    for (const list of nested.children.values()) list.sort(cmp);
+    return nested;
+  }, [dimFiltered, unfoldedScoped, byUpdate]);
   const dispatchedKeys = useMemo(() => dispatchedSessionKeys(todos), [todos]);
   const knownTodoKeys = useMemo(() => todoSessionKeys(todos), [todos]);
   const codexProjectMachines = useMemo(() => codexMachinesWithSidebarProjects(listed), [listed]);
@@ -721,13 +728,13 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const machinesById = useMemo(() => new Map(machines.map((m) => [m.id, m])), [machines]);
   // In By repo, desktop app projects (Codex App / Claude Desktop) and Persona-created sessions stay inside their folder, and pinned catalog workspaces keep theirs.
   const { live, recent: offline } = useMemo(() => splitAgentSessions(
-    dimFiltered,
+    chatList ? dimFiltered : groupedSessions,
     machines,
     shownGrouping === "repo" && !chatList
       ? (s) => hasWorkspacePin(s, catalog.workspaces, catalog.manager) || isRepoOfflineRetained(s, onlineMachineIds, knownTodoKeys, codexProjectMachines, machinesById.get(s.machine_id))
       : undefined,
     shownGrouping === "state" && !chatList ? (s) => isDispatchedSession(s, dispatchedKeys) : undefined,
-  ), [dimFiltered, machines, shownGrouping, chatList, catalog, onlineMachineIds, knownTodoKeys, codexProjectMachines, machinesById, dispatchedKeys]);
+  ), [dimFiltered, groupedSessions, machines, shownGrouping, chatList, catalog, onlineMachineIds, knownTodoKeys, codexProjectMachines, machinesById, dispatchedKeys]);
   const seeded = useRef(false);
   useEffect(() => {
     // a filter saved in this browser starts from what it matches once the list has loaded
@@ -757,20 +764,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
     : !loaded && listError ? <ListError text={agentsReadFailed(listError)} onRetry={retryFullAgentSessions} />
     : sessionsPending ? <p className="px-2 py-1 text-[12px] text-ink-3">{t("sidebar.loading")}</p>
     : null;
-  const sideChildren = useMemo(() => {
-    if (shownGrouping !== "repo") return undefined;
-    const map = new Map<string, Session[]>();
-    for (const s of unfoldedScoped) {
-      if (s.folded_as !== "side" || !s.folded_under || s.archived) continue;
-      const parentKey = `${s.machine_id}/${s.folded_under}`;
-      const list = map.get(parentKey);
-      if (list) list.push(s);
-      else map.set(parentKey, [s]);
-    }
-    const cmp = byUpdate ? byUpdated : byRepoActivity;
-    for (const list of map.values()) list.sort(cmp);
-    return map;
-  }, [shownGrouping, unfoldedScoped, byUpdate]);
+  const holdsSession = (s: Session) => rowKey(s) === activeKey || holdsRow(sideChildren.get(agentKey(s)) ?? [], activeKey);
   const repoMachines = useMemo(() => {
     if (shownGrouping !== "repo") return [];
     const built = buildRepoMachineTree(unpinned, machines, { ...catalog, hiddenSources: botmuxHidden ? ["botmux"] : undefined, navigationSessions: [...shown, ...pinnedAgents.filter((p) => !shown.includes(p))], hideEmpty: filtered, compareSessions: byUpdate ? byUpdated : byRepoActivity });
@@ -801,7 +795,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const [confirmSeen, setConfirmSeen] = useState<Session[] | null>(null);
   // stable, like `go`: every row gets it, and a new one each render would re-render them all (SessionRow's memo)
   const onRowMenu = useCallback<RowMenuFn>((s, anchor, at) => setRowMenu((m) => (!at && m?.anchor === anchor ? null : { s, anchor, at })), []);
-  const [pinnedFolded, togglePinned] = useFolded("agents-pinned", false, { holds: holdsRow(pinnedAgents, activeKey), scope: AGENTS_FOLD });
+  const [pinnedFolded, togglePinned] = useFolded("agents-pinned", false, { holds: pinnedAgents.some(holdsSession), scope: AGENTS_FOLD });
   const [launchesFolded, toggleLaunches] = useFolded("agents-launching", false, { holds: launches.some((l) => activeKey === `s:${l.machineId}/${l.id}`), scope: AGENTS_FOLD });
   // the whole block folds under its title in the sidebar (#2524); the phone's Agents page is the block, it doesn't
   // and opens by itself when ⌘K puts words on the list, so what was asked for is in view (#6589)
@@ -879,7 +873,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
               return <AgentChatListRow key={key} s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} pinned mutes={mutes} filters={dimFilters} ctx={evalCtx} onMenu={onRowMenu} />;
             }
             const context = [s.space_name || baseName(s.cwd), machines.length > 1 ? machineWithHub(s.machine_id, machines) : ""].filter(Boolean).join(" · ");
-            return <SessionRow key={key} s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={context} onMenu={onRowMenu} />;
+            return <SidebarSessionItem key={key} s={s} sides={sideChildren.get(agentKey(s))} reg={reg} hover={hover} activeKey={activeKey} go={go} hint={context} hideDispatchedBadge={shownGrouping === "repo"} onRowMenu={onRowMenu} />;
           })}
         </Section>
       )}
@@ -900,7 +894,7 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
           <RepoMachineSection key={m.key} m={m} flat={repoMachines.length <= 1} machines={machines} sideChildren={sideChildren} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} {...workspaceActions} />
         ))
       ) : groups.map((group) => (
-        <AgentSection key={group.key} group={group} machines={machines} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} onNavigate={onNavigate} />
+        <AgentSection key={group.key} group={group} machines={machines} sideChildren={sideChildren} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} onNavigate={onNavigate} />
       )))}
       </div>
       </Collapse>
@@ -999,16 +993,17 @@ const FilterBar = memo(function FilterBar({ selection, counts, onChoose, botmux 
 });
 
 // Every group in the sidebar is one of these: its title folds it, and the fold is kept in this browser (useFolded).
-function AgentSection({ group, machines, byTodo, showHost, reg, hover, activeKey, go, onRowMenu, onNavigate }: { group: AgentGroup; machines: Machine[]; byTodo?: boolean; showHost?: boolean; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn; onNavigate?: () => void }) {
-  const [folded, toggle] = useFolded(group.key, group.folded, { follow: true, holds: holdsRow(group.sessions, activeKey) });
+function AgentSection({ group, machines, sideChildren, byTodo, showHost, reg, hover, activeKey, go, onRowMenu, onNavigate }: { group: AgentGroup; machines: Machine[]; sideChildren?: ReadonlyMap<string, Session[]>; byTodo?: boolean; showHost?: boolean; reg: RegFn; hover: (k: string | null) => void; activeKey: string; go: GoFn; onRowMenu: RowMenuFn; onNavigate?: () => void }) {
+  const holds = (s: Session) => rowKey(s) === activeKey || holdsRow(sideChildren?.get(agentKey(s)) ?? [], activeKey);
+  const [folded, toggle] = useFolded(group.key, group.folded, { follow: true, holds: group.sessions.some(holds) });
   const [showAll, setShowAll] = useState(false);
   const shownSessions = group.initialLimit && !showAll
-    ? firstAndCurrent(group.sessions, group.initialLimit, (s) => rowKey(s) === activeKey)
+    ? firstAndCurrent(group.sessions, group.initialLimit, holds)
     : group.sessions;
   const row = (s: Session) => {
     const key = `s:${s.machine_id}/${s.session_id}`;
     const context = [s.space_name || baseName(s.cwd), machines.length > 1 ? machineWithHub(s.machine_id, machines) : ""].filter(Boolean).join(" · ");
-    return <SessionRow key={key} s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={context} host={showHost && sessionHost(s) !== "herdr" ? sessionHost(s) : undefined} showTodoTag={!byTodo} onMenu={onRowMenu} />;
+    return <SidebarSessionItem key={key} s={s} sides={sideChildren?.get(agentKey(s))} reg={reg} hover={hover} activeKey={activeKey} go={go} hint={context} host={showHost && sessionHost(s) !== "herdr" ? sessionHost(s) : undefined} showTodoTag={!byTodo} onRowMenu={onRowMenu} />;
   };
 
   const statusInfo = group.todoStatus ? TODO_STATUS_INFO[group.todoStatus as TodoStatus] : undefined;
@@ -1044,7 +1039,7 @@ function AgentSection({ group, machines, byTodo, showHost, reg, hover, activeKey
 
   return (
     <Section title={titleNode} folded={folded} onToggle={toggle} right={rightNode}>
-      <WindowedRows items={shownSessions} holds={(s) => rowKey(s) === activeKey} render={row} />
+      <WindowedRows items={shownSessions} holds={holds} render={row} />
       {Boolean(group.initialLimit && group.sessions.length > group.initialLimit) && (
         <button type="button" onClick={() => setShowAll((x) => !x)} className="relative z-10 w-full rounded-[7px] px-2 py-1 text-left text-[12px] text-ink-3 hover:text-ink-2 [@media(pointer:coarse)]:min-h-11">
           {showAll ? t("sidebar.show_less") : t("sidebar.show_more", { count: group.sessions.length - shownSessions.length })}

@@ -3,6 +3,35 @@
 // "Session hierarchy"). Unlike a folded child (lib/child-sessions.ts) it keeps its row, its state and its place in every
 // count; the lists only move it under its parent, a level in. This module is the arrangement, for any row type.
 
+import type { Session } from "./types";
+
+/** Sidebar-only nesting: retain the protocol's folding/count rules, but show available children under their listed
+ * parent even when a mixed fleet cannot advertise side folding. Filtered-out parents never swallow visible rows. */
+export function sidebarSessionChildren(listed: Session[], raw: readonly Session[]) {
+  const key = (s: Session) => `${s.machine_id}/${s.session_id}`;
+  const visible = new Set(listed.map(key));
+  const rows = new Map(raw.filter((s) => !s.archived && !s.assistant).map((s) => [key(s), s]));
+  for (const s of listed) rows.set(key(s), s);
+  const tree = nestUnderParents([...rows.values()], key, (s) => {
+    const parent = s.folded_under || s.parent_agent_id || (s.is_subagent ? s.parent_session_id : undefined);
+    return parent ? `${s.machine_id}/${parent}` : undefined;
+  });
+  const children = new Map<string, Session[]>();
+  const nested = new Set<string>();
+  let parent: string | undefined;
+  for (const s of tree.rows) {
+    if (!tree.nested.has(s)) {
+      parent = visible.has(key(s)) ? key(s) : undefined;
+    } else if (parent) {
+      const list = children.get(parent) ?? [];
+      list.push(s);
+      children.set(parent, list);
+      nested.add(key(s));
+    }
+  }
+  return { roots: listed.filter((s) => !nested.has(key(s))), children };
+}
+
 export interface Nested<T> {
   /** The rows in the order to draw them: each group where its most recent member was, its top first, then the rest. */
   rows: readonly T[];

@@ -29,8 +29,8 @@ describe("Agent 分组偏好", () => {
   });
 });
 
-describe("状态视图分组（需要你 → 进行中 → 派出任务 → 最近 → 已屏蔽）", () => {
-  it("固定顺序：需要你 → 进行中 → 派出任务（默认展开并仅识别督办/worktree 任务，普通手动新建不误判为派出）→ 最近 → 已屏蔽（折叠）", () => {
+describe("status grouping", () => {
+  it("orders needs, working, recent, dispatched, muted without treating manual chats as dispatched", () => {
     const dispatchedKeys = dispatchedSessionKeys([
       { id: "td-supervised", supervision: { mode: "auto" }, agents: [{ machine_id: "machine-a", session_id: "todo-worker" }] } as never,
       { id: "td-origin", origin: "assistant", agents: [{ machine_id: "machine-a", session_id: "origin-worker" }] } as never,
@@ -60,13 +60,13 @@ describe("状态视图分组（需要你 → 进行中 → 派出任务 → 最�
     expect(isDispatchedSession(all[4], dispatchedKeys)).toBe(true);
     expect(isDispatchedSession(all[1], dispatchedKeys)).toBe(false);
     const groups = buildAgentGroups(all, machines, "state", mutes, offline, dispatchedKeys);
-    expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "派出任务", "最近", "已屏蔽"]);
+    expect(groups.map((g) => g.name)).toEqual(["需要你", "进行中", "最近", "派出任务", "已屏蔽"]);
     expect(ids(groups[0].sessions)).toEqual(["persona-needs"]);
     expect(ids(groups[1].sessions)).toEqual(["manual-working", "persona-working", "waiting"]);
-    expect(ids(groups[2].sessions)).toEqual(["dispatched-offline", "worktree-worker", "todo-worker", "origin-worker"]);
-    expect(groups[2].initialLimit).toBe(5);
-    expect(ids(groups[3].sessions)).toEqual(["manual-unread", "manual-idle", "manual-linked", "webui-manual", "unknown", "manual-offline"]);
-    expect(groups[3].initialLimit).toBe(8);
+    expect(ids(groups[2].sessions)).toEqual(["manual-unread", "manual-idle", "manual-linked", "webui-manual", "unknown", "manual-offline"]);
+    expect(groups[2].initialLimit).toBe(8);
+    expect(ids(groups[3].sessions)).toEqual(["dispatched-offline", "worktree-worker", "todo-worker", "origin-worker"]);
+    expect(groups[3].initialLimit).toBe(5);
     expect(groups.slice(0, 4).every((g) => !g.folded)).toBe(true);
     expect(groups[4].folded).toBe(true);
   });

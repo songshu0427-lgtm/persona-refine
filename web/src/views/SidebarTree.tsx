@@ -299,10 +299,13 @@ function preferredNativeLauncher(...groups: (readonly Session[] | undefined)[]):
   return undefined;
 }
 
-const RepoSessionItem = memo(function RepoSessionItem({ s, sides, hint, reg, hover, activeKey, go, onRowMenu }: {
+export const SidebarSessionItem = memo(function SidebarSessionItem({ s, sides, hint, host, showTodoTag, hideDispatchedBadge = false, reg, hover, activeKey, go, onRowMenu }: {
   s: Session;
   sides?: readonly Session[];
   hint?: string;
+  host?: string;
+  showTodoTag?: boolean;
+  hideDispatchedBadge?: boolean;
   reg: RegFn;
   hover: (k: string | null) => void;
   activeKey: string;
@@ -312,15 +315,15 @@ const RepoSessionItem = memo(function RepoSessionItem({ s, sides, hint, reg, hov
   const key = `s:${s.machine_id}/${s.session_id}`;
   const hasSides = Boolean(sides && sides.length > 0);
   const allOffline = stateOf(s) === "offline" && (!sides || sides.every((c) => stateOf(c) === "offline"));
-  const [folded, toggle] = useFolded(`sides:${s.machine_id}/${s.session_id}`, allOffline, { holds: Boolean(sides && holdsRow(sides, activeKey)) });
+  const [folded, toggle] = useFolded(`sides:${s.machine_id}/${s.session_id}`, allOffline, { follow: true, holds: Boolean(sides && holdsRow(sides, activeKey)) });
   if (!hasSides) {
-    return <SessionRow s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} hideDispatchedBadge onMenu={onRowMenu} />;
+    return <SessionRow s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} host={host} showTodoTag={showTodoTag} hideDispatchedBadge={hideDispatchedBadge} onMenu={onRowMenu} />;
   }
   return (
-    <div>
+    <div data-sidebar-session={`${s.machine_id}/${s.session_id}`}>
       <div className="flex items-center">
         <div className="min-w-0 flex-1">
-          <SessionRow s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} hideDispatchedBadge onMenu={onRowMenu} />
+          <SessionRow s={s} k={key} reg={reg} hover={hover} active={activeKey === key} to={{ name: "session", mid: s.machine_id, sid: s.session_id }} go={go} hint={hint} host={host} showTodoTag={showTodoTag} hideDispatchedBadge={hideDispatchedBadge} onMenu={onRowMenu} />
         </div>
         <button
           type="button"
@@ -403,7 +406,7 @@ function RepoSection({ tree, machineId, online, machineLauncher, sideChildren, r
   const [folded, toggle] = useFolded(tree.key, false, { holds: tree.worktrees.some((w) => holdsRow(w.navigationTree ?? w.tree, activeKey) || holdsSide(w.navigationTree ?? w.tree) || holdsWorkspace(w, selected)) });
   const [showAll, setShowAll] = useState(false);
   const row = (s: Session, hint?: string) => (
-    <RepoSessionItem key={`s:${s.machine_id}/${s.session_id}`} s={s} sides={sideChildren?.get(`${s.machine_id}/${s.session_id}`)} hint={hint} reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} />
+    <SidebarSessionItem key={`s:${s.machine_id}/${s.session_id}`} s={s} sides={sideChildren?.get(`${s.machine_id}/${s.session_id}`)} hint={hint} hideDispatchedBadge reg={reg} hover={hover} activeKey={activeKey} go={go} onRowMenu={onRowMenu} />
   );
   // Plain project folders never render an extra git branch / worktree tree in the sidebar: sessions sit directly under
   // their project folder, while catalog-managed workspaces (Orca / Paseo / Herdr) keep their explicit workspace tree.

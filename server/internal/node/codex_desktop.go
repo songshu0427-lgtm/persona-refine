@@ -458,49 +458,105 @@ func slotCodexDesktop(list []proto.Session) {
 }
 
 type codexTurnMark struct {
-	size   int64
-	status string
+	size    int64
+	scanned int64 // end of the last complete JSONL record; retry a partially written record on growth
+	status  string
 }
 
 // codexDesktopTurn: working while the rollout's last turn has started and not ended, done after; read from the tail
-// and kept until the file grows.
+// in backward chunks (or incrementally from the last mark) so turns writing >256 KiB of tool output stay working.
 func (n *Node) codexDesktopTurn(path string) string {
 	st, err := os.Stat(path)
 	if err != nil {
 		return proto.StatusUnknown
 	}
-	if v, ok := codexTurnMarks.Load(path); ok && v.(codexTurnMark).size == st.Size() {
-		return v.(codexTurnMark).status
-	}
-	status := proto.StatusDone
-	if f, err := os.Open(path); err == nil {
-		const tail = 256 << 10
-		off := max(st.Size()-tail, 0)
-		b := make([]byte, st.Size()-off)
-		_, err = f.ReadAt(b, off)
-		f.Close()
-		if err == nil {
-			for _, line := range bytes.Split(b, []byte("\n")) {
-				var e struct {
-					Type    string `json:"type"`
-					Payload struct {
-						Type string `json:"type"`
-					} `json:"payload"`
-				}
-				if !bytes.Contains(line, []byte(`"event_msg"`)) || json.Unmarshal(line, &e) != nil || e.Type != "event_msg" {
-					continue
-				}
-				switch e.Payload.Type {
-				case "task_started":
-					status = proto.StatusWorking
-				case "task_complete", "turn_aborted":
-					status = proto.StatusDone
-				}
-			}
+	var floor int64
+	fallback := proto.StatusDone
+	if v, ok := codexTurnMarks.Load(path); ok {
+		mark := v.(codexTurnMark)
+		if mark.size == st.Size() {
+			return mark.status
+		}
+		if mark.size > 0 && mark.size < st.Size() {
+			floor = mark.scanned
+			fallback = mark.status
 		}
 	}
-	codexTurnMarks.Store(path, codexTurnMark{size: st.Size(), status: status})
+	f, err := os.Open(path)
+	if err != nil {
+		return proto.StatusUnknown
+	}
+	defer f.Close()
+	status, scanned, err := codexTurnStatusFromTail(f, st.Size(), floor, fallback)
+	if err != nil {
+		return proto.StatusUnknown // do not cache a failed read as a completed turn
+	}
+	codexTurnMarks.Store(path, codexTurnMark{size: st.Size(), scanned: scanned, status: status})
 	return status
+}
+
+func codexTurnStatusFromTail(f *os.File, size, floor int64, fallback string) (string, int64, error) {
+	const chunk = 256 << 10
+	var carry []byte
+	scanned := floor
+	complete := false
+	for end := size; end > floor; {
+		off := max(end-chunk, floor)
+		n := int(end - off)
+		buf := make([]byte, n+len(carry))
+		if _, err := f.ReadAt(buf[:n], off); err != nil {
+			return "", floor, err
+		}
+		copy(buf[n:], carry)
+		// A writer may be halfway through a record. Keep the prior state until its newline arrives.
+		if !complete {
+			nl := bytes.LastIndexByte(buf, '\n')
+			if nl < 0 {
+				end = off
+				continue
+			}
+			scanned = off + int64(nl) + 1
+			buf = buf[:nl+1]
+			complete = true
+		}
+		scan := buf
+		if off > floor {
+			nl := bytes.IndexByte(buf, '\n')
+			if nl < 0 {
+				carry = buf
+				end = off
+				continue
+			}
+			carry = buf[:nl]
+			scan = buf[nl+1:]
+		}
+		var found string
+		for _, line := range bytes.Split(scan, []byte("\n")) {
+			if !bytes.Contains(line, []byte(`"event_msg"`)) {
+				continue
+			}
+			var e struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Type string `json:"type"`
+				} `json:"payload"`
+			}
+			if json.Unmarshal(line, &e) != nil || e.Type != "event_msg" {
+				continue
+			}
+			switch e.Payload.Type {
+			case "task_started":
+				found = proto.StatusWorking
+			case "task_complete", "turn_aborted":
+				found = proto.StatusDone
+			}
+		}
+		if found != "" {
+			return found, scanned, nil
+		}
+		end = off
+	}
+	return fallback, scanned, nil
 }
 
 var codexTurnMarks sync.Map
