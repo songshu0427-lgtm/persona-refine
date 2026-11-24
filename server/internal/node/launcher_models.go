@@ -69,6 +69,12 @@ func (n *Node) launcherModels(ctx context.Context, name, agentType string, refre
 	if isCodexAppLauncher(name) {
 		return n.codexAppLauncherModels(ctx, refresh)
 	}
+	// The desktop bridge attaches to native conversations but cannot start them, so it is not a launcher owner.
+	if name == agyDesktopRuntimeID {
+		if h := n.runtimes.runtimeNamed(name); h != nil {
+			return n.liveRuntimeModels(ctx, h, name, refresh, proto.LauncherModels{Agent: name, Models: []proto.AgentModel{}})
+		}
+	}
 	// A runtime's launcher, as a start in ctx's host runs it (where that host's engine runs only its own launchers, its
 	// provider of the name, #8140): static advertisement or native discovery.
 	if h := n.runtimeOfIn(ctx, name); h != nil {
@@ -172,6 +178,9 @@ func (n *Node) knownLauncher(ctx context.Context, name string) bool {
 		return err == nil
 	}
 	if name == "claude" || name == traexAgent {
+		return true
+	}
+	if name == agyDesktopRuntimeID && n.runtimes.runtimeNamed(name) != nil {
 		return true
 	}
 	if _, ok := n.managedLauncher(name); ok {

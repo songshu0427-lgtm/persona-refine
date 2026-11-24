@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -405,6 +406,68 @@ func TestLauncherModelsKnowsRuntimeLaunchers(t *testing.T) {
 	params, _ := json.Marshal(map[string]any{"name": name})
 	if _, err := n.handle(context.Background(), "launchers.models", params); err != nil && strings.Contains(err.Error(), "unknown launcher") {
 		t.Fatalf("%s refused: %v", name, err)
+	}
+}
+
+// A read/send desktop runtime has no start capability, but its session model picker still uses its native catalog
+// without advertising Claude Code permission chips.
+func TestLauncherModelsAgyDesktopRuntime(t *testing.T) {
+	n, _ := runtimeNode(t)
+	h := paseoEngineHello()
+	h["runtime"], h["agent"] = agyDesktopRuntimeID, agyDesktopRuntimeID
+	h["caps"] = map[string]any{"send": true, "interrupt": true, "modes": true, "model": true, "models": true}
+	h["launchers"] = []map[string]any{}
+	host := dialRuntime(t, n, h)
+	var picked string
+	host.answer = func(method string, params json.RawMessage) (any, error) {
+		switch method {
+		case "launchers.models":
+			return map[string]any{"models": []map[string]any{{"id": "desktop-model", "name": "Desktop model", "resolved": "native-enum"}}}, nil
+		case "session.modes":
+			var p struct {
+				Model string `json:"model"`
+			}
+			_ = json.Unmarshal(params, &p)
+			picked = p.Model
+			return map[string]any{}, nil
+		}
+		return nil, errors.New("unexpected native call: " + method)
+	}
+	_ = host.peer.Notify("runtime.sessions", map[string]any{"sessions": []map[string]any{{
+		"session_id":   "desktop-agy-11111111-2222-4333-8444-555555555555",
+		"title":        "Desktop session",
+		"cwd":          "/tmp",
+		"status":       "idle",
+		"launcher":     agyDesktopRuntimeID,
+		"capabilities": map[string]any{"modes": false},
+	}}})
+	waitFor(t, "agy desktop listed", func() bool {
+		_, ok := listed(t, n)["desktop-agy-11111111-2222-4333-8444-555555555555"]
+		return ok
+	})
+	row := listed(t, n)["desktop-agy-11111111-2222-4333-8444-555555555555"]
+	if row.Capabilities == nil || row.Capabilities.Model == nil || !*row.Capabilities.Model {
+		t.Fatalf("expected Capabilities.Model = true, got %+v", row.Capabilities)
+	}
+	if row.Capabilities.Modes == nil || *row.Capabilities.Modes {
+		t.Fatalf("expected Capabilities.Modes = false, got %+v", row.Capabilities)
+	}
+	raw, err := nodeCall(t, n, "launchers.models", map[string]any{"name": agyDesktopRuntimeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got proto.LauncherModels
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Agent != agyDesktopRuntimeID || len(got.Models) != 1 || got.Models[0].ID != "desktop-model" || got.Models[0].Resolved != "native-enum" {
+		t.Fatalf("models %s", raw)
+	}
+	if _, err := nodeCall(t, n, "session.modes", map[string]any{
+		"session_id": "desktop-agy-11111111-2222-4333-8444-555555555555",
+		"model":      "desktop-model",
+	}); err != nil || picked != "desktop-model" {
+		t.Fatalf("session.modes picked=%q err=%v", picked, err)
 	}
 }
 

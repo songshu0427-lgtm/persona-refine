@@ -38,6 +38,11 @@ describe("which sessions can switch model", () => {
     const cx = session({ agent: "codex", source_kind: "codex_app_server", capabilities: { send: true, model: true } as Session["capabilities"] });
     expect(canSwitchModel(cx)).toBe(true);
     expect(canSwitchModel(session({ agent: "codex", space_kind: "codex_app", capabilities: { send: true, model: true } as Session["capabilities"] }))).toBe(true);
+
+    const agyDesktop = session({ agent: "antigravity-desktop", source_kind: "runtime", capabilities: { send: true, model: true } as Session["capabilities"] });
+    expect(canSwitchModel(agyDesktop)).toBe(true);
+    expect(sessionLauncher(agyDesktop)).toBe("antigravity-desktop");
+    expect(modelBusy({ ...agyDesktop, status: "working" })).toBe("");
   });
 
   it("is busy while Claude works or waits on you, but Codex and plugin-backed Claude Desktop queue for the next step", () => {

@@ -79,6 +79,10 @@ function rpc(hub, method, body) {
 
 export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigravity'), socketPath, log, discover = findHub, call = rpc } = {}) {
   const watched = new Map()
+  const selectedModels = new Map() // cascadeId -> { id, stepIndex }
+  const stepModels = new Map() // cascadeId -> { stepIndex, native }
+  let catalog = []
+  let catalogFlight
 
   function raw(id) {
     if (typeof id !== 'string' || !id.startsWith(prefix) || !uuid.test(id.slice(prefix.length))) {
@@ -95,20 +99,81 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
     const result = await call(hub, 'GetAllCascadeTrajectories', {})
     return result.trajectorySummaries || {}
   }
-  async function control(id, method, fields) {
-    const cascadeId = raw(id)
+  async function connect() {
     const hub = await discover(dir)
     if (!hub) throw new Error('Antigravity Desktop is offline')
+    return hub
+  }
+  // The native UI's friendly modelId is Persona's selection id; the enum is what a send's planModel takes.
+  async function loadCatalog(hub, cascadeId, refresh = false) {
+    if (!refresh && catalog.length) return catalog
+    if (refresh) catalogFlight = undefined
+    if (!catalogFlight) {
+      catalogFlight = (async () => {
+        const data = await call(hub, 'GetCascadeModelConfigData', cascadeId ? { cascadeId } : {})
+        const defaultNative = data.defaultOverrideModelConfig?.modelOrAlias?.model
+        const seen = new Set()
+        const next = (data.clientModelConfigs || []).flatMap(entry => {
+          if (entry?.disabled) return []
+          const id = entry?.modelId, native = entry?.modelOrAlias?.model
+          if (typeof id !== 'string' || !id || typeof native !== 'string' || !native || seen.has(id)) return []
+          seen.add(id)
+          return [{ id, name: entry.label || id, native, description: entry.tagDescription || '',
+            default: Boolean(defaultNative && native === defaultNative) }]
+        })
+        catalog = next
+        return next
+      })().finally(() => { catalogFlight = undefined })
+    }
+    return catalogFlight
+  }
+  function lastInputIndex(summary) {
+    const index = Number(summary?.lastUserInputStepIndex)
+    return Number.isSafeInteger(index) && index >= 0 ? index : -1
+  }
+  async function currentModel(hub, cascadeId, summary) {
+    const index = lastInputIndex(summary)
+    const picked = selectedModels.get(cascadeId)
+    if (picked) {
+      if (index <= picked.stepIndex) return picked.id
+      selectedModels.delete(cascadeId)
+    }
+    if (index < 0) return ''
+    let cached = stepModels.get(cascadeId)
+    if (!cached || cached.stepIndex !== index) {
+      const tail = await call(hub, 'GetCascadeTrajectorySteps', { cascadeId, stepOffset: index })
+      const pc = tail.steps?.[0]?.userInput?.userConfig?.plannerConfig
+      cached = { stepIndex: index, native: pc?.requestedModel?.model || pc?.planModel || '' }
+      stepModels.set(cascadeId, cached)
+    }
+    if (!cached.native) return ''
+    const models = await loadCatalog(hub, cascadeId)
+    return models.find(model => model.native === cached.native)?.id || ''
+  }
+  async function control(id, method, fields) {
+    const cascadeId = raw(id)
+    const hub = await connect()
     const summary = (await summaries(hub))[cascadeId]
     if (!summary) throw new RpcError('Desktop session no longer listed', 'not_found')
     if (method === 'SendUserCascadeMessage') {
       // Without the desktop config, the server accepts the prompt but fails during execution.
-      const index = Number(summary.lastUserInputStepIndex ?? 0)
-      if (!Number.isSafeInteger(index) || index < 0) throw new Error('Send the first message in Antigravity Desktop')
+      const index = lastInputIndex(summary)
+      if (index < 0) throw new Error('Send the first message in Antigravity Desktop')
       const tail = await call(hub, 'GetCascadeTrajectorySteps', { cascadeId, stepOffset: index })
       const previous = tail.steps?.[0]?.userInput
       if (!previous?.userConfig?.plannerConfig) throw new Error('Send a message in Antigravity Desktop to initialize the session configuration')
-      fields.cascadeConfig = previous.userConfig
+      fields.cascadeConfig = structuredClone(previous.userConfig)
+      const picked = selectedModels.get(cascadeId)
+      if (picked && index <= picked.stepIndex) {
+        const models = await loadCatalog(hub, cascadeId)
+        const model = models.find(m => m.id === picked.id)
+        if (model) {
+          fields.cascadeConfig.plannerConfig.planModel = model.native
+          if (fields.cascadeConfig.plannerConfig.requestedModel) {
+            fields.cascadeConfig.plannerConfig.requestedModel = { model: model.native }
+          }
+        }
+      }
       if (previous.userAgentSpec) fields.customAgentSpec = previous.userAgentSpec
     }
     await call(hub, method, { cascadeId, ...fields })
@@ -118,15 +183,29 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
     async listSessions() {
       const hub = await discover(dir)
       if (!hub) return []
+      const allSummaries = await summaries(hub)
+      for (const id of stepModels.keys()) {
+        if (!Object.hasOwn(allSummaries, id)) stepModels.delete(id)
+      }
       const rows = []
-      for (const [key, value] of Object.entries(await summaries(hub))) {
+      const bySession = new Map()
+      for (const [key, value] of Object.entries(allSummaries)) {
         if (!uuid.test(key)) continue
         const cwd = workspacePathOf({ WorkspaceURIs: value.workspaces?.map(w => w.workspaceFolderAbsoluteUri) })
-        rows.push({ session_id: prefix + key, title: value.summary || label, cwd, agent_label: label,
+        const session_id = prefix + key
+        bySession.set(session_id, { key, value })
+        rows.push({ session_id, title: value.summary || label, cwd, agent_label: label,
           space_id: cwd, space_name: basename(cwd), updated_at: value.lastModifiedTime || value.createdTime,
+          launcher: 'antigravity-desktop', capabilities: { modes: false },
           rev: Number(value.stepCount) || 1, status: value.status === 'CASCADE_RUN_STATUS_RUNNING' ? 'working' : 'idle' })
       }
-      return rt.recent(rows, { days: 14, max: 80, pinned: row => row.status === 'working' })
+      const kept = rt.recent(rows, { days: 14, max: 80, pinned: row => row.status === 'working' })
+      await Promise.all(kept.map(async row => {
+        const meta = bySession.get(row.session_id)
+        const model = meta ? await currentModel(hub, meta.key, meta.value).catch(() => '') : ''
+        if (model) row.model = model
+      }))
+      return kept
     },
     items(params) {
       const { items, toSeq, history } = transcript(params.session_id)
@@ -163,6 +242,27 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
       })
     },
     interrupt: params => control(params.session_id, 'CancelCascadeInvocation', {}),
-  }, { runtime: 'antigravity-desktop', agent: 'antigravity-desktop', name: label, socketPath, log })
+    async models(params = {}) {
+      const hub = await connect()
+      const models = await loadCatalog(hub, undefined, Boolean(params.refresh))
+      return { agent: 'antigravity-desktop', models: models.map(({ native, ...model }) => model) }
+    },
+    async modes(params) {
+      const cascadeId = raw(params.session_id)
+      if (params.permission_mode && params.permission_mode !== 'default') {
+        throw new RpcError('Desktop permission modes are controlled by Antigravity', 'unsupported')
+      }
+      if (params.effort) throw new RpcError('Desktop thinking levels are part of the selected model', 'unsupported')
+      if (!params.model) return
+      const hub = await connect()
+      const summary = (await summaries(hub))[cascadeId]
+      if (!summary) throw new RpcError('Desktop session no longer listed', 'not_found')
+      const models = await loadCatalog(hub, cascadeId)
+      const model = models.find(model => model.id === params.model)
+      if (!model) throw new RpcError('Model unavailable', 'not_found')
+      selectedModels.set(cascadeId, { id: model.id, stepIndex: lastInputIndex(summary) })
+      rt.sessionsChanged()
+    },
+  }, { runtime: 'antigravity-desktop', agent: 'antigravity-desktop', name: label, modelSwitch: true, socketPath, log })
   return rt
 }

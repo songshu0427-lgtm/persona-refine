@@ -252,6 +252,16 @@ func (b *runtimeRegistry) byRuntime(rt string) *runtimeConn {
 	return best
 }
 
+// runtimeNamed is the connected runtime with this id, including a read/send runtime that cannot start sessions.
+func (b *runtimeRegistry) runtimeNamed(rt string) *runtimeConn {
+	if b == nil || rt == "" {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.byRuntime(rt)
+}
+
 // belongs is the runtime a session belongs to: the connection listing it, else the connected runtime that listed it
 // before; known: it belongs to a runtime (connected or not), with that runtime's name. A subagent of a runtime's
 // session ("<parent>@<child>", splitRuntimeChild) belongs to the parent's runtime, which answers for it.
