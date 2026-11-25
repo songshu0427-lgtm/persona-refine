@@ -1177,7 +1177,7 @@ func transcriptHasOpenHostStop(path string) bool {
 			if json.Unmarshal(line, &row) != nil || row.Type != "user" || row.IsSidechain || row.IsMeta {
 				continue
 			}
-			if row.Origin != nil && row.Origin.Kind != "" && row.Origin.Kind != "user" {
+			if row.Origin != nil && row.Origin.Kind != "" && row.Origin.Kind != "user" && row.Origin.Kind != "human" {
 				continue
 			}
 			switch classifyDirectHostUserRow(row.Message) {

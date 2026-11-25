@@ -1,10 +1,12 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -534,17 +536,29 @@ func peerSessionClass(n *Node, c claudeProc, id string) string {
 			path, newest = m, st
 		}
 	}
-	var m quickMeta
-	if newest != nil {
-		m = n.metaNow(path, newest)
+	var mode string
+	var modeAt time.Time
+	desktop := desktopEntrypoint(c.Entrypoint)
+	if desktop {
+		// Claude Desktop (--input-format stream-json) never invokes savePermissionMode, so resumed sessions keep
+		// re-appending stale timestamp-less `{"type":"permission-mode"}` footers on every flush even when running in
+		// another mode. Real "user" rows carry the session's live runtime permissionMode and their own timestamp.
+		if path != "" {
+			mode, modeAt = transcriptLatestUserPermissionMode(path)
+		}
+	} else if newest != nil {
+		m := n.metaNow(path, newest)
+		mode, modeAt = m.mode, m.modeAt
 	}
-	mode := m.mode
-	if c.pid > 0 && c.StartedAt > 0 && (mode == "" || (!m.modeAt.IsZero() && m.modeAt.UnixMilli() < c.StartedAt)) {
+	if c.pid > 0 && c.StartedAt > 0 && (mode == "" || (!modeAt.IsZero() && modeAt.UnixMilli() < c.StartedAt)) {
 		if args, err := processArgv(c.pid); err == nil {
 			if argMode := argsPermissionMode(args); argMode != "" {
 				mode = argMode
 			}
 		}
+	}
+	if mode == "" && desktop && newest != nil {
+		mode = n.metaNow(path, newest).mode
 	}
 	switch mode {
 	case "bypassPermissions":
@@ -557,6 +571,67 @@ func peerSessionClass(n *Node, c claudeProc, id string) string {
 		return peerModePrompting
 	}
 	return ""
+}
+
+// transcriptLatestUserPermissionMode scans backward from the tail of path for the latest non-sidechain "user" row that
+// records a non-empty permissionMode, returning the mode and the row's parsed timestamp (zero if absent).
+func transcriptLatestUserPermissionMode(path string) (string, time.Time) {
+	if path == "" {
+		return "", time.Time{}
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", time.Time{}
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return "", time.Time{}
+	}
+	const chunkSize int64 = 512 << 10
+	const scanMax int64 = 16 << 20
+	end := st.Size()
+	limit := max(int64(0), end-scanMax)
+	var carry []byte
+	for end > limit {
+		start := max(limit, end-chunkSize)
+		buf := make([]byte, end-start)
+		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+			return "", time.Time{}
+		}
+		if len(carry) > 0 {
+			buf = append(buf, carry...)
+			carry = nil
+		}
+		lines := bytes.Split(buf, []byte{'\n'})
+		firstIdx := 0
+		if start > limit {
+			carry = append([]byte(nil), lines[0]...)
+			firstIdx = 1
+		}
+		for i := len(lines) - 1; i >= firstIdx; i-- {
+			line := bytes.TrimSpace(lines[i])
+			if len(line) == 0 || !bytes.Contains(line, []byte(`"permissionMode"`)) || !bytes.Contains(line, []byte(`"user"`)) {
+				continue
+			}
+			var row struct {
+				Type           string `json:"type"`
+				IsSidechain    bool   `json:"isSidechain"`
+				PermissionMode string `json:"permissionMode"`
+				Timestamp      string `json:"timestamp"`
+			}
+			if json.Unmarshal(line, &row) != nil || row.Type != "user" || row.IsSidechain || row.PermissionMode == "" {
+				continue
+			}
+			var at time.Time
+			if row.Timestamp != "" {
+				at, _ = time.Parse(time.RFC3339Nano, row.Timestamp)
+			}
+			return row.PermissionMode, at
+		}
+		end = start
+	}
+	return "", time.Time{}
 }
 
 // computerWaitKey is where sendOutside leaves, for session.send's answer, that the session took the message while

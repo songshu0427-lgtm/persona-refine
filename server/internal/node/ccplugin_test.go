@@ -804,10 +804,80 @@ func TestCCPluginLegacyDroppedFallsBackOnlyOnOpenHostStop(t *testing.T) {
 		t.Fatalf("peer inbox turn should not clear transcriptHasOpenHostStop")
 	}
 
-	// Direct host user prompt clears open host stop detection.
+	// Direct host user prompt clears open host stop detection (including Claude Desktop's origin.kind = "human").
+	appendLines(t, p, `{"type":"user","uuid":"u-host-human","origin":{"kind":"human"},"message":{"role":"user","content":"direct from desktop"}}`)
+	if transcriptHasOpenHostStop(p) {
+		t.Fatalf("direct host user prompt with origin.kind=human should clear transcriptHasOpenHostStop")
+	}
+	appendLines(t, p, `{"type":"user","uuid":"u-stop-2","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`)
+	if !transcriptHasOpenHostStop(p) {
+		t.Fatalf("expected open host stop after second interrupt")
+	}
 	appendLines(t, p, `{"type":"user","uuid":"u-host","message":{"role":"user","content":"direct from desktop"}}`)
 	if transcriptHasOpenHostStop(p) {
 		t.Fatalf("direct host user prompt should clear transcriptHasOpenHostStop")
+	}
+}
+
+// Claude Desktop (--input-format stream-json) never updates savePermissionMode, so resumed sessions keep re-appending
+// stale timestamp-less `{"type":"permission-mode","permissionMode":"auto"}` footers even while running in
+// bypassPermissions. peerSessionClass must ignore those stale footers for desktop sessions, honor live user-row modes
+// (and newer process argv when no user turn landed since start), and keep honoring permission-mode lines for CLI TUI.
+func TestPeerSessionClassIgnoresStaleDesktopPermissionModeFooters(t *testing.T) {
+	n, _, home := herdrNode(t)
+	noPaneEnv(t)
+	t0 := time.Date(2026, 11, 24, 13, 31, 0, 0, time.UTC)
+	t1 := t0.Add(17 * time.Hour)
+
+	// 1. Desktop session running in bypassPermissions with stale repeated `permission-mode: auto` footers after user row.
+	writeTranscript(t, home, home, sidA, t1,
+		`{"type":"user","permissionMode":"bypassPermissions","origin":{"kind":"human"},"uuid":"u1","timestamp":"`+t1.Format(time.RFC3339)+`","cwd":"`+home+`","sessionId":"`+sidA+`","message":{"role":"user","content":"verify"}}`,
+		`{"type":"permission-mode","permissionMode":"auto","sessionId":"`+sidA+`"}`,
+		`{"type":"assistant","uuid":"a1","timestamp":"`+t1.Add(time.Second).Format(time.RFC3339)+`","sessionId":"`+sidA+`","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}`,
+		`{"type":"permission-mode","permissionMode":"auto","sessionId":"`+sidA+`"}`,
+		`{"type":"user","uuid":"u-int","timestamp":"`+t1.Add(2*time.Second).Format(time.RFC3339)+`","sessionId":"`+sidA+`","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`)
+
+	oldArgv := processArgv
+	processArgv = func(pid int) ([]string, error) {
+		return []string{"claude", "--resume", sidA, "--permission-mode=bypassPermissions"}, nil
+	}
+	t.Cleanup(func() { processArgv = oldArgv })
+
+	desktopProc := claudeProc{
+		pid:        os.Getpid(),
+		SessionID:  sidA,
+		StartedAt:  t0.UnixMilli(),
+		Entrypoint: "claude-desktop-3p",
+		dir:        filepath.Join(home, ".claude", "sessions"),
+	}
+	if got := peerSessionClass(n, desktopProc, sidA); got != peerModeBypass {
+		t.Fatalf("desktop with stale auto footer = %q, want %q", got, peerModeBypass)
+	}
+
+	// 2. CLI TUI session switching mode via `permission-mode` line still honors the footer.
+	cliProc := desktopProc
+	cliProc.Entrypoint = "cli"
+	if got := peerSessionClass(n, cliProc, sidA); got != peerModePrompting {
+		t.Fatalf("cli with permission-mode footer = %q, want %q", got, peerModePrompting)
+	}
+
+	// 3. Desktop started with --permission-mode=bypassPermissions, then switched to auto in UI (user row newer than StartedAt).
+	pB := writeTranscript(t, home, home, sidB, t1,
+		`{"type":"user","permissionMode":"auto","origin":{"kind":"human"},"uuid":"u1","timestamp":"`+t1.Format(time.RFC3339)+`","cwd":"`+home+`","sessionId":"`+sidB+`","message":{"role":"user","content":"switched in UI"}}`)
+	switchedProc := desktopProc
+	switchedProc.SessionID = sidB
+	if got := peerSessionClass(n, switchedProc, sidB); got != peerModePrompting {
+		t.Fatalf("desktop switched to auto after start = %q, want %q", got, peerModePrompting)
+	}
+
+	// 4. Desktop resumed in bypassPermissions after an older auto user row, even with a stale auto footer flushed after start.
+	resumedProc := switchedProc
+	resumedProc.StartedAt = t1.Add(5 * time.Minute).UnixMilli()
+	appendLines(t, pB,
+		`{"type":"assistant","uuid":"a2","timestamp":"`+t1.Add(6*time.Minute).Format(time.RFC3339)+`","sessionId":"`+sidB+`","message":{"role":"assistant","content":[{"type":"text","text":"resumed"}]}}`,
+		`{"type":"permission-mode","permissionMode":"auto","sessionId":"`+sidB+`"}`)
+	if got := peerSessionClass(n, resumedProc, sidB); got != peerModeBypass {
+		t.Fatalf("desktop resumed in bypass with stale auto footer = %q, want %q", got, peerModeBypass)
 	}
 }
 
