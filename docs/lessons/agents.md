@@ -1221,6 +1221,16 @@ Apply that native activity before internal-metadata filtering and history limits
 before a brain directory or transcript is exported. Read titles, workspaces and update times from the native summary when
 the legacy JSON cache is incomplete. Cover these cases through the runtime inventory protocol.
 
+## Antigravity Desktop images use different send and history formats
+
+Desktop's native `SendUserCascadeMessage` takes `media[{mimeType, inlineData}]` (base64 JSON for protobuf bytes), not
+ACP image blocks or the deprecated native `images` field. Preserve the effective planner configuration when sending.
+Native `USER_INPUT` exports instead contain `media[{mime_type, uri}]`, with files under the cascade's `.user_uploaded`
+directory. Resolve them lazily from disk, without an upload cache or inline history bytes, and keep image-only user turns.
+Restrict reads to that cascade, reject symlink escapes, bound file reads, and sniff the bytes: native exports can label
+JPEG files as PNG, even with a `.png` extension. Change the history token when adding these formerly omitted items.
+Use fake RPC and synthetic files for send, reload, streaming and path-boundary tests; never probe a live conversation by sending.
+
 ## Antigravity model directories and ACP acknowledgements (#3716)
 
 Native model availability changes independently of Persona releases. Discover the authenticated CLI catalog and use its

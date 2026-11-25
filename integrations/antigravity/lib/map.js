@@ -149,7 +149,7 @@ export function cleanGenericOutput(content) {
 /**
  * Parse a transcript.jsonl file (or array of parsed step objects) into Persona items.
  * @param {object[]} steps
- * @param {{ brainDir?: string, full?: boolean }} [opts]
+ * @param {{ brainDir?: string, full?: boolean, userImage?: (media: object) => object | undefined }} [opts]
  */
 export function stepsToItems(steps, opts = {}) {
   const items = []
@@ -177,10 +177,17 @@ export function stepsToItems(steps, opts = {}) {
         turnError = undefined
         afterWork = false
         const text = cleanUserText(step.content)
-        if (!text) break
         const msgId = (typeof step.client_msg_id === 'string' && step.client_msg_id) || opts.clientMsgIdFor?.(idx, text)
-        const item = { id: `${line}#0`, seq, role: 'user', kind: 'text', text, ts, ...(msgId ? { client_msg_id: msgId } : {}) }
-        items.push(opts.full ? item : light(item))
+        const common = { seq, role: 'user', ts, ...(msgId ? { client_msg_id: msgId } : {}) }
+        if (text) {
+          const item = { ...common, id: `${line}#0`, kind: 'text', text }
+          items.push(opts.full ? item : light(item))
+        }
+        // Only runtimes with a matching session.image reader opt into lazy user attachments.
+        for (const [i, media] of (Array.isArray(step.media) ? step.media : []).entries()) {
+          const image = opts.userImage?.(media)
+          if (image) items.push({ ...common, id: `${line}#${i + 1}`, kind: 'image', image })
+        }
         break
       }
       case 'PLANNER_RESPONSE': {

@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startFakeNode } from '../../runtime-sdk/testing/fake-node.js'
 import { createDesktopRuntime } from '../lib/desktop.js'
+import { installAntigravityPackage } from '../install.mjs'
 
 test('desktop attaches to existing sessions, follows transcripts, and routes only their controls', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-'))
@@ -61,8 +62,8 @@ test('desktop attaches to existing sessions, follows transcripts, and routes onl
     { method: 'SendUserCascadeMessage', params: { cascadeId: key, items: [{ text: 'next' }], cascadeConfig, customAgentSpec, clientMessageId: 'one' } },
     { method: 'CancelCascadeInvocation', params: { cascadeId: key } },
   ])
-  await assert.rejects(node.peer.call('session.send', { session_id, text: ' ' }), { code: 'unsupported' })
-  await assert.rejects(node.peer.call('session.send', { session_id, text: 'image', images: [{}] }), { code: 'unsupported' })
+  await assert.rejects(node.peer.call('session.send', { session_id, text: ' ' }), { code: 'bad_request' })
+  await assert.rejects(node.peer.call('session.send', { session_id, text: 'image', images: [{}] }), { code: 'bad_request' })
   configured = false
   await assert.rejects(node.peer.call('session.send', { session_id, text: 'not initialized' }), /initialize the session configuration/)
   listed = false
@@ -71,6 +72,8 @@ test('desktop attaches to existing sessions, follows transcripts, and routes onl
   await assert.rejects(node.peer.call('session.send', { session_id, text: 'offline' }), /offline/)
   assert.equal(calls.length, 2, 'rejected requests never mutate the native session')
 })
+
+const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='
 
 test('desktop lists native models and applies a selection only to the next send', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-models-'))
@@ -83,8 +86,9 @@ test('desktop lists native models and applies a selection only to the next send'
   let stepReads = 0
   let stepIndex = 4
   let currentNative = 'MODEL_PLACEHOLDER_M532'
+  let failNextSend = false
   const previous = {
-    plannerConfig: { planModel: 'MODEL_PLACEHOLDER_M532', nested: { preserved: true } },
+    plannerConfig: { planModel: 'MODEL_PLACEHOLDER_M532', requestedModel: { model: 'MODEL_PLACEHOLDER_M532' }, nested: { preserved: true } },
     executorConfig: { useCoreDirect: true },
     conversationHistoryConfig: { preserved: true },
   }
@@ -104,13 +108,17 @@ test('desktop lists native models and applies a selection only to the next send'
         return {
           defaultOverrideModelConfig: { modelOrAlias: { model: 'MODEL_PLACEHOLDER_M532' } },
           clientModelConfigs: [
-            { modelId: 'neon-high', label: 'Neon (High)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M532' } },
-            { modelId: 'neon-xhigh', label: 'Neon (XHigh)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M535' } },
+            { modelId: 'neon-high', label: 'Neon (High)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M532' }, supportsImages: false },
+            { modelId: 'neon-xhigh', label: 'Neon (XHigh)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M535' }, supportsImages: true,
+              supportedMimeTypes: { 'image/png': true } },
             { modelId: 'retired', label: 'Retired', disabled: true, modelOrAlias: { model: 'MODEL_RETIRED' } },
           ],
         }
       }
-      if (method === 'SendUserCascadeMessage') sends.push(params)
+      if (method === 'SendUserCascadeMessage') {
+        if (failNextSend) { failNextSend = false; throw new Error('fake native refusal') }
+        sends.push(params)
+      }
       return {}
     } })
   t.after(() => runtime.stop())
@@ -132,22 +140,40 @@ test('desktop lists native models and applies a selection only to the next send'
     { id: 'neon-high', name: 'Neon (High)', description: '', default: true },
     { id: 'neon-xhigh', name: 'Neon (XHigh)', description: '', default: false },
   ] })
+  const images = [{ mime: 'image/png', data: png }]
+  await assert.rejects(node.peer.call('session.send', { session_id, text: 'look', images }), { code: 'unsupported' })
+  assert.equal(sends.length, 0, 'a non-vision model refuses the whole message')
   await node.peer.call('session.modes', { session_id, model: 'neon-xhigh' })
   assert.equal(sends.length, 0, 'selecting a model does not send a prompt')
   await until(() => node.last('runtime.sessions')?.sessions?.[0]?.model === 'neon-xhigh')
   await assert.rejects(node.peer.call('session.modes', { session_id, model: 'missing' }), /Model unavailable/)
   await assert.rejects(node.peer.call('session.modes', { session_id, effort: 'high' }), /thinking levels/)
   await assert.rejects(node.peer.call('session.modes', { session_id, permission_mode: 'plan' }), /permission modes/)
-  await node.peer.call('session.send', { session_id, text: 'next', client_msg_id: 'one' })
+  const imageMessage = { session_id, text: 'next', context: 'context', images, client_msg_id: 'one' }
+  await node.peer.call('session.send', imageMessage)
+  await node.peer.call('session.send', imageMessage)
   assert.equal(sends.length, 1)
+  assert.deepEqual(sends[0].items, [{ text: 'context\n\nnext' }])
+  assert.deepEqual(sends[0].media, [{ mimeType: 'image/png', inlineData: png }])
+  assert.equal(sends[0].images, undefined, 'do not send the deprecated native field')
+  assert.equal(sends[0].clientMessageId, 'one')
   assert.equal(sends[0].cascadeConfig.plannerConfig.planModel, 'MODEL_PLACEHOLDER_M535')
   assert.deepEqual(sends[0].cascadeConfig, {
-    plannerConfig: { planModel: 'MODEL_PLACEHOLDER_M535', nested: { preserved: true } },
+    plannerConfig: { planModel: 'MODEL_PLACEHOLDER_M535', requestedModel: { model: 'MODEL_PLACEHOLDER_M535' }, nested: { preserved: true } },
     executorConfig: { useCoreDirect: true },
     conversationHistoryConfig: { preserved: true },
   })
   assert.equal(previous.plannerConfig.planModel, 'MODEL_PLACEHOLDER_M532', 'the cached native config is not mutated')
   assert.deepEqual(sends[0].customAgentSpec, { builtinAgent: true })
+  const imageOnly = { session_id, images, client_msg_id: 'image-only' }
+  failNextSend = true
+  await assert.rejects(node.peer.call('session.send', imageOnly), /fake native refusal/)
+  await node.peer.call('session.send', imageOnly)
+  await node.peer.call('session.send', imageOnly)
+  assert.equal(sends.length, 2, 'a refused send is retryable; an accepted send is deduplicated')
+  assert.deepEqual(sends[1].items, [])
+  assert.deepEqual(sends[1].media, sends[0].media)
+  assert.deepEqual(sends[1].cascadeConfig, sends[0].cascadeConfig)
 
   // If the user later switches the model in Antigravity Desktop and sends a new message there, Persona follows it.
   stepIndex = 6
@@ -155,14 +181,17 @@ test('desktop lists native models and applies a selection only to the next send'
   runtime.sessionsChanged()
   await until(() => node.last('runtime.sessions')?.sessions?.[0]?.model === 'neon-high')
   await node.peer.call('session.send', { session_id, text: 'after native switch', client_msg_id: 'two' })
-  assert.equal(sends[1].cascadeConfig.plannerConfig.planModel, 'MODEL_PLACEHOLDER_M532')
+  assert.equal(sends.at(-1).cascadeConfig.plannerConfig.planModel, 'MODEL_PLACEHOLDER_M532')
+  await assert.rejects(node.peer.call('session.send', { session_id, images }), { code: 'unsupported' })
+  assert.equal(sends.length, 3, 'image validation follows the new native model, not the old Persona selection')
 })
 
 test('supervised desktop entrypoint exits on parent EOF without the App', { timeout: 10000 }, async t => {
   const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-eof-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const node = await startFakeNode(t)
-  const child = spawn(process.execPath, [new URL('../desktop.mjs', import.meta.url).pathname,
+  const { current } = installAntigravityPackage({ socketPath: node.path })
+  const child = spawn(process.execPath, [join(current, 'antigravity', 'desktop.mjs'),
     '--desktop-dir', dir, '--socket', node.path, '--parent-stdin'], { stdio: ['pipe', 'ignore', 'pipe'] })
   t.after(() => { if (child.exitCode === null) child.kill() })
   let errors = ''

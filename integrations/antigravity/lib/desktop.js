@@ -8,6 +8,7 @@ import { promisify } from 'node:util'
 import { createRuntime, page, RpcError } from '../../runtime-sdk/index.js'
 import { createSubagentCaches, selectDesktopSessions } from './desktop-subagents.js'
 import { readTranscript, stepsToItems, workspacePathOf } from './map.js'
+import { checkModelMedia, inputMedia, mediaError, readUserImage, userImage } from './desktop-media.js'
 
 const exec = promisify(execFile)
 const prefix = 'desktop-agy-'
@@ -95,7 +96,8 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
   function transcript(id, full = false) {
     const brainDir = join(dir, 'brain', raw(id))
     const { steps, branch, revision } = readTranscript(brainDir, true)
-    return { ...stepsToItems(steps, { brainDir, full }), history: [id, 'no-tool-media', branch, revision].join(':') }
+    return { ...stepsToItems(steps, { brainDir, full, userImage: media => userImage(media, brainDir) }),
+      history: [id, 'user-media-v1', branch, revision].join(':') }
   }
   async function summaries(hub) {
     const result = await call(hub, 'GetAllCascadeTrajectories', {})
@@ -121,6 +123,7 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
           if (typeof id !== 'string' || !id || typeof native !== 'string' || !native || seen.has(id)) return []
           seen.add(id)
           return [{ id, name: entry.label || id, native, description: entry.tagDescription || '',
+            supportsImages: entry.supportsImages, supportedMimeTypes: entry.supportedMimeTypes,
             default: Boolean(defaultNative && native === defaultNative) }]
         })
         catalog = next
@@ -176,6 +179,11 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
           }
         }
       }
+      if (fields.media?.length) {
+        const planner = fields.cascadeConfig.plannerConfig
+        const models = await loadCatalog(hub, cascadeId)
+        checkModelMedia(models.find(model => model.native === (planner.requestedModel?.model || planner.planModel)), fields.media)
+      }
       if (previous.userAgentSpec) fields.customAgentSpec = previous.userAgentSpec
     }
     await call(hub, method, { cascadeId, ...fields })
@@ -220,6 +228,16 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
       if (!item) throw new RpcError('Unknown desktop transcript item', 'not_found')
       return item
     },
+    async image(params) {
+      const brainDir = join(dir, 'brain', raw(params.session_id))
+      const { steps } = readTranscript(brainDir, true)
+      const item = stepsToItems(steps, { userImage: media => userImage(media, brainDir) }).items
+        .find(it => it.id === params.item_id && it.kind === 'image')
+      if (!item) throw mediaError('missing', 'not_found')
+      const step = steps.find((step, i) => (typeof step.step_index === 'number' ? step.step_index : i) + 1 === item.seq)
+      const index = Number(item.id.slice(item.id.lastIndexOf('#') + 1)) - 1
+      return readUserImage(step?.media?.[index], brainDir)
+    },
     watchChanged(id, on, options) {
       clearInterval(watched.get(id))
       watched.delete(id)
@@ -239,17 +257,19 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
     },
     async send(params) {
       raw(params.session_id)
-      if (params.images?.length || !params.text?.trim()) throw new RpcError('Desktop sessions accept text prompts', 'unsupported')
+      const media = inputMedia(params.images)
+      if (!params.text?.trim() && !media.length) throw mediaError('empty')
       const text = [params.context, params.text].filter(Boolean).join('\n\n')
       await control(params.session_id, 'SendUserCascadeMessage', {
-        items: [{ text }], ...(params.client_msg_id && { clientMessageId: params.client_msg_id }),
+        items: text.trim() ? [{ text }] : [], ...(media.length && { media }),
+        ...(params.client_msg_id && { clientMessageId: params.client_msg_id }),
       })
     },
     interrupt: params => control(params.session_id, 'CancelCascadeInvocation', {}),
     async models(params = {}) {
       const hub = await connect()
       const models = await loadCatalog(hub, undefined, Boolean(params.refresh))
-      return { agent: 'antigravity-desktop', models: models.map(({ native, ...model }) => model) }
+      return { agent: 'antigravity-desktop', models: models.map(({ native, supportsImages, supportedMimeTypes, ...model }) => model) }
     },
     async modes(params) {
       const cascadeId = raw(params.session_id)
