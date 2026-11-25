@@ -481,3 +481,59 @@ func TestEchoForgetsASendThatFailed(t *testing.T) {
 		t.Fatal("a send that went out is not expected")
 	}
 }
+
+// An earlier send that ended with delivered="unknown" (e.g. peer_unconfirmed) must not steal the echo line of a later
+// confirmed send carrying identical text; yet if the earlier uncertain send really landed on its own, it still matches.
+func TestEchoConfirmedSendNotStolenByEarlierUncertainSend(t *testing.T) {
+	const prompt = "请先完整阅读 TOP1000_EVOLUTION_RUNBOOK.md 并按步骤推进"
+	now := time.Now()
+	tOld := now.Add(-50 * time.Minute)
+	tNew := now.Add(-2 * time.Second)
+
+	// 1. Uncertain older send + confirmed newer send with same text -> single new line ties to confirmed send.
+	var log echoLog
+	log.expect(echoRecord{SessionID: sidA, ClientMsgID: "m-old", Text: prompt, SentAt: tOld, AfterSeq: 10, In: echoInTranscript, Uncertain: true})
+	log.expect(echoRecord{SessionID: sidA, ClientMsgID: "m-new", Text: prompt, SentAt: tNew, AfterSeq: 10, In: echoInTranscript})
+	found := log.match(sidA, echoInTranscript, []proto.Item{
+		{ID: "line-1", Seq: 11, Role: "user", Kind: proto.KindText, Text: prompt, TS: tNew.Add(100 * time.Millisecond)},
+	})
+	if len(found) != 1 || found[0].ClientMsgID != "m-new" || found[0].Line != "line-1" {
+		t.Fatalf("matched %+v, want m-new on line-1", found)
+	}
+
+	// 2. sendEchoed marks maybeDelivered errors uncertain automatically.
+	n := &Node{}
+	if err := n.sendEchoed(sidA, "m-uncertain", prompt, 0, echoAfter{seq: 10, in: echoInTranscript}, func() error { return unconfirmed() }); !maybeDelivered(err) {
+		t.Fatalf("expected maybeDelivered error, got %v", err)
+	}
+	if rec, ok := n.echoes.record(sidA, "m-uncertain"); !ok || !rec.Uncertain {
+		t.Fatalf("record = %+v (ok=%v), want Uncertain=true", rec, ok)
+	}
+
+	// 3. When the earlier uncertain send actually landed before the later confirmed send, both bind to their own lines.
+	var log2 echoLog
+	log2.expect(echoRecord{SessionID: sidA, ClientMsgID: "m-old", Text: prompt, SentAt: tOld, AfterSeq: 10, In: echoInTranscript, Uncertain: true})
+	log2.expect(echoRecord{SessionID: sidA, ClientMsgID: "m-new", Text: prompt, SentAt: tNew, AfterSeq: 10, In: echoInTranscript})
+	found2 := log2.match(sidA, echoInTranscript, []proto.Item{
+		{ID: "line-old", Seq: 11, Role: "user", Kind: proto.KindText, Text: prompt, TS: tOld.Add(2 * time.Minute)},
+		{ID: "line-new", Seq: 12, Role: "user", Kind: proto.KindText, Text: prompt, TS: tNew.Add(100 * time.Millisecond)},
+	})
+	gotByID := map[string]string{}
+	for _, r := range found2 {
+		gotByID[r.ClientMsgID] = r.Line
+	}
+	if gotByID["m-old"] != "line-old" || gotByID["m-new"] != "line-new" {
+		t.Fatalf("got %v, want m-old->line-old and m-new->line-new", gotByID)
+	}
+
+	// 4. Two uncertain sends with same text -> late echo binds to the newest retry, not the older dead attempt.
+	var log3 echoLog
+	log3.expect(echoRecord{SessionID: sidA, ClientMsgID: "m-u1", Text: prompt, SentAt: tOld, AfterSeq: 10, In: echoInTranscript, Uncertain: true})
+	log3.expect(echoRecord{SessionID: sidA, ClientMsgID: "m-u2", Text: prompt, SentAt: tNew, AfterSeq: 10, In: echoInTranscript, Uncertain: true})
+	found3 := log3.match(sidA, echoInTranscript, []proto.Item{
+		{ID: "line-late", Seq: 11, Role: "user", Kind: proto.KindText, Text: prompt, TS: tNew.Add(8 * time.Second)},
+	})
+	if len(found3) != 1 || found3[0].ClientMsgID != "m-u2" || found3[0].Line != "line-late" {
+		t.Fatalf("matched %+v, want m-u2 on line-late", found3)
+	}
+}

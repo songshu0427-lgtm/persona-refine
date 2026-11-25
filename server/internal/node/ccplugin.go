@@ -1166,15 +1166,16 @@ func transcriptHasOpenHostStop(path string) bool {
 				continue
 			}
 			var row struct {
-				Type        string `json:"type"`
-				IsSidechain bool   `json:"isSidechain"`
-				IsMeta      bool   `json:"isMeta"`
-				Origin      *struct {
+				Type             string `json:"type"`
+				IsSidechain      bool   `json:"isSidechain"`
+				IsMeta           bool   `json:"isMeta"`
+				IsCompactSummary bool   `json:"isCompactSummary"`
+				Origin           *struct {
 					Kind string `json:"kind"`
 				} `json:"origin"`
 				Message json.RawMessage `json:"message"`
 			}
-			if json.Unmarshal(line, &row) != nil || row.Type != "user" || row.IsSidechain || row.IsMeta {
+			if json.Unmarshal(line, &row) != nil || row.Type != "user" || row.IsSidechain || row.IsMeta || row.IsCompactSummary {
 				continue
 			}
 			if row.Origin != nil && row.Origin.Kind != "" && row.Origin.Kind != "user" && row.Origin.Kind != "human" {
@@ -1215,7 +1216,8 @@ func classifyDirectHostUserRow(raw json.RawMessage) int {
 			strings.HasPrefix(t, "<local-command-caveat>") ||
 			strings.HasPrefix(t, "<command-name>") ||
 			strings.HasPrefix(t, "<local-command-stdout>") ||
-			strings.HasPrefix(t, "<task-notification>")
+			strings.HasPrefix(t, "<task-notification>") ||
+			strings.HasPrefix(t, "This session is being continued from a previous conversation")
 	}
 	if trimmed[0] == '"' {
 		var s string

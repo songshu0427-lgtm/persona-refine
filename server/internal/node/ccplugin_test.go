@@ -799,9 +799,16 @@ func TestCCPluginLegacyDroppedFallsBackOnlyOnOpenHostStop(t *testing.T) {
 		t.Fatalf("expected 1 peer inbox message, got %d", len(inbox.users()))
 	}
 
-	// Peer turn appended on top of interrupt: host stop latch is still open until a direct host prompt lands.
+	// Peer turn and auto-compaction summary appended on top of interrupt: host stop latch is still open until a direct host prompt lands.
 	if !transcriptHasOpenHostStop(p) {
 		t.Fatalf("peer inbox turn should not clear transcriptHasOpenHostStop")
+	}
+	appendLines(t, p,
+		`{"type":"system","subtype":"compact_boundary","uuid":"cb-1","sessionId":"`+sidA+`"}`,
+		`{"type":"user","isCompactSummary":true,"uuid":"u-compact","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}`,
+		`{"type":"user","uuid":"u-compact-legacy","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context."}}`)
+	if !transcriptHasOpenHostStop(p) {
+		t.Fatalf("auto-compaction summary should not clear transcriptHasOpenHostStop")
 	}
 
 	// Direct host user prompt clears open host stop detection (including Claude Desktop's origin.kind = "human").

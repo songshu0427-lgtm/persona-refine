@@ -48,6 +48,10 @@ type echoRecord struct {
 	// first message) or handed back by a hub from before #8358 has none: it is looked for and tagged wherever the
 	// items come from, as before, and counts where it is found from then on.
 	In string `json:"in,omitempty"`
+	// Uncertain marks a send that ended with delivered="unknown" (e.g. peer_unconfirmed / peer_held): it stays
+	// matchable in case the session accepts it later, but confirmed sends claim matching transcript lines first so
+	// an abandoned uncertain attempt cannot steal a later retry's echo.
+	Uncertain bool `json:"uncertain,omitempty"`
 	// scanned: lines through this seq were looked at for it and did not fit (a line stays as it was parsed).
 	scanned int
 }
@@ -163,6 +167,18 @@ func (l *echoLog) forget(id, clientMsgID string) {
 	l.recs[id] = slices.DeleteFunc(l.recs[id], func(r *echoRecord) bool { return r.ClientMsgID == clientMsgID })
 }
 
+// markUncertain marks a record whose send ended with delivered="unknown" so confirmed sends claim echoes before it.
+func (l *echoLog) markUncertain(id, clientMsgID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range l.recs[id] {
+		if r.ClientMsgID == clientMsgID {
+			r.Uncertain = true
+			return
+		}
+	}
+}
+
 // prepareDispatched refreshes SentAt when a node-held message is finally handed to the session, and ties batched
 // Send-now messages so every client_msg_id resolves when the combined user line lands in the transcript.
 func (l *echoLog) prepareDispatched(id string, clientMsgIDs []string, joined string) {
@@ -255,9 +271,9 @@ func (l *echoLog) match(id, in string, items []proto.Item) []echoRecord {
 	if len(items) > 0 {
 		last = items[len(items)-1].Seq
 	}
-	for _, r := range recs {
+	matchOne := func(r *echoRecord) {
 		if r.Line != "" || time.Since(r.matchAt()) > echoWithin {
-			continue
+			return
 		}
 		for _, ln := range lines {
 			if taken[ln.key] || ln.seq <= r.AfterSeq || ln.seq <= r.scanned || slices.Contains(r.Before, ln.key) {
@@ -288,6 +304,19 @@ func (l *echoLog) match(id, in string, items []proto.Item) []echoRecord {
 			// Looked at all of these: only later lines can be its copy. A later record may still take one of them
 			// (they are claimed in the order sent), so this only moves its own start.
 			r.scanned = max(r.scanned, last)
+		}
+	}
+	// Pass 1: confirmed and in-flight sends in chronological order so queued sends keep strict FIFO matching and
+	// cannot have their echo stolen by an earlier unconfirmed/held attempt with identical text.
+	for _, r := range recs {
+		if !r.Uncertain {
+			matchOne(r)
+		}
+	}
+	// Pass 2: uncertain sends, newest first, so a late approval or retry binds to the most recent attempt.
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].Uncertain {
+			matchOne(recs[i])
 		}
 	}
 	return found
@@ -543,6 +572,9 @@ func (n *Node) sendEchoed(id, clientMsgID, text string, images int, after echoAf
 		return err
 	}
 	if err == nil || maybeDelivered(err) {
+		if err != nil {
+			n.echoes.markUncertain(id, clientMsgID)
+		}
 		if cur, ok := n.echoes.record(id, clientMsgID); ok {
 			n.notifyEcho(cur) // found already (a push ran meanwhile): the hub hears the line too
 		}
