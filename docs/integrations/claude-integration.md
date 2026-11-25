@@ -720,8 +720,15 @@ installs and updates it.
   while a turn runs (`$.prompt.submit` writes `queue-operation: enqueue` immediately, without blocking the poll loop or
   being held for computer approval in `bypassPermissions` / `auto` mode, and `session.send` reports `queued: true` while
   busy); a session waiting on an `AskUserQuestion` still takes the peer inbox at priority `now` so the question ends
-  instead of blocking the queue. Older plugins without `busy_input` receive owner messages only at rest and fall back to
-  the inbox while busy (`relay_reason: "busy"`).
+  instead of blocking the queue. When the user stopped the session on the computer (Claude Desktop Stop / terminal Esc),
+  Claude Code latches plugin submissions (`submitted.drop`: `"the session was stopped and nobody has sent input since"`)
+  until direct host input arrives. In 0.4.2+ the plugin reports `reason: "stopped"` with `detail` (and for running 0.4.1
+  plugins, the node verifies an open host `[Request interrupted by user]` in the transcript): **only** for this host Stop
+  latch does the node fall back to the attested peer inbox (`delivered_as: "relayed"`, `relay_reason: "plugin_refused"`),
+  while continuing to try the plugin first on every subsequent send so normal plugin delivery resumes automatically as soon
+  as direct host input clears the latch. Hook refusals (`reason: "dropped"` with non-stop detail) never fall back to the
+  peer inbox. Older plugins without `busy_input` receive owner messages only at rest and fall back to the inbox while
+  busy (`relay_reason: "busy"`).
 - **Owner Stop, session settings, remote permissions, and desktop host confirmations**: when the plugin advertises
   `interrupt` (0.3.0+), an owner-attested `session.interrupt` cancels the running main-loop turn via
   `$.turn.abort({ turnId })` (falling back to the peer inbox when no plugin turn is active or for non-owner interrupts),

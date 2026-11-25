@@ -86,6 +86,7 @@ const (
 	relayBusy        = "busy"               // the session works or waits on a dialog: the inbox queues the message there
 	relayUnavailable = "plugin_unavailable" // the plugin did not take it in time
 	relayRefused     = "plugin_refused"     // the plugin took it and did not submit it
+	relayStopped     = "plugin_stopped"     // internal: Claude Code's host Stop latch dropped the plugin prompt
 	relayUnconfirmed = "plugin_unconfirmed" // taken, and nothing showed it went in before its deadline
 )
 
@@ -125,6 +126,7 @@ type ccPluginDelivery struct {
 type ccPluginAck struct {
 	Submitted bool
 	Reason    string
+	Detail    string
 }
 
 type ccPluginCaps struct {
@@ -566,6 +568,7 @@ func (n *Node) ccPluginRequest(ctx context.Context, c net.Conn, method, path str
 		ID            string   `json:"id"`
 		Submitted     bool     `json:"submitted"`
 		Reason        string   `json:"reason"`
+		Detail        string   `json:"detail"`
 	}
 	if json.Unmarshal(body, &in) != nil || !validID(in.SessionID) {
 		return http.StatusBadRequest, map[string]any{"error": "invalid"}
@@ -580,7 +583,11 @@ func (n *Node) ccPluginRequest(ctx context.Context, c net.Conn, method, path str
 		return http.StatusForbidden, map[string]any{"error": "not_this_session", "retry_ms": ccPluginStrangerRetry.Milliseconds()}
 	}
 	if what == "ack" {
-		n.ccPlugins.acked(in.SessionID, pid, in.ID, ccPluginAck{Submitted: in.Submitted, Reason: clipReason(in.Reason)})
+		n.ccPlugins.acked(in.SessionID, pid, in.ID, ccPluginAck{
+			Submitted: in.Submitted,
+			Reason:    clipReason(in.Reason),
+			Detail:    clipDetail(in.Detail),
+		})
 		return http.StatusOK, map[string]any{"ok": true}
 	}
 	if !ccPluginServes(n, claude) {
@@ -628,6 +635,15 @@ func (n *Node) ccPluginRequest(ctx context.Context, c net.Conn, method, path str
 func clipReason(s string) string {
 	if len(s) > 64 {
 		return s[:64]
+	}
+	return s
+}
+
+// clipDetail bounds an optional diagnostic string from the plugin (e.g. PromptSubmitResult.drop).
+func clipDetail(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r", " "), "\n", " "))
+	if len(s) > 200 {
+		return s[:200]
 	}
 	return s
 }
@@ -836,7 +852,14 @@ func (n *Node) ccPluginSend(ctx context.Context, c claudeProc, id, text string) 
 		select {
 		case a := <-acks:
 			if !a.Submitted {
-				log.Printf("send %s: the plugin did not submit it (%s)", id, a.Reason)
+				if a.Detail != "" {
+					log.Printf("send %s: the plugin did not submit it (%s: %s)", id, a.Reason, a.Detail)
+				} else {
+					log.Printf("send %s: the plugin did not submit it (%s)", id, a.Reason)
+				}
+				if n.isPluginStopLatchDrop(path, a) {
+					return false, relayStopped
+				}
 				return false, relayRefused
 			}
 			submitted = true
@@ -890,6 +913,9 @@ func (n *Node) ccPluginAbortAndSend(ctx context.Context, c claudeProc, id string
 		cIdle.Status = "idle"
 		ok, why := n.ccPluginSend(ctx, cIdle, id, *text)
 		if !ok {
+			if why == relayStopped && n.peerFallbackOwnerSend(ctx, cIdle, id, *text, offset) {
+				return true, nil
+			}
 			return why != relayUnavailable && why != relayNoPlugin, uncertain(fmt.Errorf("Persona 插件未能提交这条消息（%s），请稍后重试", why))
 		}
 		return true, nil
@@ -932,6 +958,10 @@ func (n *Node) ccPluginAbortAndSend(ctx context.Context, c claudeProc, id string
 		case <-intAcks:
 		case a := <-msgAcks:
 			if !a.Submitted {
+				if n.isPluginStopLatchDrop(path, a) && n.peerFallbackOwnerSend(ctx, c, id, *text, offset) {
+					n.ccPlugins.clearAborted(id, c.pid)
+					return true, nil
+				}
 				return true, uncertain(fmt.Errorf("Persona 插件未能提交排队消息（%s）", a.Reason))
 			}
 			submitted = true
@@ -1066,5 +1096,197 @@ func ccPluginLineSeen(l []byte, needle string) bool {
 		_ = json.Unmarshal(e.Message.Content, &said)
 		return strings.Contains(said, needle)
 	}
+	return false
+}
+
+// isPluginStopLatchDrop reports whether a non-submitted plugin ack represents Claude Code's host Stop latch
+// ("the session was stopped and nobody has sent input since"), where plugin prompts are dropped until the host
+// receives direct input. Only this case may fall back to the peer inbox; hook refusals never fall back.
+func (n *Node) isPluginStopLatchDrop(transcriptPath string, a ccPluginAck) bool {
+	if a.Reason == "stopped" {
+		return true
+	}
+	if a.Reason != "dropped" {
+		return false
+	}
+	if a.Detail != "" {
+		return isStopLatchDropText(a.Detail)
+	}
+	// Legacy <= 0.4.1 plugin acks omit `detail`: fall back only when the session's transcript confirms an open
+	// host-side `[Request interrupted by user]` with no direct host prompt since.
+	return transcriptHasOpenHostStop(transcriptPath)
+}
+
+func isStopLatchDropText(s string) bool {
+	low := strings.ToLower(s)
+	return strings.Contains(low, "session was stopped") && strings.Contains(low, "sent input since")
+}
+
+// transcriptHasOpenHostStop scans backward from the tail of path for the latest direct host user row (ignoring tool
+// results, local commands, peer inbox turns, and plugin turns) and returns true when it is Claude Code's user-interrupt
+// marker. Peer inbox turns do not clear Claude Code's host Stop latch, so skipping peer/plugin origins preserves
+// detection across consecutive fallback sends until a direct host prompt lands.
+func transcriptHasOpenHostStop(path string) bool {
+	if path == "" {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return false
+	}
+	const chunkSize int64 = 512 << 10
+	const scanMax int64 = 16 << 20
+	end := st.Size()
+	limit := max(int64(0), end-scanMax)
+	var carry []byte
+	for end > limit {
+		start := max(limit, end-chunkSize)
+		buf := make([]byte, end-start)
+		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+			return false
+		}
+		if len(carry) > 0 {
+			buf = append(buf, carry...)
+			carry = nil
+		}
+		lines := bytes.Split(buf, []byte{'\n'})
+		firstIdx := 0
+		if start > limit {
+			carry = append([]byte(nil), lines[0]...)
+			firstIdx = 1
+		}
+		for i := len(lines) - 1; i >= firstIdx; i-- {
+			line := bytes.TrimSpace(lines[i])
+			if len(line) == 0 || !bytes.Contains(line, []byte(`"user"`)) {
+				continue
+			}
+			var row struct {
+				Type        string `json:"type"`
+				IsSidechain bool   `json:"isSidechain"`
+				IsMeta      bool   `json:"isMeta"`
+				Origin      *struct {
+					Kind string `json:"kind"`
+				} `json:"origin"`
+				Message json.RawMessage `json:"message"`
+			}
+			if json.Unmarshal(line, &row) != nil || row.Type != "user" || row.IsSidechain || row.IsMeta {
+				continue
+			}
+			if row.Origin != nil && row.Origin.Kind != "" && row.Origin.Kind != "user" {
+				continue
+			}
+			switch classifyDirectHostUserRow(row.Message) {
+			case 1:
+				return true
+			case -1:
+				return false
+			}
+		}
+		end = start
+	}
+	return false
+}
+
+// classifyDirectHostUserRow returns 1 for a host-side user interrupt line, -1 for a genuine direct host prompt, and 0
+// for synthetic / tool-result-only / local-command rows to skip.
+func classifyDirectHostUserRow(raw json.RawMessage) int {
+	var m struct {
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &m) != nil || len(m.Content) == 0 {
+		return 0
+	}
+	trimmed := bytes.TrimLeft(m.Content, " \t\r\n")
+	if len(trimmed) == 0 {
+		return 0
+	}
+	isInterruptText := func(s string) bool {
+		t := strings.TrimSpace(s)
+		return t == "[Request interrupted by user]" || t == "[Request interrupted by user for tool use]"
+	}
+	isSyntheticText := func(s string) bool {
+		t := strings.TrimSpace(s)
+		return t == "" ||
+			strings.HasPrefix(t, "<local-command-caveat>") ||
+			strings.HasPrefix(t, "<command-name>") ||
+			strings.HasPrefix(t, "<local-command-stdout>") ||
+			strings.HasPrefix(t, "<task-notification>")
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if json.Unmarshal(trimmed, &s) != nil {
+			return 0
+		}
+		if isInterruptText(s) {
+			return 1
+		}
+		if isSyntheticText(s) {
+			return 0
+		}
+		return -1
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(trimmed, &blocks) != nil || len(blocks) == 0 {
+		return 0
+	}
+	sawInterrupt := false
+	sawRealPrompt := false
+	for _, b := range blocks {
+		if b.Type == "tool_result" {
+			continue
+		}
+		if b.Type == "text" {
+			if isInterruptText(b.Text) {
+				sawInterrupt = true
+				continue
+			}
+			if isSyntheticText(b.Text) {
+				continue
+			}
+			sawRealPrompt = true
+			continue
+		}
+		sawRealPrompt = true
+	}
+	if sawRealPrompt {
+		return -1
+	}
+	if sawInterrupt {
+		return 1
+	}
+	return 0
+}
+
+// peerFallbackOwnerSend sends an owner message through Claude Code's peer inbox when Persona's plugin hit Claude
+// Code's host Stop latch. It attests owner provenance so bypassPermissions sessions accept it without holding.
+func (n *Node) peerFallbackOwnerSend(ctx context.Context, c claudeProc, id, text string, offset int64) bool {
+	p, has := peerOf(c)
+	if !has {
+		return false
+	}
+	if ownerDeliveryOf(ctx) == nil {
+		ctx, _ = withOwnerDelivery(ctx)
+	}
+	p.fromMode = n.peerAttest(ctx, c, id)
+	if err := peerSendAt(ctx, p, id, text, peerNext); err != nil {
+		var pe *errPeer
+		if asPeer(err, &pe) {
+			log.Printf("send %s: peer inbox fallback refused by claude %d: %v", id, c.pid, err)
+			return false
+		}
+	}
+	if peerTaken(ctx, func() string { return n.transcriptPath(id) }, offset, text, peerConfirmWait) {
+		n.ccPlugins.clearAborted(id, c.pid)
+		return true
+	}
+	log.Printf("send %s: peer inbox fallback to claude %d was not confirmed within %s", id, c.pid, peerConfirmWait)
 	return false
 }

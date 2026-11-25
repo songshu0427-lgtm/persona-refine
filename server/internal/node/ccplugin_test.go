@@ -584,3 +584,297 @@ func TestPeerSessionClassHonorsNewerProcessPermissionMode(t *testing.T) {
 		t.Fatalf("peerSessionClass = %q, want %q", got, peerModeBypass)
 	}
 }
+
+// When a modern (`busy_input`) plugin reports Claude Code's host Stop latch (`reason: "stopped"`), the node falls back
+// ONLY for that case to the attested peer inbox, never falls back for hook drops (`reason: "dropped"` with non-stop
+// detail), and automatically returns to normal plugin delivery once the latch clears.
+func TestCCPluginStopLatchFallsBackToPeerInboxAndRecoversToPlugin(t *testing.T) {
+	n, f, home := herdrNode(t)
+	noPaneEnv(t)
+	shortPeerWait(t, 2*time.Second)
+	shortPluginWaits(t)
+	p := bgTranscript(t, home, home, sidA, "persona-fix")
+	appendLines(t, p, `{"type":"user","permissionMode":"bypassPermissions","uuid":"u-bp","timestamp":"2026-11-24T09:00:00Z","cwd":"`+home+`","sessionId":"`+sidA+`","message":{"role":"user","content":"seed"}}`)
+	inbox := newFakeInbox(t, p)
+	inbox.setMode(peerModeBypass)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "idle", inbox, nil)
+	f.reply("session.snapshot", snapshot(nil, nil, nil, nil))
+	c := pluginSocket(t, n)
+
+	var mu sync.Mutex
+	ackMode := "stopped"
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-done })
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			b, _ := json.Marshal(map[string]any{
+				"session_id":     sidA,
+				"plugin_version": "0.4.2",
+				"engine_version": "2.1.330",
+				"capabilities":   []string{"settings", "busy_input", "interrupt", "permission_bridge"},
+				"wait_ms":        1000,
+			})
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://persona/claude-plugin/v1/poll", strings.NewReader(string(b)))
+			res, err := c.Do(req)
+			if err != nil {
+				continue
+			}
+			var answer struct {
+				Messages []map[string]any `json:"messages"`
+			}
+			_ = json.NewDecoder(res.Body).Decode(&answer)
+			res.Body.Close()
+			for _, m := range answer.Messages {
+				mu.Lock()
+				mode := ackMode
+				mu.Unlock()
+				switch mode {
+				case "stopped":
+					pluginPost(t, c, "ack", map[string]any{
+						"session_id": sidA,
+						"id":         m["id"],
+						"submitted":  false,
+						"reason":     "stopped",
+						"detail":     "the session was stopped and nobody has sent input since",
+					})
+				case "hook_drop":
+					pluginPost(t, c, "ack", map[string]any{
+						"session_id": sidA,
+						"id":         m["id"],
+						"submitted":  false,
+						"reason":     "dropped",
+						"detail":     "blocked by policy hook",
+					})
+				case "submit":
+					text, _ := m["text"].(string)
+					line, _ := json.Marshal(map[string]any{
+						"type": "user", "uuid": newUUID(), "sessionId": sidA,
+						"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
+						"message":   map[string]any{"role": "user", "content": text},
+						"origin":    map[string]any{"kind": "plugin", "name": "persona", "asUser": true},
+					})
+					if tf, err := os.OpenFile(p, os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+						_, _ = tf.Write(append(line, '\n'))
+						_ = tf.Close()
+					}
+					pluginPost(t, c, "ack", map[string]any{"session_id": sidA, "id": m["id"], "submitted": true})
+				}
+			}
+		}
+	}()
+	waitPolling(t, n, sidA)
+
+	// 1. Stop latch: falls back to peer inbox with bypass attestation.
+	res, err := request(t, n, "session.send", map[string]any{
+		"session_id": sidA, "text": "continue after stop", "client_msg_id": "m-stop-1", "owner_input": true,
+	})
+	if err != nil {
+		t.Fatalf("stop-latched send failed: %v", err)
+	}
+	if res["ok"] != true || res["delivered_as"] != "relayed" || res["relay_reason"] != relayRefused {
+		t.Fatalf("stop-latched send answer = %v", res)
+	}
+	if len(inbox.users()) != 1 {
+		t.Fatalf("expected 1 peer inbox message on stop latch, got %d", len(inbox.users()))
+	}
+
+	// Wait past outsideQueueStartGrace so the next send attempts plugin delivery directly while idle.
+	time.Sleep(outsideQueueStartGrace + 20*time.Millisecond)
+	waitPolling(t, n, sidA)
+
+	// 2. Hook refusal (`dropped` with non-stop detail): must NOT bypass via peer inbox.
+	mu.Lock()
+	ackMode = "hook_drop"
+	mu.Unlock()
+	if _, err := request(t, n, "session.send", map[string]any{
+		"session_id": sidA, "text": "blocked prompt", "client_msg_id": "m-hook-2", "owner_input": true,
+	}); err == nil {
+		t.Fatalf("expected hook drop to fail without falling back to peer inbox")
+	}
+	if len(inbox.users()) != 1 {
+		t.Fatalf("hook drop must not reach peer inbox, got %d messages", len(inbox.users()))
+	}
+
+	// 3. Latch cleared (host sent input): next send automatically returns to plugin asUser delivery.
+	waitPolling(t, n, sidA)
+	mu.Lock()
+	ackMode = "submit"
+	mu.Unlock()
+	res, err = request(t, n, "session.send", map[string]any{
+		"session_id": sidA, "text": "back to plugin", "client_msg_id": "m-ok-3", "owner_input": true,
+	})
+	if err != nil {
+		t.Fatalf("recovered plugin send failed: %v", err)
+	}
+	if res["ok"] != true || res["delivered_as"] != "user_input" || res["relay_reason"] != nil {
+		t.Fatalf("recovered send answer = %v", res)
+	}
+	if len(inbox.users()) != 1 {
+		t.Fatalf("recovered send should not touch peer inbox, got %d messages", len(inbox.users()))
+	}
+}
+
+// Legacy 0.4.1 plugins omit `detail` and report only `reason: "dropped"`; the node falls back to peer inbox only when
+// the transcript confirms an open host-side `[Request interrupted by user]` (preserving detection across peer turns
+// until a direct host prompt lands).
+func TestCCPluginLegacyDroppedFallsBackOnlyOnOpenHostStop(t *testing.T) {
+	n, f, home := herdrNode(t)
+	noPaneEnv(t)
+	shortPeerWait(t, 2*time.Second)
+	shortPluginWaits(t)
+	p := bgTranscript(t, home, home, sidA, "persona-fix")
+	appendLines(t, p, `{"type":"user","permissionMode":"bypassPermissions","uuid":"u-bp","timestamp":"2026-11-24T09:00:00Z","cwd":"`+home+`","sessionId":"`+sidA+`","message":{"role":"user","content":"seed"}}`)
+	inbox := newFakeInbox(t, p)
+	inbox.setMode(peerModeBypass)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "idle", inbox, nil)
+	f.reply("session.snapshot", snapshot(nil, nil, nil, nil))
+	c := pluginSocket(t, n)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-done })
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			b, _ := json.Marshal(map[string]any{
+				"session_id":     sidA,
+				"plugin_version": "0.4.1",
+				"engine_version": "2.1.330",
+				"capabilities":   []string{"settings", "busy_input", "interrupt", "permission_bridge"},
+				"wait_ms":        1000,
+			})
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://persona/claude-plugin/v1/poll", strings.NewReader(string(b)))
+			res, err := c.Do(req)
+			if err != nil {
+				continue
+			}
+			var answer struct {
+				Messages []map[string]any `json:"messages"`
+			}
+			_ = json.NewDecoder(res.Body).Decode(&answer)
+			res.Body.Close()
+			for _, m := range answer.Messages {
+				pluginPost(t, c, "ack", map[string]any{
+					"session_id": sidA,
+					"id":         m["id"],
+					"submitted":  false,
+					"reason":     "dropped",
+				})
+			}
+		}
+	}()
+	waitPolling(t, n, sidA)
+
+	// Normal transcript (no open host interrupt): legacy `dropped` must NOT fall back.
+	if transcriptHasOpenHostStop(p) {
+		t.Fatalf("normal transcript unexpectedly detected open host stop")
+	}
+	if _, err := request(t, n, "session.send", map[string]any{
+		"session_id": sidA, "text": "no stop in transcript", "client_msg_id": "m-leg-1", "owner_input": true,
+	}); err == nil {
+		t.Fatalf("expected legacy drop without open host stop to refuse fallback")
+	}
+	if len(inbox.users()) != 0 {
+		t.Fatalf("unexpected peer inbox message without open host stop: %d", len(inbox.users()))
+	}
+
+	// Host interrupt written to transcript: legacy `dropped` now falls back to peer inbox.
+	appendLines(t, p, `{"type":"user","uuid":"u-int","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`)
+	if !transcriptHasOpenHostStop(p) {
+		t.Fatalf("expected open host stop after interrupt line")
+	}
+	waitPolling(t, n, sidA)
+	res, err := request(t, n, "session.send", map[string]any{
+		"session_id": sidA, "text": "first fallback after host stop", "client_msg_id": "m-leg-2", "owner_input": true,
+	})
+	if err != nil {
+		t.Fatalf("legacy stop-latched send failed: %v", err)
+	}
+	if res["ok"] != true || res["delivered_as"] != "relayed" || res["relay_reason"] != relayRefused {
+		t.Fatalf("legacy stop-latched answer = %v", res)
+	}
+	if len(inbox.users()) != 1 {
+		t.Fatalf("expected 1 peer inbox message, got %d", len(inbox.users()))
+	}
+
+	// Peer turn appended on top of interrupt: host stop latch is still open until a direct host prompt lands.
+	if !transcriptHasOpenHostStop(p) {
+		t.Fatalf("peer inbox turn should not clear transcriptHasOpenHostStop")
+	}
+
+	// Direct host user prompt clears open host stop detection.
+	appendLines(t, p, `{"type":"user","uuid":"u-host","message":{"role":"user","content":"direct from desktop"}}`)
+	if transcriptHasOpenHostStop(p) {
+		t.Fatalf("direct host user prompt should clear transcriptHasOpenHostStop")
+	}
+}
+
+// Held queued messages on a stop-latched outside Claude session drain cleanly through peer inbox once the turn settles.
+func TestCCPluginOutsideQueueDrainFallsBackOnStopLatch(t *testing.T) {
+	n, f, home := herdrNode(t)
+	noPaneEnv(t)
+	shortPeerWait(t, 2*time.Second)
+	shortPluginWaits(t)
+	p := bgTranscript(t, home, home, sidA, "persona-fix")
+	appendLines(t, p, `{"type":"user","permissionMode":"bypassPermissions","uuid":"u-bp","timestamp":"2026-11-24T09:00:00Z","cwd":"`+home+`","sessionId":"`+sidA+`","message":{"role":"user","content":"seed"}}`)
+	inbox := newFakeInbox(t, p)
+	inbox.setMode(peerModeBypass)
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "busy", inbox, nil)
+	f.reply("session.snapshot", snapshot(nil, nil, nil, nil))
+	c := pluginSocket(t, n)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-done })
+	go func() {
+		defer close(done)
+		for ctx.Err() == nil {
+			b, _ := json.Marshal(map[string]any{
+				"session_id":     sidA,
+				"plugin_version": "0.4.2",
+				"engine_version": "2.1.330",
+				"capabilities":   []string{"settings", "busy_input", "interrupt", "permission_bridge"},
+				"wait_ms":        1000,
+			})
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://persona/claude-plugin/v1/poll", strings.NewReader(string(b)))
+			res, err := c.Do(req)
+			if err != nil {
+				continue
+			}
+			var answer struct {
+				Messages []map[string]any `json:"messages"`
+			}
+			_ = json.NewDecoder(res.Body).Decode(&answer)
+			res.Body.Close()
+			for _, m := range answer.Messages {
+				pluginPost(t, c, "ack", map[string]any{
+					"session_id": sidA,
+					"id":         m["id"],
+					"submitted":  false,
+					"reason":     "stopped",
+					"detail":     "the session was stopped and nobody has sent input since",
+				})
+			}
+		}
+	}()
+	waitPolling(t, n, sidA)
+
+	if _, err := request(t, n, "session.send", map[string]any{
+		"session_id": sidA, "text": "queued while peer turn runs", "client_msg_id": "m-q-1", "owner_input": true,
+	}); err != nil {
+		t.Fatalf("queue send: %v", err)
+	}
+	writeOutsideClaude(t, home, sidA, "claude-desktop-3p", "idle", inbox, nil)
+	waitFor(t, "queued message drained via peer inbox fallback", func() bool {
+		q := n.outsideQueues.lookup(sidA)
+		if q == nil {
+			return false
+		}
+		q.mu.Lock()
+		done := len(q.held) == 0 && !q.draining && !q.sending
+		q.mu.Unlock()
+		return len(inbox.users()) == 1 && done
+	})
+}

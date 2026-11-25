@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import {
   applyStepOverride,
   buildPreviewShellCommand,
+  classifyPromptDrop,
   homeDir,
   mergeOverride,
   nextBackoff,
@@ -39,6 +40,7 @@ function world(
   const workDir = extra.cwd ?? '/work'
   let sessionModel = 'claude-sonnet-5-5'
   let holdSubmit = false
+  let submitDrop: ((text: string) => string | undefined) | undefined
   let abortError: string | undefined
   let onBashLaunch: (() => void) | undefined
   let toolCheckVerdict: ToolCheckResult = { decision: 'ask' }
@@ -56,7 +58,7 @@ function world(
       return { value: extra.files[e.path]! }
     }
     if (e.path.endsWith('/.claude-plugin/plugin.json')) {
-      return { value: '{"name":"persona","version":"0.4.1"}' }
+      return { value: '{"name":"persona","version":"0.4.2"}' }
     }
     throw new Error(`ENOENT: ${e.path}`)
   })
@@ -86,6 +88,8 @@ function world(
   })
   on('prompt.submit', (_$, e) => {
     submitted.push({ text: e.text, origin: e.origin })
+    const drop = submitDrop?.(e.text)
+    if (drop !== undefined) return { drop }
     if (holdSubmit) return new Promise(() => {})
     return { text: e.text }
   })
@@ -127,6 +131,9 @@ function world(
     setHoldSubmit(v: boolean) {
       holdSubmit = v
     },
+    setSubmitDrop(fn: ((text: string) => string | undefined) | undefined) {
+      submitDrop = fn
+    },
     setAbortError(err: string | undefined) {
       abortError = err
     },
@@ -153,7 +160,7 @@ describe('persona plugin', () => {
     expect(poll?.socketPath).toBe('/home/me/.persona/node.sock')
     expect(poll?.body).toEqual({
       session_id: SESSION,
-      plugin_version: '0.4.1',
+      plugin_version: '0.4.2',
       engine_version: '2.1.326',
       capabilities: ['settings', 'busy_input', 'interrupt', 'permission_bridge'],
       wait_ms: 25_000,
@@ -323,6 +330,42 @@ describe('persona plugin', () => {
     expect(w.requests.length).toBe(1)
     await w.clock.advance(1)
     expect(w.requests.length).toBe(2)
+  })
+
+  test('reports stopped vs dropped with detail when prompt.submit drops a message', async ($, on) => {
+    const w = world(on, [
+      { status: 200, body: { messages: [{ id: 'm-stop', text: 'continue please', deadline_ms: 9_000 }] } },
+      { status: 200, body: { messages: [{ id: 'm-hook', text: 'secret text', deadline_ms: 9_000 }] } },
+    ])
+    w.setSubmitDrop(text =>
+      text === 'continue please'
+        ? 'the session was stopped and nobody has sent input since'
+        : 'blocked by policy hook',
+    )
+    await $.session.start(start)
+    await w.clock.settle()
+
+    const acks = w.requests.filter(r => r.url.endsWith('/ack')).map(r => r.body)
+    expect(acks).toEqual([
+      {
+        session_id: SESSION,
+        id: 'm-stop',
+        submitted: false,
+        reason: 'stopped',
+        detail: 'the session was stopped and nobody has sent input since',
+      },
+      {
+        session_id: SESSION,
+        id: 'm-hook',
+        submitted: false,
+        reason: 'dropped',
+        detail: 'blocked by policy hook',
+      },
+    ])
+    expect(classifyPromptDrop('blocked by policy hook')).toEqual({
+      reason: 'dropped',
+      detail: 'blocked by policy hook',
+    })
   })
 
   test('finds the node where the node itself looks', async ($, on) => {

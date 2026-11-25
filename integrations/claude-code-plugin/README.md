@@ -57,7 +57,7 @@ another session, gets `403`.
 `POST /claude-plugin/v1/poll`
 
 ```json
-{"session_id": "<uuid>", "plugin_version": "0.4.1", "engine_version": "2.1.326", "capabilities": ["settings", "busy_input", "interrupt", "permission_bridge"], "wait_ms": 25000}
+{"session_id": "<uuid>", "plugin_version": "0.4.2", "engine_version": "2.1.326", "capabilities": ["settings", "busy_input", "interrupt", "permission_bridge"], "wait_ms": 25000}
 ```
 
 - Held until work comes or `wait_ms` passes (at most 25 s; Claude Code's fetch gives up at 30 s), then asked
@@ -77,7 +77,10 @@ another session, gets `403`.
 {"session_id": "<uuid>", "id": "<id>", "submitted": true}
 ```
 
-`submitted: false` with a `reason` (`late`, `invalid`, `command`, `dropped`, `failed`) when the plugin did not submit it.
+`submitted: false` with a `reason` (`late`, `invalid`, `command`, `stopped`, `dropped`, `failed`) and optional `detail` (the
+engine or hook's drop text, clipped) when the plugin did not submit it. `stopped` marks Claude Code's host Stop latch
+("the session was stopped and nobody has sent input since"), where the node may fall back to the peer inbox until direct
+host input clears the latch.
 The plugin submits a message only before its `deadline_ms`; after that the node may send it through the inbox instead.
 
 `POST /claude-plugin/v1/permission`

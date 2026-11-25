@@ -389,7 +389,9 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 	cEff := c
 	cEff.Status = n.effectiveOutsideStatus(c, path, offset)
 	// When Persona's modern plugin (`busy_input`) is connected, all owner messages — idle, busy, or replying in free text
-	// to an open AskUserQuestion — go exclusively through the plugin without ever falling back to the peer inbox.
+	// to an open AskUserQuestion — go through the plugin first, falling back to the peer inbox ONLY when Claude Code's
+	// host Stop latch drops the plugin prompt ("the session was stopped and nobody has sent input since").
+	imagesAttached := false
 	if owner := ownerDeliveryOf(ctx); owner != nil && forced == "" && pane == "" && n.ccPlugins.busyInputCapable(id, c.pid) {
 		if len(images) > 0 {
 			paths, err := n.saveImages(images)
@@ -397,6 +399,7 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 				return true, err
 			}
 			text = attachImages(text, paths)
+			imagesAttached = true
 		}
 		if n.ccPerms.hasOpenKind(id, c.pid, proto.IxQuestion) {
 			n.outsideQuestionInterrupt(ctx, id, c.pid)
@@ -411,13 +414,20 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 			return true, nil
 		}
 		ok, why := n.ccPluginSend(ctx, cEff, id, text)
-		if !ok {
+		if ok {
+			log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
+			n.noteOutsideTurnStarted(id, offset)
+			owner.as, owner.reason = deliveredUserInput, ""
+			return true, nil
+		}
+		if why != relayStopped {
 			return true, uncertain(fmt.Errorf("Persona 插件未能提交这条消息（%s），请稍后重试", why))
 		}
-		log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
-		n.noteOutsideTurnStarted(id, offset)
-		owner.as, owner.reason = deliveredUserInput, ""
-		return true, nil
+		if _, has := peerOf(c); !has {
+			return true, uncertain(fmt.Errorf("该会话刚在电脑端手动停止，插件被暂锁且无可用的会话消息通道；请先在 Claude Desktop 发送一条消息解锁"))
+		}
+		log.Printf("send %s: claude %d (%s) plugin dropped prompt due to desktop Stop latch; falling back to peer inbox", id, c.pid, c.Entrypoint)
+		owner.as, owner.reason = deliveredRelayed, relayRefused
 	}
 	p, has := peerOf(c)
 	if !has {
@@ -426,7 +436,7 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 		}
 		return false, nil
 	}
-	if len(images) > 0 {
+	if len(images) > 0 && !imagesAttached {
 		paths, err := n.saveImages(images)
 		if err != nil {
 			return true, err
@@ -445,12 +455,15 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 		}
 	}
 	// Legacy 0.1.0 plugins (no `busy_input`) accept idle owner messages and fall back to the inbox otherwise.
-	if owner := ownerDeliveryOf(ctx); owner != nil && forced == "" && priority == peerNext {
+	if owner := ownerDeliveryOf(ctx); owner != nil && owner.as == "" && forced == "" && priority == peerNext {
 		if ok, why := n.ccPluginSend(ctx, cEff, id, text); ok {
 			log.Printf("send %s: claude %d (%s) took it as the user's input through Persona's plugin", id, c.pid, c.Entrypoint)
 			owner.as, owner.reason = deliveredUserInput, ""
 			return true, nil
 		} else {
+			if why == relayStopped {
+				why = relayRefused
+			}
 			owner.as, owner.reason = deliveredRelayed, why
 		}
 	}
@@ -463,6 +476,9 @@ func (n *Node) sendOutsidePriority(ctx context.Context, id, text string, images 
 	}
 	if peerTaken(ctx, func() string { return n.transcriptPath(id) }, offset, text, peerConfirmWait) {
 		log.Printf("send %s: claude %d (%s) took it through its inbox (%s)", id, c.pid, c.Entrypoint, priority)
+		if ownerDeliveryOf(ctx) != nil && n.ccPlugins.busyInputCapable(id, c.pid) {
+			n.noteOutsideTurnStarted(id, offset)
+		}
 		// Taken into its queue while a permission prompt or another dialog holds it: Claude reads the message only once
 		// that is answered at the computer, which the answer says (waits_on_computer). The status is read once, after
 		// the take: a prompt that opened just after a busy session queued the message marks it too, and rightly, since

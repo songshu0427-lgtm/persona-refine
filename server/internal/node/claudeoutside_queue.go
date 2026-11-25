@@ -219,6 +219,11 @@ func (n *Node) drainOutsideQueue(id string, q *outsideSessionQueue) {
 		cIdle := c
 		cIdle.Status = "idle"
 		sent, why := n.ccPluginSend(context.Background(), cIdle, id, next.text)
+		usedPeer := false
+		if !sent && why == relayStopped {
+			sent = n.peerFallbackOwnerSend(context.Background(), cIdle, id, next.text, rev)
+			usedPeer = sent
+		}
 
 		q.mu.Lock()
 		q.sending = false
@@ -230,7 +235,11 @@ func (n *Node) drainOutsideQueue(id string, q *outsideSessionQueue) {
 				q.draining = false
 			}
 			q.mu.Unlock()
-			log.Printf("send %s: drained queued owner message through Persona's plugin", id)
+			if usedPeer {
+				log.Printf("send %s: drained queued owner message through peer inbox (plugin stop-latched)", id)
+			} else {
+				log.Printf("send %s: drained queued owner message through Persona's plugin", id)
+			}
 			n.notifySessions()
 			if done {
 				return

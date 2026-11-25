@@ -151,11 +151,13 @@ func (n *Node) outsideAnswer(ctx context.Context, session, id string, r proto.Re
 		cIdle := c
 		cIdle.Status = "idle"
 		okSend, why := n.ccPluginSend(ctx, cIdle, session, text)
-		if !okSend {
+		if okSend {
+			n.cx.hold(session, id)
+			return nil
+		}
+		if why != relayStopped {
 			return uncertain(fmt.Errorf("Persona 插件未能提交问题回答（%s）", why))
 		}
-		n.cx.hold(session, id)
-		return nil
 	}
 	handled, err := n.sendOutsidePriority(ctx, session, text, nil, peerNow)
 	if !handled {

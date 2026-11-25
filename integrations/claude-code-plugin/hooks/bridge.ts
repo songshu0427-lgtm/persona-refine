@@ -285,6 +285,19 @@ export function applyStepOverride<
 export type Verdict = 'ok' | 'invalid' | 'late' | 'command'
 
 /**
+ * Classifies Claude Code's `PromptSubmitResult.drop` reason. When the user stopped the session on the computer
+ * ("the session was stopped and nobody has sent input since"), Claude Code blocks plugin-initiated prompts until
+ * the host receives direct input; report `stopped` so the node can fall back to the peer inbox only for this latch
+ * without bypassing hook refusals.
+ */
+export function classifyPromptDrop(drop: string): { reason: 'stopped' | 'dropped'; detail: string } {
+  const detail = drop.trim().slice(0, 200)
+  const norm = detail.toLowerCase()
+  const reason = norm.includes('session was stopped') && norm.includes('sent input since') ? 'stopped' : 'dropped'
+  return { reason, detail }
+}
+
+/**
  * Whether the message may go in as the person's words now (`now`, epoch ms): text that is a string with something in
  * it and not too long, before its deadline, and no slash command (the node sends none; a command would run, not be
  * read).

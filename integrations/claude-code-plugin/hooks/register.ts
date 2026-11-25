@@ -9,6 +9,7 @@ import {
   SUBMIT_QUEUE_SETTLE_MS,
   applyStepOverride,
   buildPreviewShellCommand,
+  classifyPromptDrop,
   homeDir,
   isWindowsPath,
   mergeOverride,
@@ -308,23 +309,32 @@ async function applyInterrupt(
  */
 async function deliver($: Engine, sock: string, session: string, m: Message): Promise<void> {
   let outcome: string = verdict(m, await $.clock.now())
+  let detail: string | undefined
   if (outcome === 'ok' && typeof m.text === 'string') {
     try {
       const pending = $.prompt.submit({ text: m.text, asUser: true })
       // Prevent unhandled rejection if `pending` settles later after being queued behind a running turn.
       pending.catch(() => undefined)
-      outcome = await Promise.race([
+      const res = await Promise.race([
         pending.then(
-          submitted => (submitted.drop !== undefined ? 'dropped' : 'ok'),
-          () => 'failed',
+          submitted =>
+            submitted.drop !== undefined
+              ? classifyPromptDrop(submitted.drop)
+              : { reason: 'ok', detail: undefined },
+          () => ({ reason: 'failed', detail: undefined }),
         ),
-        sleep($, SUBMIT_QUEUE_SETTLE_MS).then(() => 'ok'),
+        sleep($, SUBMIT_QUEUE_SETTLE_MS).then(() => ({ reason: 'ok', detail: undefined })),
       ])
+      outcome = res.reason
+      detail = res.detail
     } catch {
       outcome = 'failed'
     }
   }
-  const ack = outcome === 'ok' ? { submitted: true } : { submitted: false, reason: outcome }
+  const ack =
+    outcome === 'ok'
+      ? { submitted: true }
+      : { submitted: false, reason: outcome, ...(detail ? { detail } : {}) }
   try {
     await $.http.fetch(`${BASE}/ack`, post(sock, { session_id: session, id: m.id, ...ack }))
   } catch {
