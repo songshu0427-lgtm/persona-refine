@@ -9,11 +9,11 @@ import (
 // Generate writes from integrations/. Measured 161,129 B on 2026-11-17 for the DSH, pi, Antigravity and Paseo runtimes
 // and the Claude Code plugin (#9799); raised for main's later Antigravity / runtime-sdk updates and the Claude Code
 // plugin's session model/effort overrides, mid-turn owner input queueing, owner turn interrupts, bypass preview pre-start,
-// and remote permission bridge (173,207 B on 2026-11-20), plus the Antigravity Desktop bridge and model switching
-// (176,381 B on 2026-11-24, with ~2,100 B of headroom). Raise it only for code a runtime needs, never to embed the
-// packages raw again.
+// and remote permission bridge (173,207 B on 2026-11-20), plus the Antigravity Desktop bridge, model switching, and
+// subagent hierarchy folding (179,712 B on 2026-11-26, with ~1,800 B of headroom). Raise it only for code a runtime
+// needs, never to embed the packages raw again.
 func TestDistBudget(t *testing.T) {
-	const budget = 178_500
+	const budget = 181_500
 	_, out := generateIntegrations(t)
 	entries, err := os.ReadDir(out)
 	if err != nil {

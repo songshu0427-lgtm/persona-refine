@@ -6,6 +6,7 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import { createRuntime, page, RpcError } from '../../runtime-sdk/index.js'
+import { createSubagentCaches, selectDesktopSessions } from './desktop-subagents.js'
 import { readTranscript, stepsToItems, workspacePathOf } from './map.js'
 
 const exec = promisify(execFile)
@@ -81,6 +82,7 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
   const watched = new Map()
   const selectedModels = new Map() // cascadeId -> { id, stepIndex }
   const stepModels = new Map() // cascadeId -> { stepIndex, native }
+  const subagentCaches = createSubagentCaches()
   let catalog = []
   let catalogFlight
 
@@ -199,7 +201,9 @@ export function createDesktopRuntime({ dir = join(homedir(), '.gemini', 'antigra
           launcher: 'antigravity-desktop', capabilities: { modes: false },
           rev: Number(value.stepCount) || 1, status: value.status === 'CASCADE_RUN_STATUS_RUNNING' ? 'working' : 'idle' })
       }
-      const kept = rt.recent(rows, { days: 14, max: 80, pinned: row => row.status === 'working' })
+      const kept = selectDesktopSessions({
+        dir, prefix, label, allSummaries, rows, recent: (list, opts) => rt.recent(list, opts), caches: subagentCaches,
+      })
       await Promise.all(kept.map(async row => {
         const meta = bySession.get(row.session_id)
         const model = meta ? await currentModel(hub, meta.key, meta.value).catch(() => '') : ''
