@@ -630,8 +630,11 @@ export function isOpen() {
 let ws: WebSocket | null = null;
 let authenticatedSocket: WebSocket | null = null;
 let socketToken = "";
+let socketAttemptAt = 0;
 let retry = 0;
-let retryTimer: number | undefined;
+let helloTimedOut = false;
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let connectTimer: ReturnType<typeof setTimeout> | undefined;
 let lastMessage = 0;
 let lastPing = 0;
 let stopped = true;
@@ -639,10 +642,17 @@ let stopped = true;
 // attempts since, the ones in the quick phase after a restart, and the timer that shows the drop once the grace ends.
 let drop: Drop | null = null;
 let fastTries = 0;
-let graceTimer: number | undefined;
+let graceTimer: ReturnType<typeof setTimeout> | undefined;
 // The hub said hub_restarting on this socket: its close is a restart whatever the close code.
 let restartNotice = false;
 let cursor: EventCursor = NO_CURSOR;
+
+/** Bound a single WebSocket connect + hello handshake so a half-open / blackholed route cannot wedge reconnects. */
+export const CONNECT_TIMEOUT_MS = 20_000;
+const QUIET_RECONNECT_MS = 70_000;
+const VISIBLE_QUIET_MS = 40_000;
+const VISIBLE_STUCK_CONNECT_MS = 3_000;
+const VISIBLE_PING_MIN_MS = 5_000;
 
 export function send(msg: Record<string, unknown>) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -669,25 +679,90 @@ export function sayHello() {
   if (ws?.readyState === WebSocket.OPEN) sendHello(ws);
 }
 
+function armDrop(now: number, restart: boolean) {
+  // the drop starts while online; a restart announced on a later attempt stretches its grace
+  const next = !drop && state.conn === "online" ? { at: now, restart } : drop && restart && !drop.restart ? { ...drop, restart } : null;
+  if (!next) return;
+  drop = next;
+  clearTimeout(graceTimer);
+  graceTimer = setTimeout(showDrop, Math.max(0, graceUntil(next) - now));
+}
+
+function failSocket(sock: WebSocket, code: number, timedOut = false) {
+  if (ws === sock) directionTreeAwaitsHello(false); // no hello: whoever waited for the tree reads it now
+  if (ws !== sock) return;
+  clearTimeout(connectTimer);
+  connectTimer = undefined;
+  const wasLive = authenticatedSocket === sock;
+  const openedWithoutHello = timedOut && !wasLive && sock.readyState === WebSocket.OPEN;
+  if (openedWithoutHello) helloTimedOut = true;
+  ws = null;
+  setCompatibilityFeatures([]);
+  socketChanged(false);
+  if (timedOut) {
+    try {
+      sock.close();
+    } catch {
+      // ignore close errors on wedged sockets
+    }
+  }
+  if (stopped) return;
+  // an attempt that never got a hello carries no status: ask the hub once whether a sign-in layer in front of it has
+  // expired (lib/edge-auth.ts); a socket that was live just dropped, and its reconnect attempt is the one to ask about
+  if (!wasLive && !restartNotice && code !== 1001) void probeEdge(undefined, probeCredential);
+  const now = Date.now();
+  const restart = restartNotice || code === 1001;
+  armDrop(now, restart);
+  const since = drop ? now - drop.at : Infinity;
+  const fast = Boolean(drop?.restart) && since < RESTART_FAST_MS;
+  // the ordinary backoff counts its own attempts: after a restart's quick phase it starts again from the fast one
+  const wait = retryDelay(fast ? fastTries : retry - fastTries, Boolean(drop?.restart), since, Math.random());
+  if (fast) fastTries++;
+  retry++;
+  const conn = shownConn(drop, retry - 1, now);
+  // what the pill's details say (the facts change on every attempt; only the pill and its details read them)
+  const link: ConnLink = { ...state.link, lastOnline: drop?.at ?? state.link.lastOnline, nextTry: now + wait, restarting: Boolean(drop?.restart) && now - (drop?.at ?? now) < RESTARTING_MS };
+  set(conn !== state.conn ? { conn, link } : { link }); // inside the grace: the page still looks online
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => {
+    retryTimer = undefined;
+    connect();
+  }, wait);
+}
+
 export function connect() {
   setCompatibilityFeatures([]);
   stopped = false;
   clearTimeout(retryTimer);
-  ws?.close();
+  retryTimer = undefined;
+  clearTimeout(connectTimer);
+  connectTimer = undefined;
+  const now = Date.now();
+  // Replacing a quiet/stale socket while state.conn is still "online" must start the drop grace window too;
+  // otherwise ignoring the old socket's onclose leaves the page stuck in fake "online" if this attempt hangs.
+  if (!drop && state.conn === "online") armDrop(now, false);
+  const prev = ws;
+  ws = null;
+  prev?.close();
   socketChanged(false);
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   socketToken = getToken();
+  socketAttemptAt = now;
   directionTreeAwaitsHello(true); // its hello reads the direction tree: the screens wait for that read
   const sock = new WebSocket(`${proto}//${location.host}${BASE}/api/v1/ws?${wsQuery(socketToken, cursor, [SESSIONS_LIST_FEATURE, SESSIONS_LIST_CHANGES_FEATURE, SESSIONS_DELTA_FEATURE, SESSION_LIVE_FEATURE, "extension_ui_stream_v1", "persona_contracts_v1"])}`);
   ws = sock;
   restartNotice = false;
+  connectTimer = setTimeout(() => failSocket(sock, 0, true), CONNECT_TIMEOUT_MS);
   // an attempt does not move offline back to connecting: the pill stays on one phase while the hub is down instead of
   // flipping at every backoff tick (the app's ConnectionTitle); shownConn decides it when the attempt fails
   sock.onopen = () => {
+    if (ws !== sock) return;
     socketOpenedAt = Date.now(); // a direction tree read since then serves this hello (lib/direction-tree.ts)
     sendHello(sock);
-    retry = 0;
-    fastTries = 0;
+    if (!helloTimedOut) {
+      retry = 0;
+      fastTries = 0;
+    }
     lastMessage = Date.now();
     lastPing = Date.now();
   };
@@ -704,7 +779,11 @@ export function connect() {
       if (appSocketReady()) privateStreamListeners.forEach((listener) => listener(ev.data));
       return; // Private trees never enter the global replay cursor or store.
     }
-    if (msg.type === "hello") authenticatedSocket = sock;
+    if (msg.type === "hello") {
+      clearTimeout(connectTimer);
+      connectTimer = undefined;
+      authenticatedSocket = sock;
+    }
     pushing = true;
     try {
       onMessage(msg);
@@ -713,38 +792,7 @@ export function connect() {
       pushing = false;
     }
   };
-  sock.onclose = (ev) => {
-    if (ws === sock) directionTreeAwaitsHello(false); // no hello: whoever waited for the tree reads it now
-    if (ws !== sock) return;
-    const wasLive = authenticatedSocket === sock;
-    ws = null;
-    setCompatibilityFeatures([]);
-    socketChanged(false);
-    if (stopped) return;
-    // an attempt that never got a hello carries no status: ask the hub once whether a sign-in layer in front of it has
-    // expired (lib/edge-auth.ts); a socket that was live just dropped, and its reconnect attempt is the one to ask about
-    if (!wasLive && !restartNotice && ev.code !== 1001) void probeEdge(undefined, probeCredential);
-    const now = Date.now();
-    const restart = restartNotice || ev.code === 1001;
-    // the drop starts while online; a restart announced on a later attempt stretches its grace
-    const next = !drop && state.conn === "online" ? { at: now, restart } : drop && restart && !drop.restart ? { ...drop, restart } : null;
-    if (next) {
-      drop = next;
-      clearTimeout(graceTimer);
-      graceTimer = window.setTimeout(showDrop, Math.max(0, graceUntil(next) - now));
-    }
-    const since = drop ? now - drop.at : Infinity;
-    const fast = Boolean(drop?.restart) && since < RESTART_FAST_MS;
-    // the ordinary backoff counts its own attempts: after a restart's quick phase it starts again from the fast one
-    const wait = retryDelay(fast ? fastTries : retry - fastTries, Boolean(drop?.restart), since, Math.random());
-    if (fast) fastTries++;
-    retry++;
-    const conn = shownConn(drop, retry - 1, now);
-    // what the pill's details say (the facts change on every attempt; only the pill and its details read them)
-    const link: ConnLink = { ...state.link, lastOnline: drop?.at ?? state.link.lastOnline, nextTry: now + wait, restarting: Boolean(drop?.restart) && now - (drop?.at ?? now) < RESTARTING_MS };
-    set(conn !== state.conn ? { conn, link } : { link }); // inside the grace: the page still looks online
-    retryTimer = window.setTimeout(connect, wait);
-  };
+  sock.onclose = (ev) => failSocket(sock, ev.code);
 }
 
 // The hub answered while it refused the socket: a browser can't read why a WebSocket handshake failed, so one ordinary
@@ -755,13 +803,20 @@ const probeCredential = () => api("/machines", { timeout: 15_000 }).catch(() => 
 
 // The grace is over and the socket is still not back: show it as before.
 function showDrop() {
+  graceTimer = undefined;
   if (!drop || stopped || state.conn !== "online") return;
-  set({ conn: shownConn(drop, Math.max(0, retry - 1), Date.now()) });
+  const now = Date.now();
+  const link: ConnLink = { ...state.link, lastOnline: drop.at };
+  set({ conn: shownConn(drop, Math.max(0, retry - 1), now), link });
 }
 
 function back() {
   drop = null;
+  retry = 0;
+  fastTries = 0;
+  helloTimedOut = false;
   clearTimeout(graceTimer);
+  graceTimer = undefined;
 }
 
 /** "Retry now" (the pill's details): try now instead of waiting for the backoff. */
@@ -782,9 +837,13 @@ export function disconnect() {
   stopped = true;
   // a reconnect scheduled after a drop would otherwise fire connect(), which clears stopped (signed out: an empty token)
   clearTimeout(retryTimer);
+  retryTimer = undefined;
+  clearTimeout(connectTimer);
+  connectTimer = undefined;
   back();
-  ws?.close();
+  const prev = ws;
   ws = null;
+  prev?.close();
   socketChanged(false);
 }
 
@@ -796,11 +855,23 @@ export function disconnect() {
 const APP_PING_EVERY = 25_000;
 let pingSeq = 0;
 
-/** One look at the socket (every 5 s): reconnect a quiet one, or ask a hub with app_ping whether it is there. */
+/** One look at the socket (every 5 s): abort a wedged handshake, reconnect a quiet socket, or send app_ping. */
 export function checkSocket() {
+  if (stopped) return;
   const now = Date.now();
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  if (now - lastMessage > 70_000) {
+  if (!ws) {
+    if (retryTimer === undefined) connect();
+    return;
+  }
+  if (authenticatedSocket !== ws) {
+    if (now - socketAttemptAt >= CONNECT_TIMEOUT_MS) failSocket(ws, 0, true);
+    return;
+  }
+  if (ws.readyState !== WebSocket.OPEN) {
+    failSocket(ws, 0, true);
+    return;
+  }
+  if (now - lastMessage > QUIET_RECONNECT_MS) {
     connect();
     return;
   }
@@ -809,13 +880,40 @@ export function checkSocket() {
     send({ type: "ping", id: `web-${++pingSeq}` });
   }
 }
+
+/** Called when the tab returns to the foreground (visibilitychange / bfcache pageshow). */
+export function onPageVisible() {
+  if (stopped) return;
+  const now = Date.now();
+  if (!ws) {
+    connect();
+    return;
+  }
+  if (authenticatedSocket !== ws) {
+    const pending = ws.readyState === 0 || ws.readyState === WebSocket.OPEN;
+    if (!pending || now - socketAttemptAt >= VISIBLE_STUCK_CONNECT_MS) connect();
+    return;
+  }
+  if (ws.readyState !== WebSocket.OPEN || now - lastMessage > VISIBLE_QUIET_MS) {
+    connect();
+    return;
+  }
+  if (hubHas(state.features, APP_PING_FEATURE) && now - lastPing >= VISIBLE_PING_MIN_MS) {
+    lastPing = now;
+    send({ type: "ping", id: `web-${++pingSeq}` });
+  }
+}
+
 setInterval(() => checkSocket(), 5_000);
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && !stopped && (!ws || Date.now() - lastMessage > 40_000)) connect();
+    if (document.visibilityState === "visible") onPageVisible();
   });
 }
 if (typeof window !== "undefined") {
+  window.addEventListener("pageshow", (ev) => {
+    if (ev.persisted) onPageVisible();
+  });
   window.addEventListener("online", () => {
     set({ link: { ...state.link, networkUp: true } });
     if (!stopped) connect();

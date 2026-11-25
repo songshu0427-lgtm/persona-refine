@@ -1,7 +1,7 @@
 // The socket's side of #1574: a drop is invisible inside the grace, a restart retries at once, and a resumed hello
 // refetches nothing while an ordinary one refreshes everything as before.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appSocketReady, applyMachine, checkSocket, connect, disconnect, getState, onAppSocket, onHello, onPrivateUIStream, onHubEvent, reconnectNow, refresh, reset } from "./store";
+import { CONNECT_TIMEOUT_MS, appSocketReady, applyMachine, checkSocket, connect, disconnect, getState, onAppSocket, onHello, onPageVisible, onPrivateUIStream, onHubEvent, reconnectNow, refresh, reset } from "./store";
 import { offlineNow } from "./feedback";
 import { liveEntry, resetLive } from "./live";
 import { messageFeedback } from "./message-send";
@@ -488,5 +488,120 @@ describe("keeping a quiet connection (app_ping)", () => {
     idle(80_000);
     expect(pings(s)).toEqual([]);
     expect(FakeSocket.all.length).toBeGreaterThan(sockets);
+  });
+});
+
+describe("wedged handshakes and foreground recovery", () => {
+  it("aborts a socket stuck in CONNECTING after CONNECT_TIMEOUT_MS and retries with backoff until hello", () => {
+    const first = online(["app_ping"]);
+    first.drop();
+    vi.advanceTimersByTime(600);
+    const hung = last();
+    expect(hung).not.toBe(first);
+    expect(hung.readyState).toBe(0);
+
+    // Still waiting before the handshake deadline (hung was created at 300–600 ms into the first advance).
+    vi.advanceTimersByTime(CONNECT_TIMEOUT_MS - 500);
+    expect(last()).toBe(hung);
+    expect(hung.readyState).toBe(0);
+
+    // Past CONNECT_TIMEOUT_MS: closed, backed off, and replaced with a fresh socket.
+    vi.advanceTimersByTime(600);
+    expect(hung.readyState).toBe(3);
+    expect(getState().conn).not.toBe("online");
+    expect(getState().link.nextTry).toBeGreaterThan(0);
+
+    vi.advanceTimersByTime(3_000);
+    const recovered = last();
+    expect(recovered).not.toBe(hung);
+    expect(recovered.readyState).toBe(0);
+    recovered.open();
+    recovered.push({ type: "hello", server_version: "v1", event_stream: "s1", event_seq: 5, resumed: true });
+    expect(getState().conn).toBe("online");
+    expect(getState().link.nextTry).toBe(0);
+  });
+
+  it("aborts a socket that opened but never received hello, and backs off to offline", () => {
+    connect();
+    const s1 = last();
+    s1.open(); // readyState = OPEN, client_hello sent, but no hello ever arrives
+    expect(appSocketReady()).toBe(false);
+
+    vi.advanceTimersByTime(CONNECT_TIMEOUT_MS + 50);
+    expect(s1.readyState).toBe(3);
+
+    // Let two more open-without-hello attempts time out: retry must NOT reset on onopen.
+    for (let i = 0; i < 2; i++) {
+      vi.advanceTimersByTime(10_000);
+      const cur = last();
+      if (cur.readyState === 0) cur.open();
+      vi.advanceTimersByTime(CONNECT_TIMEOUT_MS + 50);
+      expect(cur.readyState).toBe(3);
+    }
+    expect(getState().conn).toBe("offline");
+  });
+
+  it("does not stay stuck in fake online when a quiet-socket replacement hangs in CONNECTING", () => {
+    const s = online(["app_ping"]);
+    // Go quiet for 75 s so checkSocket replaces the socket via connect().
+    for (let t = 0; t < 75_000; t += 5_000) {
+      vi.advanceTimersByTime(5_000);
+      checkSocket();
+    }
+    const replacement = last();
+    expect(replacement).not.toBe(s);
+    expect(replacement.readyState).toBe(0);
+    // Inside the 8 s grace window: UI stays calm ("online"), but offlineNow already knows the link is gone.
+    expect(getState().conn).toBe("online");
+    expect(offlineNow()).toBe("hub");
+
+    // Past the 8 s grace window while still hung in CONNECTING: UI must expose connecting/Retry instead of fake online.
+    vi.advanceTimersByTime(8_100);
+    expect(getState().conn).toBe("connecting");
+    expect(getState().link.lastOnline).toBeGreaterThan(0);
+
+    // Past CONNECT_TIMEOUT_MS total: the hung replacement is aborted and a new retry is scheduled.
+    vi.advanceTimersByTime(CONNECT_TIMEOUT_MS - 8_000 + 100);
+    expect(replacement.readyState).toBe(3);
+    vi.advanceTimersByTime(1_000);
+    expect(last()).not.toBe(replacement);
+  });
+
+  it("onPageVisible recycles a stuck CONNECTING socket (>= 3 s) without thrashing a fresh one", () => {
+    const first = online(["app_ping"]);
+    first.drop();
+    vi.advanceTimersByTime(600);
+    const pending = last();
+    expect(pending.readyState).toBe(0);
+
+    // Fresh attempt (< 3 s): do not tear it down.
+    vi.advanceTimersByTime(1_000);
+    onPageVisible();
+    expect(last()).toBe(pending);
+
+    // Stuck >= 3 s when user switches back: recycle immediately even though < 40 s since lastMessage.
+    vi.advanceTimersByTime(2_500);
+    onPageVisible();
+    expect(pending.readyState).toBe(3);
+    expect(last()).not.toBe(pending);
+  });
+
+  it("onPageVisible probes an open app_ping socket without dropping it when quiet < 40 s", () => {
+    const s = online(["app_ping"]);
+    const beforeSockets = FakeSocket.all.length;
+    vi.advanceTimersByTime(10_000);
+    onPageVisible();
+    expect(FakeSocket.all.length).toBe(beforeSockets);
+    const sent = s.sent.map((m) => JSON.parse(m)).filter((m) => m.type === "ping");
+    expect(sent.length).toBe(1);
+  });
+
+  it("checkSocket recovers an authenticated socket whose readyState left OPEN without firing onclose", () => {
+    const s = online(["app_ping"]);
+    s.readyState = 2; // CLOSING, no onclose fired
+    checkSocket();
+    expect(s.readyState).toBe(3);
+    vi.advanceTimersByTime(700);
+    expect(last()).not.toBe(s);
   });
 });
