@@ -255,7 +255,11 @@ func (n *Node) claudeSessions(procs []claudeProc, seen map[string]bool, livePane
 			}
 		}
 		if status == proto.StatusBlocked && s.AttentionReason == "" {
-			s.AttentionReason = proto.AttentionClaudeComputer // no dialog read from a pane (yet)
+			if source == proto.SourceClaudeDesktop && n.ccPlugins.permissionBridgeCapable(id, c.pid) {
+				s.AttentionReason = proto.AttentionClaudeDesktopComputer
+			} else {
+				s.AttentionReason = proto.AttentionClaudeComputer // no dialog read from a pane (yet)
+			}
 			if s.Capabilities != nil && s.Capabilities.Send && s.PaneID == "" && asking(cEff, m) {
 				s.AttentionReason = proto.AttentionClaudeAnswer // a message answers it (sendOutside)
 				// Its question is a card the apps answer (claudeoutside_ask.go): the answer goes as that message.

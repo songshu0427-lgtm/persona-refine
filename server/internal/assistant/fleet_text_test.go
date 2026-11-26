@@ -212,4 +212,16 @@ func TestClaudeComputerAttentionSuggestsTmuxOrPersona(t *testing.T) {
 			t.Errorf("%s: legacy attention %q, want the localized current guidance %q", lang, legacy.AttentionReason, current.AttentionReason)
 		}
 	}
+
+	// Desktop sessions with the permission plugin get Desktop-specific copy rather than suggesting tmux.
+	for _, lang := range []i18n.Lang{i18n.En, i18n.Ja, i18n.ZhHans} {
+		s := proto.Session{AttentionReason: proto.AttentionClaudeDesktopComputer}
+		localizeSession(lang, &s)
+		if s.AttentionReason == "" || strings.Contains(strings.ToLower(s.AttentionReason), "tmux") {
+			t.Errorf("%s: desktop attention %q should not suggest tmux", lang, s.AttentionReason)
+		}
+		if lang != i18n.ZhHans && s.AttentionReason == proto.AttentionClaudeDesktopComputer {
+			t.Errorf("%s: desktop attention was not localized", lang)
+		}
+	}
 }
