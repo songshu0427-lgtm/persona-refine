@@ -22,6 +22,8 @@ const lastPulls = new Map<string, number>();
 /** After an older page fails, loadEarlier waits this long before asking again (scrolling at the top calls it on every tick), doubling up to the cap. */
 const EARLIER_RETRY_MS = 3000;
 const EARLIER_RETRY_MAX_MS = 30_000;
+/** Coalesce live push cache writes so WS bursts do not serialize the main-chat cache on every frame. */
+export const FEED_CACHE_SAVE_MS = 1000;
 
 interface EarlierRead {
   controller: AbortController;
@@ -168,6 +170,20 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
 
   useEffect(() => {
     let dead = false;
+    let savePending = false;
+    let saveTimer: number | undefined;
+    let saveIdle: number | undefined;
+    const cancelSave = () => {
+      savePending = false;
+      if (saveTimer !== undefined) {
+        clearTimeout(saveTimer);
+        saveTimer = undefined;
+      }
+      if (saveIdle !== undefined) {
+        window.cancelIdleCallback?.(saveIdle);
+        saveIdle = undefined;
+      }
+    };
     const ctl = new AbortController();
     // Older pages and folds still on their way were asked for from what is shown now: they must not land on what replaces it.
     const disownReads = () => {
@@ -178,6 +194,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
     const offDeleted = onConversationDeleted((machine, session) => {
       if (machine !== mid || session !== sid) return;
       dead = true;
+      cancelSave();
       ctl.abort();
       disownReads();
       snapshot.current = null;
@@ -245,13 +262,37 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
       snapshot.current = { scope: cacheScope, page };
       writeFeedCache(cacheScope, page);
     };
+    const flushSave = () => {
+      const pending = savePending;
+      cancelSave();
+      if (!pending || dead || !ready) return;
+      save();
+    };
+    const scheduleSave = () => {
+      savePending = true;
+      if (saveTimer !== undefined || saveIdle !== undefined) return;
+      saveTimer = window.setTimeout(() => {
+        saveTimer = undefined;
+        if (!savePending || dead || !ready) return;
+        if (typeof window.requestIdleCallback === "function") {
+          saveIdle = window.requestIdleCallback(() => {
+            saveIdle = undefined;
+            flushSave();
+          }, { timeout: FEED_CACHE_SAVE_MS });
+        } else {
+          flushSave();
+        }
+      }, FEED_CACHE_SAVE_MS);
+    };
     const remember = (batch: Item[], gap = false) => {
       if (!ready) pendingItems = mergeItems(pendingItems, batch);
       latest = mergeItems(latest, batch);
-      if (ready && !gap) save(); // a page with a hole is not kept: the fill saves once it is closed
+      if (gap) cancelSave();
+      else if (ready) scheduleSave(); // a page with a hole is not kept: the fill saves once it is closed
     };
     const rewritten = () => {
       dead = true;
+      cancelSave();
       if (assistant) deltas.current.flush("");
       disownReads(); // invalidate in-flight reads before React runs the next effect
       if (cacheScope) discardFeedCache(cacheScope);
@@ -345,7 +386,12 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
         });
     };
     const staleTimer = window.setInterval(checkStale, STALE_TICK_MS);
-    document.addEventListener("visibilitychange", checkStale);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flushSave();
+      else checkStale();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", flushSave);
 
     const onItems = (e: ItemsEvent) => {
       if (dead) return;
@@ -427,6 +473,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
         latestMore = Boolean(p.has_more);
         updateHasMore(latestMore);
         if (p.history) history.current = p.history;
+        cancelSave();
         save();
         showLive(batch);
         covered.current = Math.max(covered.current, p.to_seq ?? Math.max(0, ...batch.map((i) => i.seq)));
@@ -451,6 +498,7 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
     })();
 
     return () => {
+      flushSave();
       dead = true;
       invalidateHistoryReads();
       ctl.abort();
@@ -461,7 +509,8 @@ export function useTranscript(mid: string, sid: string, opts: { starting?: boole
       clearTimeout(gapTimer.current);
       gapTimer.current = undefined; // the next session's first gap starts its own
       clearInterval(staleTimer);
-      document.removeEventListener("visibilitychange", checkStale);
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", flushSave);
       clearLive(mid, sid);
       send({ type: "unsubscribe", machine_id: mid, session_id: sid });
     };

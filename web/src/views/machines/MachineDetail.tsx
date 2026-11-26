@@ -6,7 +6,7 @@
 // while the page scrolls, and does not wait for Cua Driver, which the screen does not use.
 import { MoveToManager } from "../ManagerParts";
 import { offlineManagerOf, useRoster } from "../../lib/managers";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import { api, ApiError, enc, errorText, isAbort } from "../../lib/api";
 import { ago } from "../../lib/format";
 import {
@@ -49,7 +49,7 @@ import { AgentRow } from "./AgentRow";
 import { Icon } from "../../ui/icons";
 import { ProviderName } from "../../ui/ProviderName";
 import { MetricChart, type ChartSeries } from "./MetricChart";
-import { MachineDeploy } from "./MachineDeploy";
+import { lazyOverlay } from "../LazyOverlay";
 import { homeUser, LinkSwitch } from "./LinkSwitch";
 import { BrowserSection } from "./BrowserSection";
 import { ComputerSection } from "./ComputerSection";
@@ -66,6 +66,16 @@ import { t } from "../../i18n";
 // MACHINE_RENAME_FEATURE: the hub renames computers (PUT /api/v1/machines/{id}/name, docs/server/machines.md
 // "Renaming a computer"); an older one keeps the name its hub.json has.
 const MACHINE_RENAME_FEATURE = "machine_rename";
+
+const NOOP = () => {};
+type MachineDeployProps = ComponentProps<typeof import("./MachineDeploy").MachineDeploy>;
+
+// Loaded strictly on demand when this computer has a deployment status, error, or version mismatch (no idle preload).
+const MachineDeploy = lazyOverlay<MachineDeployProps & { onClose: () => void }>(() =>
+  import("./MachineDeploy").then(({ MachineDeploy: Deploy }) => function LazyMachineDeploy(props: MachineDeployProps & { onClose: () => void }) {
+    return <Deploy machine={props.machine} className={props.className} onDetails={props.onDetails} />;
+  }),
+);
 
 // RenameMachine edits what the hub calls the computer, in place of its title row: the hub writes hub.json and every
 // app and the computer's Persona Link follow (a machines event), with no restart or reconnect. Empty is its id again.
@@ -123,7 +133,8 @@ export function MachineDetail({ mid, onToggleSidebar }: { mid: string; onToggleS
   const sessions = useMemo(() => full.sessions.filter((s) => s.machine_id === mid), [full.sessions, mid]);
   const m = machines.find((x) => x.id === mid);
   const online = m?.online ?? false;
-  const expectedDisconnect = m ? machineDeployment(m).expectedDisconnect : false;
+  const deployment = m ? machineDeployment(m) : null;
+  const expectedDisconnect = deployment?.expectedDisconnect ?? false;
 
   const [range, setRangeState] = useState<MetricRange>(initialRange);
   const [data, setData] = useState<{ metrics: DetailMetrics; range: MetricRange; at: number } | null>(null);
@@ -340,7 +351,7 @@ export function MachineDetail({ mid, onToggleSidebar }: { mid: string; onToggleS
           user={homeUser(m.home)}
           className="mx-4 mb-3.5"
         />
-        <MachineDeploy machine={m} className="mb-3.5" />
+        {deployment?.visible && <MachineDeploy machine={m} className="mb-3.5" onClose={NOOP} />}
       </section>
 
       {/* agents */}

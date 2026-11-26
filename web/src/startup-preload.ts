@@ -430,6 +430,7 @@ export async function brotliCopies(dir: string, files: string[]): Promise<{ file
 // during awaiting on plugin-connected outside Claude sessions) measures en 479,509 B, ja 482,614 B, zh-Hans 480,354 B (+31 B room).
 // Super-Agent single-main-chat & 3-tier urgency sidebar (dispatched worker badge & folded bucket, main-chat history/new-chat menu,
 // grouping menu items) measures en 479,609 B, ja 482,687 B, zh-Hans 480,438 B (+31 B room).
+// #14042 (mount-once long-chat windowing) adds ~200 B on its own, offset by the first-screen lazy-load PRs (#15601/#15727/#15812/#15908/#16044).
 export const FIRST_SCREEN_BUDGET = 482_718;
 // The hash in a built file's name: the 8 characters of Rollup's [hash] (url-safe base64) between "-" and the
 // extension, as vite.config.ts names every chunk and asset ("assets/[name]-[hash].js", "[name]-[hash][extname]").

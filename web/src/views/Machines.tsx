@@ -1,6 +1,6 @@
 // Machines: every computer's CPU / memory / network now and over the last hour (docs/server/machines.md), as Insight Cards. "Add computer"
 // (feature machines_add) adds one from here, and a computer waiting to be confirmed (trust pending) says so on its card.
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
 import { storedValue, storeValue } from "../lib/compatibility";
 import { concernOf, launcherFailing, machineAlerts, orderMachines, type AlertKind, type LauncherHealthRecord } from "../lib/machine-alerts";
 import { t as tr } from "../i18n";
@@ -21,9 +21,8 @@ import type { Machine, MachineMetrics, Session } from "../lib/types";
 import { Button, cx, EASE, IconButton, Loading, toast } from "../ui/atoms";
 import { Icon } from "../ui/icons";
 import { Empty } from "./assistant/parts";
-import { AddComputer, type PendingComputer } from "./machines/AddComputer";
-import { HelpDialog } from "./assistant/Readiness";
-import { MachineDeploy } from "./machines/MachineDeploy";
+import { lazyDialog, lazyOverlay } from "./LazyOverlay";
+import type { PendingComputer } from "./machines/AddComputer";
 import { MachineMetricsSummary } from "./machines/MachineMetricsSummary";
 import { AlertChips } from "./machines/MachineAlertChips";
 import { MachineAlertSheet } from "./machines/MachineAlertSheet";
@@ -34,6 +33,17 @@ import { useScopedMachines } from "../lib/current-assistant";
 import { t } from "../i18n";
 import { addTokens, formatTokens, hitRate, percentText, totalTokens, type UsageTokens } from "../lib/tokens";
 
+const NOOP = () => {};
+type MachineDeployProps = ComponentProps<typeof import("./machines/MachineDeploy").MachineDeploy>;
+
+// Loaded strictly on demand when the user opens Add computer or Help, or when a card has a deployment banner (no idle preload).
+const AddComputer = lazyDialog(() => import("./machines/AddComputer").then((m) => m.AddComputer));
+const HelpDialog = lazyOverlay(() => import("./assistant/ReadinessHelp").then((m) => m.HelpDialog));
+const MachineDeploy = lazyOverlay<MachineDeployProps & { onClose: () => void }>(() =>
+  import("./machines/MachineDeploy").then(({ MachineDeploy: Deploy }) => function LazyMachineDeploy(props: MachineDeployProps & { onClose: () => void }) {
+    return <Deploy machine={props.machine} className={props.className} onDetails={props.onDetails} />;
+  }),
+);
 export function Machines({ onToggleSidebar }: { onToggleSidebar: () => void }) {
   // with several assistants, the current one's computers (docs/assistant/managers.md "Clients"); one: as before
   const machines = useScopedMachines();
@@ -229,7 +239,8 @@ type AgentsKnown = "yes" | "loading" | "failed";
 // machines push that only moved last_seen on (sameCard).
 const MachineCard = memo(function MachineCard({ m, index, metrics: mm, hub, route, canAdd, answering, onReconnect, onAnswer, onAddAgain, managerOffline, agents, working, known, launcherIssues, onAlert }: CardProps) {
   const detail = { name: "machine" as const, mid: m.id };
-  const { expectedDisconnect } = machineDeployment(m);
+  const deployment = machineDeployment(m);
+  const { expectedDisconnect } = deployment;
   const pending = isPending(m);
   // why it is offline: the hub's error_code in our words, else from the error text, and what to do
   const coded = pending ? "" : machineErrorText(m.error_code);
@@ -314,7 +325,9 @@ const MachineCard = memo(function MachineCard({ m, index, metrics: mm, hub, rout
       )}
       {/* an offline card has no metrics under them: the chips keep their own room above the footer */}
       <AlertChips alerts={alerts} onOpen={(kind) => onAlert(m.id, kind)} className={m.online ? undefined : "mb-3"} />
-      <MachineDeploy machine={m} className="mt-2" onDetails={() => onAlert(m.id, m.deploy_error ? "deploy_failed" : "mismatch")} />
+      {deployment.visible && (
+        <MachineDeploy machine={m} className="mt-2" onDetails={() => onAlert(m.id, m.deploy_error ? "deploy_failed" : "mismatch")} onClose={NOOP} />
+      )}
       <MachineMetricsSummary machine={m} metrics={mm} />
       {/* the gap keeps the state and the versions apart when the versions have to shorten */}
       <div className="flex items-center justify-between gap-3 border-t border-line px-4 py-2 text-[11.5px] text-ink-3">

@@ -54,7 +54,7 @@ import { Icon } from "../../ui/icons";
 import { StoppedAgentLine } from "./StoppedAgentLine";
 const TakeoverAction = lazy(() => import("./TakeoverAction"));
 import { scrollBehavior } from "../../ui/stream/motion";
-import { segmentChanges, shiftAbove } from "./offscreen";
+import { segmentChanges, shiftAbove, type SizeChange } from "./offscreen";
 import { glide } from "./glide";
 import { AGENT_COMMANDS, Composer, type Outgoing } from "./Composer";
 import { agentCommands } from "../../lib/composer-commands";
@@ -137,7 +137,7 @@ import { codedFailure, knownAction, refreshReadiness, type CodedFailure } from "
 import { FALLBACK_UNAVAILABLE, recoveryExhausted } from "../../lib/model-fallback";
 import { BASE } from "../../lib/base";
 import { usageLimitLabel } from "../../lib/usage-limit";
-import { displayLines, getFeedState, loadedFrom, loadFeed, loadToday, sendRouted, startOfDay, useFeed, type FeedItem } from "../../lib/feed";
+import { displayLines, getFeedState, loadedFrom, loadFeed, loadToday, sendRouted, startOfDay, useFeed, type DisplayLine, type FeedItem } from "../../lib/feed";
 import { CardConversation } from "../../ui/AssistantCard";
 import { SessionMark, sessionMarkName } from "../../ui/AgentMark";
 import { sessionAgentName } from "../../lib/agent-kind";
@@ -178,6 +178,10 @@ const ModelFallbackCard = lazy(() => import("./ModelFallbackCard").then((m) => (
 const UndeliveredBubble = lazyPage(() => import("./UndeliveredBubbles").then((m) => m.UndeliveredBubble));
 
 const NO_FEED: FeedItem[] = [];
+const NO_DISPLAY_LINES: DisplayLine[] = [];
+// Below this many exchanges the ordinary immediate mount is cheaper than observing rows. Past it, completed off-screen
+// bodies mount a viewport at a time (SegmentView); their sections, estimates and live / final-two rules stay as they were.
+const CHAT_WINDOW_MIN_SEGMENTS = 40;
 // A worker's card as its own conversation shows it (#5180): without the fold that makes it "From worker" on its lead's page.
 // One copy per card object, so a push that leaves the card alone leaves its copy alone too.
 const ownCopies = new WeakMap<Interaction, Interaction>();
@@ -964,39 +968,49 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
   // the view moves by as much, so what is on screen stays (offscreen.ts).
   const heights = useRef(new WeakMap<Element, number>());
   const resized = useRef<ResizeObserver | null>(null);
+  const compensate = useCallback((changes: SizeChange[]) => {
+    const sc = scroller.current;
+    if (!sc) return;
+    if (gliding.current) return;
+    const viewTop = sc.getBoundingClientRect().top;
+    const l = landing.current;
+    if (l && (l.row instanceof Range ? l.row.startContainer : l.row).isConnected) {
+      const off = l.row.getBoundingClientRect().top - viewTop - l.at;
+      if (Math.abs(off) >= 0.5) {
+        sc.scrollTop += off;
+        holdLanding(1200);
+      }
+      return;
+    }
+    const a = anchor.current;
+    if (a && a.el.isConnected) {
+      const r = a.el.getBoundingClientRect();
+      const next = anchoredScroll(a, {
+        scrollTop: sc.scrollTop, scrollHeight: sc.scrollHeight, clientHeight: sc.clientHeight,
+        viewTop: sc.getBoundingClientRect().top, edgeAt: r.top, elTop: r.top,
+      });
+      if (Math.abs(next.scrollTop - sc.scrollTop) >= 0.5) sc.scrollTop = next.scrollTop;
+      clearTimeout(a.quiet);
+      a.quiet = window.setTimeout(() => (anchor.current = null), 600);
+      return;
+    }
+    if (atEnd.current) sc.scrollTop = sc.scrollHeight;
+    else {
+      const shift = shiftAbove(changes, viewTop);
+      if (shift) sc.scrollTop += shift;
+    }
+  }, [holdLanding]);
   const sizes = useCallback(() => (resized.current ??= new ResizeObserver((entries) => {
-      const sc = scroller.current;
-      if (!sc) return;
-      const changes = segmentChanges(entries, heights.current);
-      if (gliding.current) return;
-      const viewTop = sc.getBoundingClientRect().top;
-      const l = landing.current;
-      if (l && (l.row instanceof Range ? l.row.startContainer : l.row).isConnected) {
-        const off = l.row.getBoundingClientRect().top - viewTop - l.at;
-        if (Math.abs(off) >= 0.5) {
-          sc.scrollTop += off;
-          holdLanding(1200);
-        }
-        return;
-      }
-      const a = anchor.current;
-      if (a && a.el.isConnected) {
-        const r = a.el.getBoundingClientRect();
-        const next = anchoredScroll(a, {
-          scrollTop: sc.scrollTop, scrollHeight: sc.scrollHeight, clientHeight: sc.clientHeight,
-          viewTop: sc.getBoundingClientRect().top, edgeAt: r.top, elTop: r.top,
-        });
-        if (Math.abs(next.scrollTop - sc.scrollTop) >= 0.5) sc.scrollTop = next.scrollTop;
-        clearTimeout(a.quiet);
-        a.quiet = window.setTimeout(() => (anchor.current = null), 600);
-        return;
-      }
-      if (atEnd.current) sc.scrollTop = sc.scrollHeight;
-      else {
-        const shift = shiftAbove(changes, viewTop);
-        if (shift) sc.scrollTop += shift;
-      }
-    })), [holdLanding]);
+      if (!scroller.current) return;
+      compensate(segmentChanges(entries, heights.current));
+    })), [compensate]);
+  // A windowed body mounts from IntersectionObserver, later in the frame than content-visibility's own layout. Give
+  // the same compensation its old and new heights now, and advance the observer's baseline so it cannot apply them twice.
+  const windowDrawn = useCallback((section: HTMLElement, was: number) => {
+    const rect = section.getBoundingClientRect();
+    heights.current.set(section, rect.height);
+    compensate([{ top: rect.top, was, now: rect.height }]);
+  }, [compensate]);
   useEffect(() => {
     const view = scroller.current;
     const el = view?.firstElementChild;
@@ -1398,6 +1412,11 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
     () => (modes?.scope === `${mid}/${sid}` ? modes.kit.withModeChanges(dayRows, modes.changes, tr.hasMore || earlier.stretches.length > 0 ? earlier.liveItems : undefined) : dayRows),
     [modes, mid, sid, dayRows, tr.hasMore, earlier.stretches.length, earlier.liveItems],
   );
+  const feedFrom = useMemo(() => (assistant && tr.hasMore ? loadedFrom(tr.items) : undefined), [assistant, tr.hasMore, tr.items]);
+  const assistantLines = useMemo(
+    () => (assistant ? displayLines(lines, feed, feedFrom) : NO_DISPLAY_LINES),
+    [assistant, lines, feed, feedFrom],
+  );
   // the last exchange while the chat is at work, even while a message of yours on its way draws it finished (live needs
   // !outgoing above): its words get no reply bar until the work is over (#5314, SegmentView `busy`)
   const busySegment = useMemo(() => (lastLive ? lines.findLast((line) => line.kind === "segment")?.id : undefined), [lastLive, lines]);
@@ -1625,8 +1644,8 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
   // what runs its subagents: its own agent (a Paseo provider's subagent cards say "Grok", #8142)
   const harness = session && !assistant ? sessionAgentName(session) : undefined;
   const ctx = useMemo<ChatContextValue>(
-    () => ({ tasks, subagents: assistant ? NO_SUBAGENTS : (subagents ?? NO_SUBAGENTS), scope: `${mid}/${sid}:`, jumpToCall: jump, workflowCalls: wfCalls, lineStyle, harness, opening: openingId && openingOrigin ? { id: openingId, origin: openingOrigin, opened_by: openingBy, manager: openingManager } : undefined, closeoutSegment: closeoutSegment?.id, children: places, embedded }),
-    [tasks, subagents, assistant, mid, sid, jump, wfCalls, lineStyle, harness, openingId, openingOrigin, openingBy, openingManager, closeoutSegment, places, embedded],
+    () => ({ tasks, subagents: assistant ? NO_SUBAGENTS : (subagents ?? NO_SUBAGENTS), scope: `${mid}/${sid}:`, jumpToCall: jump, workflowCalls: wfCalls, lineStyle, harness, opening: openingId && openingOrigin ? { id: openingId, origin: openingOrigin, opened_by: openingBy, manager: openingManager } : undefined, closeoutSegment: closeoutSegment?.id, children: places, embedded, windowHistory: segs.length >= CHAT_WINDOW_MIN_SEGMENTS, windowDrawn }),
+    [tasks, subagents, assistant, mid, sid, jump, wfCalls, lineStyle, harness, openingId, openingOrigin, openingBy, openingManager, closeoutSegment, places, embedded, segs.length, windowDrawn],
   );
   // ── "Search in chat" (ChatSearch.tsx, Android ChatSearchState): where the reader was when it opened, going to a hit (the
   // rows that hold it open, search-reveal.ts), lit for HIT_MS, and "Back to where you were" ──
@@ -2131,7 +2150,7 @@ function ActiveChatView({ mid, sid, assistant, starting: launching, onToggleSide
               <CardConversation.Provider value={assistant ? sid : ""}>
               {earlier.host && <Suspense fallback={null}><EarlierStretches {...earlier.host} offscreen={offscreen} /></Suspense>}
               {assistant
-                ? displayLines(lines, feed, tr.hasMore ? loadedFrom(tr.items) : undefined).flatMap((d) => [
+                ? assistantLines.flatMap((d) => [
                     ...failedBefore(d.kind === "chat" ? d.id : ""),
                     d.kind === "feed" ? (
                       <FeedLineView key={d.id} item={d.item} simplified />
