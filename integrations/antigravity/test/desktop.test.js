@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { startFakeNode } from '../../runtime-sdk/testing/fake-node.js'
-import { createDesktopRuntime } from '../lib/desktop.js'
+import { createDesktopRuntime, resolveModel } from '../lib/desktop.js'
 import { installAntigravityPackage } from '../install.mjs'
 
 test('desktop attaches to existing sessions, follows transcripts, and routes only their controls', async t => {
@@ -200,4 +200,154 @@ test('supervised desktop entrypoint exits on parent EOF without the App', { time
   await Promise.race([node.ready, exit.then(() => { throw new Error('Bridge exited before hello: ' + errors) })])
   child.stdin.end()
   assert.deepEqual(await exit, [0, null], errors)
+})
+
+test('desktop supports ConversationService start, rename, archive, cursor, settled interrupt, and hub retry', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-conv-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const createdId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+  const archivedId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+  const probeId = 'cccccccc-dddd-4eee-8fff-111111111111'
+  const existingId = 'dddddddd-eeee-4fff-8111-222222222222'
+  const folder = join(dir, 'brain', createdId, '.system_generated', 'logs')
+  mkdirSync(folder, { recursive: true })
+  const node = await startFakeNode(t)
+
+  const convCalls = []
+  const lsCalls = []
+  let discoverCount = 0
+  let failOnceWithRefused = false
+  let runState = 'RUN_STATE_RUNNING'
+  const conversations = new Map([
+    [existingId, { id: existingId, annotations: { title: 'From Conv' }, state: { runState: 'RUN_STATE_IDLE', updateTime: new Date().toISOString() } }],
+    [archivedId, { id: archivedId, annotations: { title: 'Hidden Archived', archived: true }, state: { runState: 'RUN_STATE_IDLE' } }],
+    [probeId, { id: probeId, metadata: { tags: ['persona-probe'] }, state: { runState: 'RUN_STATE_IDLE' } }],
+  ])
+
+  const runtime = createDesktopRuntime({
+    dir,
+    home: '/Users/tester',
+    socketPath: node.path,
+    hubCacheMs: 60_000,
+    workingPollMs: 0,
+    interruptPollMs: 10,
+    interruptTimeoutMs: 500,
+    discover: async () => ({ httpPort: 50000 + (++discoverCount), csrfToken: 'tok' }),
+    call: async (hub, method, params) => {
+      if (failOnceWithRefused) {
+        failOnceWithRefused = false
+        throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+      }
+      lsCalls.push({ port: hub.httpPort, method, params })
+      if (method === 'GetAllCascadeTrajectories') {
+        return { trajectorySummaries: { [archivedId]: { summary: 'Archived Leak' }, [probeId]: { summary: 'Probe Leak' } } }
+      }
+      if (method === 'GetCascadeModelConfigData') {
+        return {
+          defaultOverrideModelConfig: { modelOrAlias: { model: 'MODEL_PLACEHOLDER_M1' } },
+          clientModelConfigs: [
+            { modelId: 'gemini-pro-high', label: 'Gemini Pro (High)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M1' }, supportsImages: true },
+            { modelId: 'gemini-pro-low', label: 'Gemini Pro (Low)', modelOrAlias: { model: 'MODEL_PLACEHOLDER_M2' }, supportsImages: true },
+          ],
+        }
+      }
+      return {}
+    },
+    conversationCall: async (hub, method, params) => {
+      convCalls.push({ port: hub.httpPort, method, params })
+      if (method === 'ListConversations') return { conversations: [...conversations.values()] }
+      if (method === 'CreateConversation') {
+        const conv = {
+          id: createdId,
+          metadata: { createTime: new Date().toISOString(), tags: params.tags || [] },
+          annotations: params.title ? { title: params.title } : {},
+          state: { runState: params.prompt?.length ? 'RUN_STATE_RUNNING' : 'RUN_STATE_IDLE', updateTime: new Date().toISOString() },
+        }
+        conversations.set(createdId, conv)
+        return { conversation: conv }
+      }
+      if (method === 'UpdateConversation') {
+        const cur = conversations.get(params.conversationId) || { id: params.conversationId, annotations: {}, state: { runState: 'RUN_STATE_IDLE' } }
+        cur.annotations = { ...cur.annotations, ...params.annotations }
+        conversations.set(params.conversationId, cur)
+        return { conversation: cur }
+      }
+      if (method === 'GetConversation') {
+        const cur = conversations.get(params.conversationId)
+        if (!cur) throw new Error('HTTP 404')
+        return { conversation: { ...cur, state: { ...cur.state, runState } } }
+      }
+      return {}
+    },
+  })
+  t.after(() => runtime.stop())
+  await runtime.start()
+  await node.ready
+
+  const until = async fn => {
+    for (let i = 0; i < 100 && !fn(); i++) await delay(25)
+    assert.ok(fn())
+  }
+  await until(() => node.last('runtime.sessions'))
+  // Archived and persona-probe conversations must be filtered even though GetAllCascadeTrajectories returned them.
+  const initialIds = node.last('runtime.sessions').sessions.map(s => s.session_id)
+  assert.deepEqual(initialIds, ['desktop-agy-' + existingId])
+
+  // Start a new conversation with effort override and cwd context.
+  const started = await node.peer.call('session.start', {
+    cwd: '/Users/tester/repo',
+    prompt: 'Hello desktop',
+    model: 'gemini-pro-high',
+    effort: 'low',
+    title: 'Initial Title',
+    client_msg_id: 'start-msg-1',
+  })
+  const sid = 'desktop-agy-' + createdId
+  assert.equal(started.session.session_id, sid)
+  assert.equal(started.session.status, 'working')
+  assert.equal(started.session.model, 'gemini-pro-low')
+  assert.equal(started.session.started_by_persona, true)
+  const createReq = convCalls.find(c => c.method === 'CreateConversation')
+  assert.equal(createReq.params.model, 'gemini-pro-low')
+  assert.deepEqual(createReq.params.tags, ['persona'])
+  assert.equal(createReq.params.title, 'Initial Title')
+  assert.match(createReq.params.prompt[0].text, /Working directory: \/Users\/tester\/repo/)
+  assert.match(createReq.params.prompt[0].text, /Hello desktop/)
+
+  // Start rejects images (must send images after session creation).
+  await assert.rejects(node.peer.call('session.start', { prompt: 'hi', images: [{ mime: 'image/png', data: png }] }), { code: 'unsupported' })
+
+  // Transcript client_msg_id matching + watch cursor (uses driver.cursor).
+  writeFileSync(join(folder, 'transcript.jsonl'), JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: 'Hello desktop' }) + '\n')
+  const page = await node.peer.call('session.items', { session_id: sid })
+  assert.equal(page.items[0].client_msg_id, 'start-msg-1')
+  const watched = await node.peer.call('session.watch', { session_id: sid, after_seq: 1, history: page.history })
+  assert.equal(watched.ok, true)
+  await node.peer.call('session.unwatch', { session_id: sid })
+
+  // Follow-up send on a newly created conversation works even before trajectory steps exist, and retries after ECONNREFUSED.
+  failOnceWithRefused = true
+  await node.peer.call('session.send', { session_id: sid, text: 'second turn', client_msg_id: 'turn-2' })
+  assert.ok(discoverCount >= 2, 'ECONNREFUSED invalidated hub cache and rediscovered')
+  assert.equal(lsCalls.at(-1).method, 'SendUserCascadeMessage')
+  assert.equal(lsCalls.at(-1).params.cascadeId, createdId)
+
+  // Rename, settled interrupt, archive, and unarchive.
+  await node.peer.call('session.rename', { session_id: sid, title: 'Renamed Title' })
+  assert.deepEqual(convCalls.at(-1).params, { conversationId: createdId, annotations: { title: 'Renamed Title' } })
+
+  runState = 'RUN_STATE_IDLE'
+  const intr = await node.peer.call('session.interrupt', { session_id: sid })
+  assert.deepEqual(intr, { ok: true, settled: true })
+
+  await node.peer.call('session.archive', { session_id: sid })
+  await until(() => !node.last('runtime.sessions').sessions.some(s => s.session_id === sid))
+
+  await node.peer.call('session.unarchive', { session_id: sid })
+  await until(() => node.last('runtime.sessions').sessions.some(s => s.session_id === sid))
+
+  // resolveModel helper checks.
+  const cat = [{ id: 'gemini-pro-high', name: 'Gemini Pro (High)', default: true }, { id: 'gemini-pro-low', name: 'Gemini Pro (Low)' }]
+  assert.equal(resolveModel('Gemini Pro (High)', 'low', cat), 'gemini-pro-low')
+  assert.equal(resolveModel('', '', cat), 'gemini-pro-high')
 })

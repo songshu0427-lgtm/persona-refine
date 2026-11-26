@@ -6,9 +6,21 @@ import { createDesktopRuntime } from './lib/desktop.js'
 const { values } = parseArgs({ options: {
   socket: { type: 'string' },
   'desktop-dir': { type: 'string' },
+  runtime: { type: 'string' },
+  launcher: { type: 'string' },
+  'display-name': { type: 'string' },
+  model: { type: 'string' },
   'parent-stdin': { type: 'boolean' },
 } })
-const runtime = createDesktopRuntime({ dir: values['desktop-dir'], socketPath: values.socket, log: console.error })
+const runtime = createDesktopRuntime({
+  dir: values['desktop-dir'],
+  socketPath: values.socket,
+  runtime: values.runtime,
+  launcher: values.launcher,
+  name: values['display-name'],
+  defaultModel: values.model,
+  log: console.error,
+})
 await runtime.start()
 const keepAlive = setInterval(() => {}, 1 << 30)
 let stopping = false

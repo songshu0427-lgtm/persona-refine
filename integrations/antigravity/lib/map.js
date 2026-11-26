@@ -1,6 +1,6 @@
 import { MCP_SERVER_NAMES, SNAPSHOT_RE, SNAPSHOT_END_RE } from '../../runtime-sdk/lib/compat.js'
 // Mapping between Antigravity CLI (agy) transcripts / ACP updates and Persona runtime items.
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { basename, join } from 'node:path'
 import { appToolName, clipInput, light, snippet } from '../../runtime-sdk/index.js'
@@ -11,6 +11,8 @@ export const PREFIX = 'agy-'
 
 // Kept off native JSON: an appended replacement branch is a new logical step even when its timestamp repeats.
 const STEP_IDENTITY = Symbol('persona.agy.stepIdentity')
+const IMMUTABLE_STEPS = Symbol('persona.agy.immutableSteps')
+const weakItemsCache = new WeakMap()
 
 function stepIdentity(step, branch = '') {
   const birth = typeof step.created_at === 'string' ? step.created_at : ''
@@ -149,15 +151,27 @@ export function cleanGenericOutput(content) {
 /**
  * Parse a transcript.jsonl file (or array of parsed step objects) into Persona items.
  * @param {object[]} steps
- * @param {{ brainDir?: string, full?: boolean, userImage?: (media: object) => object | undefined }} [opts]
+ * @param {{ brainDir?: string, full?: boolean, skipCache?: boolean, clientMsgKey?: string, userImageKey?: string, clientMsgIdFor?: (idx: number, text: string, ordinal: number) => string | undefined, userImage?: (media: object) => object | undefined }} [opts]
  */
 export function stepsToItems(steps, opts = {}) {
+  const canWeakCache = !opts.skipCache && Boolean(steps?.[IMMUTABLE_STEPS]) &&
+    (!opts.clientMsgIdFor || typeof opts.clientMsgKey === 'string') &&
+    (!opts.userImage || typeof opts.userImageKey === 'string')
+  const weakOptKey = canWeakCache
+    ? `${opts.full ? 1 : 0}:${opts.brainDir || ''}:${opts.clientMsgKey || ''}:${opts.userImageKey || ''}`
+    : ''
+  if (canWeakCache) {
+    const hit = weakItemsCache.get(steps)?.get(weakOptKey)
+    if (hit) return hit
+  }
+
   const items = []
   const pendingCalls = []
   let maxSeq = 0
   let lastText = ''
   let turnError
   let afterWork = false
+  let userOrdinal = 0
 
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i]
@@ -176,8 +190,9 @@ export function stepsToItems(steps, opts = {}) {
         lastText = ''
         turnError = undefined
         afterWork = false
+        userOrdinal++
         const text = cleanUserText(step.content)
-        const msgId = (typeof step.client_msg_id === 'string' && step.client_msg_id) || opts.clientMsgIdFor?.(idx, text)
+        const msgId = (typeof step.client_msg_id === 'string' && step.client_msg_id) || opts.clientMsgIdFor?.(idx, text, userOrdinal)
         const common = { seq, role: 'user', ts, ...(msgId ? { client_msg_id: msgId } : {}) }
         if (text) {
           const item = { ...common, id: `${line}#0`, kind: 'text', text }
@@ -188,6 +203,10 @@ export function stepsToItems(steps, opts = {}) {
           const image = opts.userImage?.(media)
           if (image) items.push({ ...common, id: `${line}#${i + 1}`, kind: 'image', image })
         }
+        break
+      }
+      case 'CHECKPOINT': {
+        items.push({ id: `${line}#0`, seq, role: 'system', kind: 'notice', text: '上下文已压缩', ts })
         break
       }
       case 'PLANNER_RESPONSE': {
@@ -268,15 +287,116 @@ export function stepsToItems(steps, opts = {}) {
     }
   }
 
-  return { items, toSeq: maxSeq, lastText, turnError }
+  const result = { items, toSeq: maxSeq, lastText, turnError }
+  if (canWeakCache) {
+    let byOpt = weakItemsCache.get(steps)
+    if (!byOpt) {
+      byOpt = new Map()
+      weakItemsCache.set(steps, byOpt)
+    }
+    byOpt.set(weakOptKey, result)
+  }
+  return result
 }
 
 const transcriptCache = new Map()
 const transcriptRevisions = new Map()
-const MAX_CACHED_TRANSCRIPTS = 16
+const MAX_CACHED_TRANSCRIPTS = 128
 const MAX_TRANSCRIPT_REVISIONS = 256
 const MAX_TRANSCRIPT_CACHE_BYTES = 64 * 1024 * 1024
 let transcriptCacheBytes = 0
+
+function readRange(fd, offset, length) {
+  if (length <= 0) return Buffer.alloc(0)
+  const buf = Buffer.allocUnsafe(length)
+  let done = 0
+  while (done < length) {
+    const n = readSync(fd, buf, done, length - done, offset + done)
+    if (n <= 0) return buf.subarray(0, done)
+    done += n
+  }
+  return buf
+}
+
+function hashPrefix(fd, size) {
+  const hasher = createHash('sha256')
+  const chunk = Buffer.allocUnsafe(Math.min(Math.max(size, 1), 65536))
+  let pos = 0
+  while (pos < size) {
+    const n = readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos)
+    if (n <= 0) break
+    hasher.update(n === chunk.length ? chunk : chunk.subarray(0, n))
+    pos += n
+  }
+  return { hasher, hash: hasher.copy().digest('hex'), bytesRead: pos }
+}
+
+function applyTranscriptText(text, out, state) {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const step = JSON.parse(trimmed)
+      const previous = out.at(-1)
+      const index = step?.step_index
+      if (Number.isInteger(index) && Number.isInteger(previous?.step_index) && index <= previous.step_index) {
+        // Native exports append replacement steps after a rewind. A status update keeps the step's identity.
+        if (index < previous.step_index || step.type !== previous.type || step.created_at !== previous.created_at) {
+          state.branch = createHash('sha256').update(state.branch).update('\n').update(trimmed).digest('hex').slice(0, 20)
+          state.revision = ''
+        } else if (JSON.stringify(previous) !== JSON.stringify(step)) {
+          // A planner step can gain its completed response while keeping its index and branch.
+          state.revision = createHash('sha256').update(JSON.stringify(step)).digest('hex').slice(0, 20)
+        }
+        while (out.length && out.at(-1).step_index >= index) out.pop()
+      }
+      // Compute once with the parsed record, rather than rehashing every step on each session-list pass.
+      if (step && typeof step === 'object') Object.defineProperty(step, STEP_IDENTITY, { value: stepIdentity(step, state.branch) })
+      out.push(step)
+    } catch {}
+  }
+}
+
+function parseTranscriptBuffer(buf, baseSteps, baseBranch, baseNativeRevision) {
+  const lastNl = buf.lastIndexOf(10)
+  const completeLen = lastNl >= 0 ? lastNl + 1 : 0
+  const committedSteps = baseSteps ? baseSteps.slice() : []
+  const committedState = { branch: baseBranch || '', revision: baseNativeRevision || '' }
+  if (completeLen > 0) applyTranscriptText(buf.subarray(0, completeLen).toString('utf8'), committedSteps, committedState)
+  let out = committedSteps
+  let state = committedState
+  if (completeLen < buf.length) {
+    out = committedSteps.slice()
+    state = { ...committedState }
+    applyTranscriptText(buf.subarray(completeLen).toString('utf8'), out, state)
+  }
+  Object.defineProperty(out, IMMUTABLE_STEPS, { value: true })
+  return {
+    out,
+    branch: state.branch,
+    nativeRevision: state.revision,
+    committedSteps,
+    committedBranch: committedState.branch,
+    committedNativeRevision: committedState.revision,
+    completeLen,
+  }
+}
+
+function storeTranscriptCache(target, entry) {
+  const existing = transcriptCache.get(target)
+  if (existing) {
+    transcriptCache.delete(target)
+    transcriptCacheBytes -= existing.size
+  }
+  if (entry.size > MAX_TRANSCRIPT_CACHE_BYTES) return
+  while (transcriptCache.size >= MAX_CACHED_TRANSCRIPTS || transcriptCacheBytes + entry.size > MAX_TRANSCRIPT_CACHE_BYTES) {
+    const oldest = transcriptCache.keys().next().value
+    transcriptCacheBytes -= transcriptCache.get(oldest).size
+    transcriptCache.delete(oldest)
+  }
+  transcriptCache.set(target, entry)
+  transcriptCacheBytes += entry.size
+}
 
 export function readTranscriptSteps(brainDir, full = false) {
   return readTranscript(brainDir, full).steps
@@ -290,7 +410,8 @@ export function readTranscript(brainDir, full = false) {
   const compact = Boolean(full && target !== file)
   try {
     const info = statSync(target, { bigint: true })
-    const version = [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':')
+    const size = Number(info.size)
+    const fileMeta = [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':')
     // Fast same-size native rewrites can share a filesystem timestamp tick.
     const settled = Math.max(Number(info.mtimeMs), Number(info.ctimeMs)) <= Date.now() - 1000
     const remembered = transcriptRevisions.get(target)
@@ -299,63 +420,82 @@ export function readTranscript(brainDir, full = false) {
       transcriptRevisions.set(target, remembered)
     }
     const cached = transcriptCache.get(target)
-    if (cached) {
+    const returnCached = (entry) => {
+      transcriptCache.delete(target)
+      transcriptCache.set(target, entry)
+      return entry.transcript.compact === compact ? entry.transcript : { ...entry.transcript, compact }
+    }
+    if (cached && settled && cached.fileMeta === fileMeta) return returnCached(cached)
+    if (cached && cached.dev === info.dev && cached.ino === info.ino && cached.byteLength === size) {
+      let fd
+      try {
+        fd = openSync(target, 'r')
+        const { hash: hash2, bytesRead } = hashPrefix(fd, size)
+        if (bytesRead === size && hash2 === cached.hash) {
+          cached.fileMeta = fileMeta
+          return returnCached(cached)
+        }
+      } finally {
+        if (fd !== undefined) closeSync(fd)
+      }
+    }
+    if (cached && cached.dev === info.dev && cached.ino === info.ino && size > cached.byteLength) {
+      let fd
+      try {
+        fd = openSync(target, 'r')
+        const { hasher, hash: prefixHash, bytesRead } = hashPrefix(fd, cached.byteLength)
+        if (bytesRead === cached.byteLength && prefixHash === cached.hash) {
+          const deltaLen = size - cached.parsedOffset
+          const deltaBuf = readRange(fd, cached.parsedOffset, deltaLen)
+          if (deltaBuf.length === deltaLen) {
+            const newBytes = deltaBuf.subarray(cached.byteLength - cached.parsedOffset)
+            const hash2 = hasher.update(newBytes).digest('hex')
+            const parsed2 = parseTranscriptBuffer(deltaBuf, cached.committedSteps, cached.committedBranch, cached.committedNativeRevision)
+            let revision2 = parsed2.nativeRevision
+            if (remembered && remembered.branch === parsed2.branch && parsed2.nativeRevision === remembered.nativeRevision) {
+              revision2 = remembered.revision
+            }
+            transcriptRevisions.set(target, { byteLength: size, hash: hash2, branch: parsed2.branch, nativeRevision: parsed2.nativeRevision, revision: revision2 })
+            while (transcriptRevisions.size > MAX_TRANSCRIPT_REVISIONS) transcriptRevisions.delete(transcriptRevisions.keys().next().value)
+            const transcript2 = { steps: parsed2.out, branch: parsed2.branch, revision: revision2, compact }
+            storeTranscriptCache(target, {
+              dev: info.dev, ino: info.ino, fileMeta, byteLength: size,
+              parsedOffset: cached.parsedOffset + parsed2.completeLen, size, hash: hash2,
+              branch: parsed2.branch, committedSteps: parsed2.committedSteps,
+              committedBranch: parsed2.committedBranch, committedNativeRevision: parsed2.committedNativeRevision,
+              transcript: transcript2,
+            })
+            return transcript2
+          }
+        }
+      } finally {
+        if (fd !== undefined) closeSync(fd)
+      }
+    }
+    const buf = readFileSync(target)
+    const parsed = parseTranscriptBuffer(buf)
+    const hash = createHash('sha256').update(buf).digest('hex')
+    let revision = parsed.nativeRevision
+    if (remembered && remembered.branch === parsed.branch) {
+      const appended = buf.length >= remembered.byteLength &&
+        createHash('sha256').update(buf.subarray(0, remembered.byteLength)).digest('hex') === remembered.hash
+      if (!appended) revision = hash.slice(0, 20)
+      else if (parsed.nativeRevision === remembered.nativeRevision) revision = remembered.revision
+    }
+    transcriptRevisions.set(target, { byteLength: buf.length, hash, branch: parsed.branch, nativeRevision: parsed.nativeRevision, revision })
+    while (transcriptRevisions.size > MAX_TRANSCRIPT_REVISIONS) transcriptRevisions.delete(transcriptRevisions.keys().next().value)
+    const transcript = { steps: parsed.out, branch: parsed.branch, revision, compact }
+    if (buf.length === size) {
+      storeTranscriptCache(target, {
+        dev: info.dev, ino: info.ino, fileMeta, byteLength: buf.length,
+        parsedOffset: parsed.completeLen, size: buf.length, hash,
+        branch: parsed.branch, committedSteps: parsed.committedSteps,
+        committedBranch: parsed.committedBranch, committedNativeRevision: parsed.committedNativeRevision,
+        transcript,
+      })
+    } else if (cached) {
       transcriptCache.delete(target)
       transcriptCacheBytes -= cached.size
-      if (settled && cached.version === version) {
-        transcriptCache.set(target, cached)
-        transcriptCacheBytes += cached.size
-        return cached.transcript
-      }
-    }
-    const raw = readFileSync(target, 'utf8')
-    const out = []
-    let branch = ''
-    let revision = ''
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
-      try {
-        const step = JSON.parse(trimmed)
-        const previous = out.at(-1)
-        const index = step?.step_index
-        if (Number.isInteger(index) && Number.isInteger(previous?.step_index) && index <= previous.step_index) {
-          // Native exports append replacement steps after a rewind. A status update keeps the step's identity.
-          if (index < previous.step_index || step.type !== previous.type || step.created_at !== previous.created_at) {
-            branch = createHash('sha256').update(branch).update('\n').update(trimmed).digest('hex').slice(0, 20)
-            revision = ''
-          } else if (JSON.stringify(previous) !== JSON.stringify(step)) {
-            // A planner step can gain its completed response while keeping its index and branch.
-            revision = createHash('sha256').update(JSON.stringify(step)).digest('hex').slice(0, 20)
-          }
-          while (out.length && out.at(-1).step_index >= index) out.pop()
-        }
-        // Compute once with the parsed record, rather than rehashing every step on each session-list pass.
-        if (step && typeof step === 'object') Object.defineProperty(step, STEP_IDENTITY, { value: stepIdentity(step, branch) })
-        out.push(step)
-      } catch {}
-    }
-    const nativeRevision = revision
-    const hash = createHash('sha256').update(raw).digest('hex')
-    if (remembered && remembered.branch === branch) {
-      const appended = raw.length >= remembered.length &&
-        createHash('sha256').update(raw.slice(0, remembered.length)).digest('hex') === remembered.hash
-      if (!appended) revision = hash.slice(0, 20)
-      else if (nativeRevision === remembered.nativeRevision) revision = remembered.revision
-    }
-    // Keep small revision records independently of the parsed-body LRU, including fresh native rewrites.
-    transcriptRevisions.set(target, { length: raw.length, hash, branch, nativeRevision, revision })
-    while (transcriptRevisions.size > MAX_TRANSCRIPT_REVISIONS) transcriptRevisions.delete(transcriptRevisions.keys().next().value)
-    const transcript = { steps: out, branch, revision, compact }
-    const size = Number(info.size)
-    if (settled && size <= MAX_TRANSCRIPT_CACHE_BYTES) {
-      while (transcriptCache.size >= MAX_CACHED_TRANSCRIPTS || transcriptCacheBytes + size > MAX_TRANSCRIPT_CACHE_BYTES) {
-        const oldest = transcriptCache.keys().next().value
-        transcriptCacheBytes -= transcriptCache.get(oldest).size
-        transcriptCache.delete(oldest)
-      }
-      transcriptCache.set(target, { version, size, transcript })
-      transcriptCacheBytes += size
     }
     return transcript
   } catch {

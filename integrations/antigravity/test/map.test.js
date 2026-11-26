@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { MCP_SERVER_NAMES } from '../../runtime-sdk/lib/compat.js'
 import {
@@ -9,6 +12,7 @@ import {
   mapToolInput,
   mapToolName,
   personaModeToAgy,
+  readTranscript,
   stepsToItems,
   toAgyId,
   toPersonaId,
@@ -184,5 +188,50 @@ describe('antigravity transcript and tool mapping', () => {
     assert.equal(personaModeToAgy('default'), 'default')
     assert.equal(agyModeToPersona('accept-edits'), 'acceptEdits')
     assert.equal(cleanGenericOutput('Created At: 2026\nOutput:\nhello'), 'hello')
+  })
+
+  it('reads transcript appends incrementally, handles partial lines, CHECKPOINT notices, and user ordinals', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agy-map-inc-'))
+    try {
+      const logs = join(dir, '.system_generated', 'logs')
+      mkdirSync(logs, { recursive: true })
+      const file = join(logs, 'transcript.jsonl')
+      writeFileSync(file, JSON.stringify({ step_index: 0, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: 'first' }) + '\n')
+      const r1 = readTranscript(dir, false)
+      assert.equal(r1.steps.length, 1)
+
+      // Partial line without trailing newline, then completed on next append.
+      const s1 = JSON.stringify({ step_index: 1, type: 'CHECKPOINT' })
+      appendFileSync(file, s1.slice(0, 12))
+      const rPartial = readTranscript(dir, false)
+      assert.equal(rPartial.steps.length, 1)
+
+      appendFileSync(file, s1.slice(12) + '\n' + JSON.stringify({ step_index: 2, type: 'USER_INPUT', source: 'USER_EXPLICIT', content: 'second' }) + '\n')
+      const r2 = readTranscript(dir, false)
+      assert.equal(r2.steps.length, 3)
+
+      const seenOrdinals = []
+      const mapped = stepsToItems(r2.steps, {
+        clientMsgKey: 'v1',
+        clientMsgIdFor: (idx, text, ord) => {
+          seenOrdinals.push([idx, text, ord])
+          return `msg-${ord}`
+        },
+      })
+      assert.deepEqual(seenOrdinals, [[0, 'first', 1], [2, 'second', 2]])
+      assert.equal(mapped.items[0].client_msg_id, 'msg-1')
+      assert.equal(mapped.items[1].kind, 'notice')
+      assert.equal(mapped.items[1].text, '上下文已压缩')
+      assert.equal(mapped.items[2].client_msg_id, 'msg-2')
+
+      // WeakMap cache returns identical reference for same immutable steps + key.
+      const mappedAgain = stepsToItems(r2.steps, {
+        clientMsgKey: 'v1',
+        clientMsgIdFor: () => 'should-not-run',
+      })
+      assert.equal(mappedAgain, mapped)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
