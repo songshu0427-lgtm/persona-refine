@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nwverse/persona/server/internal/apierr"
+	"github.com/nwverse/persona/server/internal/devicewire"
 	"github.com/nwverse/persona/server/internal/i18n"
 	"github.com/nwverse/persona/server/internal/proto"
 	"github.com/nwverse/persona/server/internal/rpc"
@@ -284,5 +285,69 @@ func TestAgentSendReadonlyPreservesModelResult(t *testing.T) {
 	}
 	if len(s.pendingQuestions()) != 0 || len(f.pushed()) != 0 {
 		t.Fatal("model-only refusal created a user-facing card or push")
+	}
+}
+
+type agentSendCtxHub struct {
+	*fakeHub
+	seen []bool
+}
+
+func (h *agentSendCtxHub) DeviceCall(ctx context.Context, p DeviceCall) (json.RawMessage, error) {
+	if p.Method == DeviceSessionSend {
+		h.mu.Lock()
+		h.seen = append(h.seen, devicewire.IsAssistantAgentSend(ctx))
+		h.mu.Unlock()
+	}
+	return h.fakeHub.DeviceCall(ctx, p)
+}
+
+// agent_send marks its session.send context with devicewire.WithAssistantAgentSend (both live and offline sends),
+// while other manager sends (such as sendToSession) stay unmarked.
+func TestAgentSendMarksAssistantAgentSendContext(t *testing.T) {
+	s, f := newTaskService(t)
+	h := &agentSendCtxHub{fakeHub: f}
+	setHub(s, h)
+	f.setSessions("box",
+		proto.Session{
+			SessionID: "desktop-live", MachineID: "box", Cwd: "/code/app", Agent: "claude",
+			Status: proto.StatusIdle, SourceKind: proto.SourceClaudeDesktop,
+			Capabilities: &proto.SessionCapabilities{Read: true, Send: true, PluginInput: true},
+		},
+		proto.Session{
+			SessionID: "desktop-resting", MachineID: "box", Cwd: "/code/app", Agent: "claude",
+			Status: proto.StatusOffline, SourceKind: proto.SourceClaudeDesktop,
+			Capabilities: &proto.SessionCapabilities{Read: true, Send: true},
+		},
+	)
+
+	res := s.Tool(context.Background(), ToolCall{
+		MachineID: "server", SessionID: "conv9", Name: "agent_send",
+		Arguments: json.RawMessage(`{"machine":"box","session_id":"desktop-live","text":"hello live"}`),
+	})
+	if res.IsError {
+		t.Fatalf("live agent_send failed: %+v", res)
+	}
+
+	res = s.Tool(context.Background(), ToolCall{
+		MachineID: "server", SessionID: "conv9", Name: "agent_send",
+		Arguments: json.RawMessage(`{"machine":"box","session_id":"desktop-resting","text":"hello resting"}`),
+	})
+	if res.IsError {
+		t.Fatalf("offline agent_send failed: %+v", res)
+	}
+
+	if err := s.sendToSession(context.Background(), "box", "desktop-live", "background message"); err != nil {
+		t.Fatalf("sendToSession failed: %v", err)
+	}
+
+	want := []bool{true, true, false}
+	if len(h.seen) != len(want) {
+		t.Fatalf("recorded %v, want %v", h.seen, want)
+	}
+	for i := range want {
+		if h.seen[i] != want[i] {
+			t.Fatalf("session.send #%d IsAssistantAgentSend = %v, want %v (all=%v)", i, h.seen[i], want[i], h.seen)
+		}
 	}
 }

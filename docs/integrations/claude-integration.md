@@ -710,11 +710,14 @@ installs and updates it.
   Polls from a claude the node does not deliver to this way (an engine pane's, the assistant's own, an SDK's) are told
   to come back in 5 minutes. `{"kind":"claude-plugin.status"}` on the same socket lists the sessions whose plugin polls
   (for Persona Link's installer and diagnostics).
-- **Which messages**: only the owner's own. The hub marks a message typed in the owner's app (`captureHumanSubmission`:
+- **Which messages**: the owner's own messages and in-process assistant `agent_send` calls. The hub marks a message typed in the owner's app (`captureHumanSubmission`:
   a full-role device token, not a link or answer-only token, not the master token, not a member hub), and the devices
   manager turns that mark into `owner_input: true` on `session.send` (`ownerInputParams`), dropping any `owner_input`
-  a caller put in the params. Messages from the assistant, extensions, channels (the Lark and WeChat bots), relays
-  between conversations and the auth relay have no mark and keep the inbox, as do Stop and the answers to a question
+  a caller put in the params. Inside the manager, `agent_send` also carries an unexported in-process context mark
+  (`devicewire.WithAssistantAgentSend`, never serialized over JSON or the bus) so `Devices.CallNode` sets `owner_input: true`
+  on `session.send` alone, aligning Claude Desktop with terminal/Codex `agent_send` delivery without hanging in `bypassPermissions`
+  peer inbox holds. Background supervision, extensions, channels (the Lark and WeChat bots), relays
+  between conversations, the auth relay, and non-send control calls (`session.interrupt`, `codex.answer`) have no mark and keep the inbox, as do Stop and the answers to a question
   the session asked (both at priority `now`), and slash commands (still refused, `peer_command`).
 - **When**: when the plugin advertises `busy_input` (0.3.0+), owner messages go through the plugin both at rest and
   while a turn runs (`$.prompt.submit` writes `queue-operation: enqueue` immediately, without blocking the poll loop or

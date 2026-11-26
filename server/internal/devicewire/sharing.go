@@ -28,6 +28,7 @@ type ShareAuthority struct {
 type callerContextKey struct{}
 type shareAuthorityKey struct{}
 type ownerAnswerKey struct{}
+type assistantAgentSendKey struct{}
 
 // WithOwnerAnswer carries a card answer's provenance from the authenticated hub bus to Devices.
 func WithOwnerAnswer(ctx context.Context) context.Context {
@@ -36,6 +37,18 @@ func WithOwnerAnswer(ctx context.Context) context.Context {
 
 func IsOwnerAnswer(ctx context.Context) bool {
 	ok, _ := ctx.Value(ownerAnswerKey{}).(bool)
+	return ok
+}
+
+// WithAssistantAgentSend marks an in-process Devices.CallNode session.send from the assistant's
+// agent_send tool so outside Claude sessions with Persona's plugin take it through the plugin
+// instead of falling into the unattested peer inbox. Never serialized over JSON or the bus.
+func WithAssistantAgentSend(ctx context.Context) context.Context {
+	return context.WithValue(ctx, assistantAgentSendKey{}, true)
+}
+
+func IsAssistantAgentSend(ctx context.Context) bool {
+	ok, _ := ctx.Value(assistantAgentSendKey{}).(bool)
 	return ok
 }
 

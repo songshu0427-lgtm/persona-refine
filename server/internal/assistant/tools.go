@@ -13,6 +13,7 @@ import (
 
 	"github.com/nwverse/persona/server/internal/assistantwire"
 	"github.com/nwverse/persona/server/internal/compat"
+	"github.com/nwverse/persona/server/internal/devicewire"
 	"github.com/nwverse/persona/server/internal/i18n"
 	"github.com/nwverse/persona/server/internal/prompts"
 	"github.com/nwverse/persona/server/internal/proto"
@@ -447,7 +448,7 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 			var sent struct {
 				Queued bool `json:"queued"` // the runtime holds it behind the turn under way (#8097)
 			}
-			err = s.call(lctx, am.ID, DeviceSessionSend, params, &sent)
+			err = s.call(devicewire.WithAssistantAgentSend(lctx), am.ID, DeviceSessionSend, params, &sent)
 			note.sent(lctx, err) // an unknown answer counts for the agent's next turn: it may still arrive
 			if err == nil {
 				s.progressMade(am.ID, c.SessionID, time.Now()) // the supervisor told it something: a new stretch (supervise_progress.go)
@@ -475,7 +476,7 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		if err != nil {
 			return "", task.sendFailed(sctx, s, err)
 		}
-		err = s.call(sctx, am.ID, DeviceSessionSend, params, nil)
+		err = s.call(devicewire.WithAssistantAgentSend(sctx), am.ID, DeviceSessionSend, params, nil)
 		note.sent(sctx, err)
 		if err != nil {
 			return "", task.sendFailed(sctx, s, err)

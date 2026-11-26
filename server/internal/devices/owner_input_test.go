@@ -157,3 +157,51 @@ func TestOwnerInputOnControlCalls(t *testing.T) {
 		t.Errorf("node received %q, want %q", got, want)
 	}
 }
+
+// In-process assistant agent_send marks session.send with owner_input: true so outside Claude sessions connected to
+// Persona's plugin accept it through the plugin instead of stalling in the unattested peer inbox. Plain CallNode
+// callers (extensions, channels, supervision), non-send control methods, and bus Call requests never get the mark.
+func TestAssistantAgentSendCallNodeOwnerInput(t *testing.T) {
+	d := newTestDevices(t)
+	n := &testNode{info: &proto.NodeInfo{Version: "test", Protocol: nodeproto.Version, Capabilities: nodeproto.Announced}}
+	connectedMachine(t, d, "box", n)
+	ctx := context.Background()
+	sendCtx := devicewire.WithAssistantAgentSend(ctx)
+	params := json.RawMessage(`{"session_id":"s","text":"hi","OWNER_INPUT":true,"owner_input":false}`)
+
+	if _, err := d.CallNode(sendCtx, "box", "session.send", params); err != nil {
+		t.Fatalf("CallNode agent_send: %v", err)
+	}
+	if _, err := d.CallNode(ctx, "box", "session.send", params); err != nil {
+		t.Fatalf("CallNode plain send: %v", err)
+	}
+	if _, err := d.CallNode(sendCtx, "box", "session.interrupt", params); err != nil {
+		t.Fatalf("CallNode interrupt with agent_send ctx: %v", err)
+	}
+	if _, err := d.CallNode(sendCtx, "box", "codex.answer", params); err != nil {
+		t.Fatalf("CallNode codex.answer with agent_send ctx: %v", err)
+	}
+	if _, err := d.Call(sendCtx, devicewire.NodeCall{MachineID: "box", Method: "session.send", Params: params}); err != nil {
+		t.Fatalf("bus Call with agent_send ctx: %v", err)
+	}
+
+	var got []string
+	n.mu.Lock()
+	for _, call := range n.calls {
+		if strings.HasPrefix(call, "session.send ") || strings.HasPrefix(call, "session.interrupt ") || strings.HasPrefix(call, "codex.answer ") ||
+			strings.HasPrefix(call, nodeproto.OwnerInterrupt+" ") || strings.HasPrefix(call, nodeproto.OwnerCardAnswer+" ") {
+			got = append(got, call)
+		}
+	}
+	n.mu.Unlock()
+	want := []string{
+		`session.send {"owner_input":true,"session_id":"s","text":"hi"}`,
+		`session.send {"session_id":"s","text":"hi"}`,
+		`session.interrupt {"session_id":"s","text":"hi"}`,
+		`codex.answer {"session_id":"s","text":"hi"}`,
+		`session.send {"session_id":"s","text":"hi"}`,
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("node received %q, want %q", got, want)
+	}
+}

@@ -959,7 +959,8 @@ func (d *Devices) CallNode(ctx context.Context, id, method string, params json.R
 	}
 	if carriesOwnerInput(method) {
 		var err error
-		params, err = rewriteOwnerInput(params, false)
+		ownerInput := method == "session.send" && devicewire.IsAssistantAgentSend(ctx)
+		params, err = rewriteOwnerInput(params, ownerInput)
 		if err != nil {
 			return nil, err
 		}
