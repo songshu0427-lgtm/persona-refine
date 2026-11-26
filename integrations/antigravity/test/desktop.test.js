@@ -351,3 +351,74 @@ test('desktop supports ConversationService start, rename, archive, cursor, settl
   assert.equal(resolveModel('Gemini Pro (High)', 'low', cat), 'gemini-pro-low')
   assert.equal(resolveModel('', '', cat), 'gemini-pro-high')
 })
+
+test('desktop reports Antigravity quota windows when node advertises usage_windows and re-emits on hub reconnect', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-quota-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const node = await startFakeNode(t, { features: ['prefer_running', 'usage_windows'], hub: false })
+  let quotaCalls = 0
+  let failForceRefresh = true
+  const future5h = new Date(Date.now() + 2 * 3600_000).toISOString()
+  const future7d = new Date(Date.now() + 5 * 24 * 3600_000).toISOString()
+  const runtime = createDesktopRuntime({
+    dir,
+    socketPath: node.path,
+    usageWindowsEveryMs: 0,
+    discover: async () => ({ httpPort: 55555, csrfToken: 'tok' }),
+    call: async (_, method, params) => {
+      if (method === 'GetAllCascadeTrajectories') return { trajectorySummaries: {} }
+      if (method === 'GetCascadeModelConfigData') return {}
+      if (method === 'RetrieveUserQuotaSummary') {
+        quotaCalls++
+        if (failForceRefresh && params?.request?.forceRefresh === true) {
+          failForceRefresh = false
+          throw new Error('forceRefresh unsupported')
+        }
+        return {
+          response: {
+            groups: [
+              {
+                displayName: 'Gemini Models',
+                buckets: [
+                  { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9, resetTime: future5h },
+                  { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.95, resetTime: future7d },
+                ],
+              },
+              {
+                displayName: 'Claude and GPT models',
+                buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }],
+              },
+            ],
+          },
+        }
+      }
+      if (method === 'GetUserStatus') {
+        return { userStatus: { planStatus: { planInfo: { planName: 'Pro' } } } }
+      }
+      return {}
+    },
+  })
+  t.after(() => runtime.stop())
+  await runtime.start()
+  await node.ready
+
+  const until = async fn => {
+    for (let i = 0; i < 100 && !fn(); i++) await delay(25)
+    assert.ok(fn())
+  }
+  await until(() => node.last('usage.windows'))
+  const first = node.last('usage.windows')
+  assert.equal(first.provider, 'agy')
+  assert.equal(first.name, 'Antigravity')
+  assert.equal(first.plan, 'Pro')
+  assert.deepEqual(first.windows, [
+    { label: '5h', window_minutes: 300, used_percent: 10, resets_at: future5h, model: 'Gemini Models' },
+    { label: '5h', window_minutes: 300, used_percent: 0, model: 'Claude and GPT models' },
+    { label: '7d', window_minutes: 10080, used_percent: 5, resets_at: future7d, model: 'Gemini Models' },
+  ])
+  const callsAfterFirst = quotaCalls
+  // When the hub connects right after startup, desktop re-emits the fresh snapshot without hitting RPC again.
+  node.setHub(true)
+  await until(() => node.all('usage.windows').length >= 2)
+  assert.equal(quotaCalls, callsAfterFirst)
+})

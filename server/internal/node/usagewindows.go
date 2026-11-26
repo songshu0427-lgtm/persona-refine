@@ -117,6 +117,75 @@ func mergeUsage(kept, found map[string]proto.UsageAccount, now time.Time) map[st
 	return out
 }
 
+// runtimeUsageWindows stores one local runtime's subscription quota snapshot beside the file sources. The runtime owns
+// its own source key ("runtime:<id>"): a newer sample replaces the older one, malformed samples leave the previous one
+// intact, an explicit empty window list clears it, and daemon-originated reports are ignored.
+func (n *Node) runtimeUsageWindows(h *runtimeConn, params json.RawMessage, now time.Time) {
+	if h == nil || h.isDaemon() {
+		return
+	}
+	var a proto.UsageAccount
+	if json.Unmarshal(params, &a) != nil {
+		return
+	}
+	var required struct {
+		Windows []struct {
+			UsedPercent *float64 `json:"used_percent"`
+		} `json:"windows"`
+	}
+	// A missing or null number becomes a float64 zero, so check its presence at the raw event boundary too.
+	if json.Unmarshal(params, &required) != nil || len(required.Windows) != len(a.Windows) {
+		return
+	}
+	a.Provider = strings.TrimSpace(a.Provider)
+	a.Name = strings.TrimSpace(a.Name)
+	a.Plan = strings.TrimSpace(a.Plan)
+	if a.Provider == "" || len(a.Provider) > 64 || a.Name == "" || len(a.Name) > 128 || len(a.Plan) > 128 ||
+		a.SampledAt.IsZero() || now.Sub(a.SampledAt) > usageWindowsMaxAge || a.SampledAt.After(now.Add(5*time.Minute)) ||
+		a.Windows == nil || len(a.Windows) > 32 {
+		return
+	}
+	windows := make([]proto.UsageWindow, 0, len(a.Windows))
+	for i, w := range a.Windows {
+		if required.Windows[i].UsedPercent == nil || w.WindowMinutes <= 0 || len(w.Model) > 256 {
+			return
+		}
+		w.Label = proto.WindowLabel(w.WindowMinutes)
+		w.UsedPercent = clampPercent(w.UsedPercent)
+		if w.ResetsAt != nil {
+			t := w.ResetsAt.UTC()
+			w.ResetsAt = &t
+		}
+		windows = append(windows, w)
+	}
+	a.Windows = liveWindows(windows, now)
+	a.SampledAt = a.SampledAt.UTC()
+
+	h.mu.Lock()
+	source := "runtime:" + h.hello.Runtime
+	h.mu.Unlock()
+	st := &n.usageWin
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.off.Load() {
+		return
+	}
+	if st.accounts == nil {
+		st.accounts = map[string]proto.UsageAccount{}
+	}
+	if previous, ok := st.accounts[source]; ok && a.SampledAt.Before(previous.SampledAt) {
+		return
+	}
+	if len(a.Windows) == 0 {
+		delete(st.accounts, source)
+	} else {
+		st.accounts[source] = a
+	}
+	if !st.at.IsZero() {
+		st.at = now
+	}
+}
+
 // collectUsageWindows reads every source once.
 func (n *Node) collectUsageWindows(now time.Time) map[string]proto.UsageAccount {
 	out := map[string]proto.UsageAccount{}

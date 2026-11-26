@@ -53,6 +53,8 @@ func (n *Node) runtimeEvent(h *runtimeConn, event string, params json.RawMessage
 	switch event {
 	case "usage.report":
 		n.runtimeUsageReport(h, params, time.Now())
+	case "usage.windows":
+		n.runtimeUsageWindows(h, params, time.Now())
 	case "session.items":
 		var p struct {
 			SessionID string       `json:"session_id"`

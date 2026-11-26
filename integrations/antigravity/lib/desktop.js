@@ -10,6 +10,7 @@ import { createRuntime, page, RpcError, snippet } from '../../runtime-sdk/index.
 import { createSubagentCaches, selectDesktopSessions } from './desktop-subagents.js'
 import { cleanUserText, readTranscript, stepsToItems, workspacePathOf } from './map.js'
 import { checkModelMedia, inputMedia, mediaError, readUserImage, userImage } from './desktop-media.js'
+import { usageAccountFromQuota } from './usage.js'
 
 const exec = promisify(execFile)
 const prefix = 'desktop-agy-'
@@ -178,6 +179,7 @@ export function createDesktopRuntime({
   workingPollMs = 1500,
   interruptPollMs = 200,
   interruptTimeoutMs = 5000,
+  usageWindowsEveryMs = 5 * 60_000,
   refreshMs,
 } = {}) {
   const runtimeId = trim(runtimeOption) || 'antigravity-desktop'
@@ -206,6 +208,13 @@ export function createDesktopRuntime({
   let catalogLoaded = false
   let catalogFlight
   let workingPollTimer
+  let usageTimer
+  let usageFlight
+  let usageError = ''
+  let usagePlan = ''
+  let usagePlanLoaded = false
+  let lastUsageAccount
+  let lastUsageAt = 0
   let stopped = false
 
   function raw(id) {
@@ -435,6 +444,52 @@ export function createDesktopRuntime({
     workingPollTimer = undefined
   }
 
+  async function refreshUsageWindows({ force = false } = {}) {
+    if (stopped || !rt.nodeHas('usage_windows')) return
+    if (!force && lastUsageAccount && Date.now() - lastUsageAt < 30_000) {
+      rt.usageWindows(lastUsageAccount)
+      return
+    }
+    if (usageFlight) return usageFlight
+    const flight = (async () => {
+      try {
+        const account = await withHub(async hub => {
+          let quota
+          try {
+            quota = await call(hub, 'RetrieveUserQuotaSummary', { request: { forceRefresh: true } })
+          } catch (err) {
+            if (RETRY_CODES.has(err?.code)) throw err
+            quota = await call(hub, 'RetrieveUserQuotaSummary', { request: { forceRefresh: false } })
+          }
+          if (!quota || typeof quota.response !== 'object' || quota.response === null) return null
+          if (!usagePlanLoaded) {
+            usagePlanLoaded = true
+            try {
+              const status = await call(hub, 'GetUserStatus', {})
+              usagePlan = trim(status?.userStatus?.planStatus?.planInfo?.planName)
+            } catch {}
+          }
+          return usageAccountFromQuota(quota, new Date(), { plan: usagePlan })
+        }, { allowOffline: true })
+        if (stopped || !account) return
+        if (account.windows.length > 0 || lastUsageAccount) {
+          lastUsageAccount = account.windows.length > 0 ? account : undefined
+          lastUsageAt = Date.now()
+          rt.usageWindows(account)
+        }
+        usageError = ''
+      } catch (err) {
+        if (!stopped && err?.message && usageError !== err.message) {
+          usageError = err.message
+          log?.(`antigravity-desktop usage windows: ${err.message}`)
+        }
+      }
+    })()
+    usageFlight = flight
+    flight.finally(() => { if (usageFlight === flight) usageFlight = undefined })
+    return flight
+  }
+
   async function confirmExists(hub, cascadeId) {
     if (!convFn) throw new RpcError('Desktop session no longer listed', 'not_found')
     try {
@@ -545,6 +600,7 @@ export function createDesktopRuntime({
         if (model) row.model = model
       }))
       if (!catalogLoaded) await loadCatalog(hub).catch(() => {})
+      if (!lastUsageAt && rt.nodeHas('usage_windows')) void refreshUsageWindows()
       return kept
     },
 
@@ -807,13 +863,30 @@ export function createDesktopRuntime({
     modelSwitch: true,
     socketPath,
     log,
+    onHub(connected) {
+      if (connected) void refreshUsageWindows()
+    },
     ...(refreshMs !== undefined ? { refreshMs } : {}),
   })
+
+  const baseStart = rt.start.bind(rt)
+  rt.start = () => {
+    stopped = false
+    clearInterval(usageTimer)
+    usageTimer = undefined
+    if (usageWindowsEveryMs > 0) {
+      usageTimer = setInterval(() => { void refreshUsageWindows({ force: true }) }, usageWindowsEveryMs)
+      usageTimer.unref?.()
+    }
+    return baseStart()
+  }
 
   const baseStop = rt.stop.bind(rt)
   rt.stop = () => {
     stopped = true
     stopWorkingPoll()
+    clearInterval(usageTimer)
+    usageTimer = undefined
     for (const timer of watched.values()) clearInterval(timer)
     watched.clear()
     return baseStop()
