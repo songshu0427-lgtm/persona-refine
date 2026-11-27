@@ -68,15 +68,26 @@ type subagentMeta struct {
 	TaskKind     string `json:"taskKind"`      // "in_process_teammate": a team's worker (agent_usage.go)
 }
 
+// maxFinishedSubagents bounds how many completed subagents a session row carries in sessions.changed.
+// Running subagents are never dropped, and older finished subagents remain readable by "<session>@<id>".
+const maxFinishedSubagents = 50
+
 // subagents lists a session's subagents, newest first; finished ones older than a day are left out (each on its own:
-// a nested one stays listed when its parent is left out).
+// a nested one stays listed when its parent is left out). At most maxFinishedSubagents completed subagents are kept
+// so long-running sessions with hundreds or thousands of finished subagents do not bloat every sessions.changed push.
 func (n *Node) subagents(parent string) []proto.Subagent {
 	dir := n.subagentDir(parent)
 	if dir == "" {
 		return nil
 	}
 	metas, _ := filepath.Glob(filepath.Join(dir, "agent-*.meta.json"))
-	var out []proto.Subagent
+	type finishedCand struct {
+		id, jp string
+		st     os.FileInfo
+		m      subagentMeta
+	}
+	var runningOut []proto.Subagent
+	var finishedCands []finishedCand
 	for _, mp := range metas {
 		id := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(mp), "agent-"), ".meta.json")
 		jp := filepath.Join(dir, "agent-"+id+".jsonl")
@@ -94,25 +105,63 @@ func (n *Node) subagents(parent string) []proto.Subagent {
 			continue
 		}
 		// A subagent whose file has not moved for 20 minutes is not running any more (its claude went away).
-		running := !m.Finished && time.Since(st.ModTime()) < 20*time.Minute
-		edges := subagentEdgesCached(jp, st, false)
-		updated := edges.lastAt
-		if updated.IsZero() {
-			updated = st.ModTime()
+		if !m.Finished && time.Since(st.ModTime()) < 20*time.Minute {
+			edges := subagentEdgesCached(jp, st, false)
+			updated := edges.lastAt
+			if updated.IsZero() {
+				updated = st.ModTime()
+			}
+			runningOut = append(runningOut, proto.Subagent{
+				ID: id, SessionID: parent + subagentSep + id, Type: m.AgentType, Description: m.Description,
+				ToolUseID: m.ToolUseID, ParentID: m.ParentID, Fork: m.Fork, Running: true, Background: m.RequestShape == "background",
+				StartedAt: edges.started, UpdatedAt: updated, LastText: edges.last, Steps: edges.calls, LastTool: edges.latestTool,
+				Model: edges.model, Tokens: edges.tokens,
+			})
+			continue
 		}
-		out = append(out, proto.Subagent{
-			ID: id, SessionID: parent + subagentSep + id, Type: m.AgentType, Description: m.Description,
-			ToolUseID: m.ToolUseID, ParentID: m.ParentID, Fork: m.Fork, Running: running, Background: m.RequestShape == "background",
-			StartedAt: edges.started, UpdatedAt: updated, LastText: edges.last, Steps: edges.calls, LastTool: edges.latestTool,
-			Model: edges.model, Tokens: edges.tokens,
-		})
+		finishedCands = append(finishedCands, finishedCand{id: id, jp: jp, st: st, m: m})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Running != out[j].Running {
-			return out[i].Running
+	if len(finishedCands) > maxFinishedSubagents*2 {
+		sort.Slice(finishedCands, func(i, j int) bool {
+			return finishedCands[i].st.ModTime().After(finishedCands[j].st.ModTime())
+		})
+		finishedCands = finishedCands[:maxFinishedSubagents*2]
+	}
+	var finishedOut []proto.Subagent
+	if len(finishedCands) > 0 {
+		finishedOut = make([]proto.Subagent, 0, len(finishedCands))
+		for _, c := range finishedCands {
+			edges := subagentEdgesCached(c.jp, c.st, false)
+			updated := edges.lastAt
+			if updated.IsZero() {
+				updated = c.st.ModTime()
+			}
+			finishedOut = append(finishedOut, proto.Subagent{
+				ID: c.id, SessionID: parent + subagentSep + c.id, Type: c.m.AgentType, Description: c.m.Description,
+				ToolUseID: c.m.ToolUseID, ParentID: c.m.ParentID, Fork: c.m.Fork, Running: false, Background: c.m.RequestShape == "background",
+				StartedAt: edges.started, UpdatedAt: updated, LastText: edges.last, Steps: edges.calls, LastTool: edges.latestTool,
+				Model: edges.model, Tokens: edges.tokens,
+			})
 		}
-		return out[i].StartedAt.After(out[j].StartedAt)
+		sort.Slice(finishedOut, func(i, j int) bool {
+			return finishedOut[i].StartedAt.After(finishedOut[j].StartedAt)
+		})
+		if len(finishedOut) > maxFinishedSubagents {
+			finishedOut = finishedOut[:maxFinishedSubagents]
+		}
+	}
+	sort.Slice(runningOut, func(i, j int) bool {
+		return runningOut[i].StartedAt.After(runningOut[j].StartedAt)
 	})
+	if len(runningOut) == 0 {
+		return finishedOut
+	}
+	if len(finishedOut) == 0 {
+		return runningOut
+	}
+	out := make([]proto.Subagent, 0, len(runningOut)+len(finishedOut))
+	out = append(out, runningOut...)
+	out = append(out, finishedOut...)
 	return out
 }
 

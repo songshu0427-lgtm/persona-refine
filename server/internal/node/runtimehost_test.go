@@ -110,3 +110,56 @@ func TestRuntimeOwnSocketWithoutResidentNode(t *testing.T) {
 		t.Fatal("hello on a node serving a hub said no hub")
 	}
 }
+
+type blockingWriter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	select {
+	case <-b.started:
+	default:
+		close(b.started)
+	}
+	<-b.release
+	return len(p), nil
+}
+
+// Hub write backpressure (a congested or stalled node-attach link) must never stall runtime.sock's read loop:
+// RPC replies such as session.items must still arrive promptly even while runtime.sessions / session.items
+// hub notifications are blocked on the hub writer.
+func TestRuntimeEventsDoNotBlockRPCRepliesWhenHubWriterStalls(t *testing.T) {
+	rh := sharedHost(t)
+	rt := dialRuntimeAt(t, rh.path, dshHello())
+	bw := &blockingWriter{started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(bw.release) })
+
+	n, _ := testNode(t)
+	n.logger = log.New(io.Discard, "", 0)
+	n.peer = rpc.New("n", bw)
+	t.Cleanup(func() { n.peer.Close(io.EOF) })
+	rh.attach(n)
+
+	_ = rt.peer.Notify("runtime.sessions", map[string]any{"sessions": []map[string]any{{"session_id": "session-1", "status": "working"}}})
+	select {
+	case <-bw.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("hub publish did not start writing")
+	}
+	// Send more runtime events while the hub writer is completely blocked.
+	_ = rt.peer.Notify("runtime.sessions", map[string]any{"sessions": []map[string]any{{"session_id": "session-1", "status": "done"}}})
+	_ = rt.peer.Notify("session.items", map[string]any{"session_id": "session-1", "to_seq": 2, "items": []map[string]any{}})
+	_ = rt.peer.Notify("session.delta", map[string]any{"session_id": "session-1", "text": "hello"})
+
+	h, _, _ := rh.reg.belongs("session-1")
+	if h == nil {
+		t.Fatal("runtime session-1 not registered")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var out json.RawMessage
+	if err := h.peer.Call(ctx, "session.items", map[string]any{"session_id": "session-1"}, &out); err != nil {
+		t.Fatalf("runtime RPC blocked behind stalled hub writer: %v", err)
+	}
+}

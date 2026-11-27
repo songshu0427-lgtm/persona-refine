@@ -727,3 +727,34 @@ func TestSubagentHandbackIsNoStep(t *testing.T) {
 		t.Fatalf("last text %q, want its report", a.LastText)
 	}
 }
+
+func TestSubagentsCapsFinishedKeepsRunning(t *testing.T) {
+	n, parent, dir := subagentTree(t)
+	writeSubagent(t, dir, "run1", `{"agentType":"general-purpose","description":"running 1"}`, time.Minute)
+	writeSubagent(t, dir, "run2", `{"agentType":"general-purpose","description":"running 2"}`, 2*time.Minute)
+	totalFinished := maxFinishedSubagents + 25
+	for i := range totalFinished {
+		id := "fin" + strconv.Itoa(i)
+		meta := `{"agentType":"Explore","description":"done ` + strconv.Itoa(i) + `","finished":true}`
+		// Older index = older age (all within 24h).
+		writeSubagent(t, dir, id, meta, time.Duration(i+3)*time.Minute)
+	}
+
+	subs := n.subagents(parent)
+	wantTotal := 2 + maxFinishedSubagents
+	if len(subs) != wantTotal {
+		t.Fatalf("listed %d subagents, want %d (2 running + %d finished)", len(subs), wantTotal, maxFinishedSubagents)
+	}
+	if !subs[0].Running || !subs[1].Running || subs[0].ID != "run1" || subs[1].ID != "run2" {
+		t.Fatalf("running subagents must come first: %+v, %+v", subs[0], subs[1])
+	}
+	for i := 2; i < len(subs); i++ {
+		if subs[i].Running {
+			t.Fatalf("unexpected running subagent at %d: %+v", i, subs[i])
+		}
+		wantID := "fin" + strconv.Itoa(i-2)
+		if subs[i].ID != wantID {
+			t.Fatalf("finished[%d] = %s, want %s (newest finished first)", i-2, subs[i].ID, wantID)
+		}
+	}
+}

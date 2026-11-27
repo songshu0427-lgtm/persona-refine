@@ -196,6 +196,8 @@ export function createDesktopRuntime({
   const selectedModels = new Map() // cascadeId -> { id, stepIndex }
   const stepModels = new Map() // cascadeId -> { stepIndex, native }
   const sessionMeta = new Map()
+  const projectCwds = new Map() // projectId -> cwd
+  const knownCwds = new Map() // cascadeId -> cwd
   const recentlyCreated = new Map()
   const archivedIds = new Set()
   const sentMsgIds = new Map()
@@ -557,6 +559,21 @@ export function createDesktopRuntime({
         }
       }
 
+      const trajectoryCwd = traj => workspacePathOf({
+        WorkspaceURIs: [
+          ...(traj?.workspaces?.map(w => w?.workspaceFolderAbsoluteUri) || []),
+          ...(traj?.trajectoryMetadata?.workspaces?.map(w => w?.workspaceFolderAbsoluteUri) || []),
+          ...(Array.isArray(traj?.trajectoryMetadata?.workspaceUris) ? traj.trajectoryMetadata.workspaceUris : []),
+        ].filter(Boolean),
+      })
+      for (const [key, traj] of Object.entries(trajs)) {
+        const trajCwd = trajectoryCwd(traj)
+        if (!trajCwd) continue
+        setBounded(knownCwds, key, trajCwd, 1000)
+        const projectId = trim(traj?.trajectoryMetadata?.projectId) || trim(byId.get(key)?.metadata?.projectId)
+        if (projectId) setBounded(projectCwds, projectId, trajCwd, 500)
+      }
+
       let anyWorking = false
       const rows = []
       const bySession = new Map()
@@ -567,7 +584,13 @@ export function createDesktopRuntime({
         const t = transcript(session_id, false)
         const status = deriveStatus(conv?.state?.runState, traj?.status, t.steps)
         if (status === 'working') anyWorking = true
-        const cwd = meta.cwd || workspacePathOf({ WorkspaceURIs: traj?.workspaces?.map(w => w.workspaceFolderAbsoluteUri) }) || ''
+        const projectId = trim(conv?.metadata?.projectId) || trim(traj?.trajectoryMetadata?.projectId)
+        const trajCwd = trajectoryCwd(traj)
+        const cwd = meta.cwd || trajCwd || (projectId && projectCwds.get(projectId)) || knownCwds.get(key) || ''
+        if (cwd) {
+          setBounded(knownCwds, key, cwd, 1000)
+          if (projectId && !projectCwds.has(projectId)) setBounded(projectCwds, projectId, cwd, 500)
+        }
         const title = trim(conv?.annotations?.title) || trim(meta.title) || trim(conv?.state?.summary) || trim(traj?.summary) || (cwd ? basename(cwd) : '') || displayName
         const updated_at = conv?.state?.updateTime || traj?.lastModifiedTime || traj?.createdTime || conv?.metadata?.createTime || (meta.createdAt ? new Date(meta.createdAt).toISOString() : undefined)
         bySession.set(session_id, { key, value: traj })

@@ -76,7 +76,7 @@ func (n *Node) runtimeEvent(h *runtimeConn, event string, params json.RawMessage
 		}
 		n.runtimes.pushed(p.SessionID, last)
 		if n.peer != nil {
-			_ = n.peer.Notify("session.items", n.echoedRaw(p.SessionID, params, "items")) // echo.go
+			h.enqueueHubNotify(n.peer, "session.items", n.echoedRaw(p.SessionID, params, "items")) // echo.go
 		}
 	case "session.delta":
 		var p struct {
@@ -85,10 +85,10 @@ func (n *Node) runtimeEvent(h *runtimeConn, event string, params json.RawMessage
 		if json.Unmarshal(params, &p) != nil || !n.runtimes.owns(h, p.SessionID) || n.peer == nil {
 			return
 		}
-		_ = n.peer.Notify("session.delta", params)
+		h.enqueueHubNotify(n.peer, "session.delta", params)
 	case "interaction.cancel":
 		if n.peer != nil {
-			_ = n.peer.Notify("interaction.cancel", params)
+			h.enqueueHubNotify(n.peer, "interaction.cancel", params)
 		}
 	}
 }

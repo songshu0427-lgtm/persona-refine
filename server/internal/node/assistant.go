@@ -1572,6 +1572,60 @@ type listPush struct {
 	pushed   int
 }
 
+// runtimePublish coalesces runtime.sessions hub publishes off the runtime socket read loop.
+type runtimePublish struct {
+	mu      sync.Mutex
+	running bool
+	again   bool
+}
+
+// publishSessionsSoon triggers n.publish(n.sessionList(...)) off the caller's goroutine so a slow or congested
+// hub transport never blocks a runtime socket's Peer.Serve read loop (and therefore never delays RPC replies
+// such as session.items or launchers.models). Bursts while a publish is in flight fold into one follow-up pass.
+func (n *Node) publishSessionsSoon() {
+	peer := n.peer
+	if peer == nil {
+		return
+	}
+	select {
+	case <-peer.Done():
+		return
+	default:
+	}
+	p := &n.runtimePublish
+	p.mu.Lock()
+	if p.running {
+		p.again = true
+		p.mu.Unlock()
+		return
+	}
+	p.running = true
+	p.mu.Unlock()
+	go func() {
+		for {
+			n.publish(n.sessionList(context.Background(), false))
+			p.mu.Lock()
+			peer := n.peer
+			closed := peer == nil
+			if !closed {
+				select {
+				case <-peer.Done():
+					closed = true
+				default:
+				}
+			}
+			if !p.again || closed {
+				p.running = false
+				p.again = false
+				p.mu.Unlock()
+				return
+			}
+			p.again = false
+			p.mu.Unlock()
+		}
+	}()
+}
+
 // listPushWait is how long a send waits for the list that shows its conversation working, so its answer goes after
 // that list as it did when the list was built inside the send (the manager drains its queues and counts rounds by
 // the lists it is pushed). A list slower than this is not waited for: the answer goes first, and the list after it.

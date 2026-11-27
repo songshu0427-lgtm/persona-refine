@@ -422,3 +422,82 @@ test('desktop reports Antigravity quota windows when node advertises usage_windo
   await until(() => node.all('usage.windows').length >= 2)
   assert.equal(quotaCalls, callsAfterFirst)
 })
+
+test('desktop resolves cwd via sibling projectId and preserves cached cwd when trajectories fail', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-cwd-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const node = await startFakeNode(t)
+  const activeId = '11111111-1111-4111-8111-111111111111'
+  const olderId = '22222222-2222-4222-8222-222222222222'
+  const projectId = 'f378dd9b-b625-46cd-af38-fb23b0669d7a'
+  let failTrajs = false
+
+  const runtime = createDesktopRuntime({
+    dir,
+    socketPath: node.path,
+    usageWindowsEveryMs: 0,
+    workingPollMs: 0,
+    discover: async () => ({ httpPort: 55555, csrfToken: 'tok' }),
+    call: async (_, method) => {
+      if (method === 'GetAllCascadeTrajectories') {
+        if (failTrajs) throw new Error('Antigravity GetAllCascadeTrajectories returned HTTP 500')
+        return {
+          trajectorySummaries: {
+            [activeId]: {
+              summary: 'Active Session',
+              status: 'CASCADE_RUN_STATUS_IDLE',
+              lastModifiedTime: '2026-11-27T08:00:00Z',
+              workspaces: [{ workspaceFolderAbsoluteUri: 'file:///Users/tester/business-meta' }],
+              trajectoryMetadata: { projectId },
+            },
+          },
+        }
+      }
+      if (method === 'GetCascadeModelConfigData') return {}
+      return {}
+    },
+    conversationCall: async (_, method) => {
+      if (method === 'ListConversations') {
+        return {
+          conversations: [
+            {
+              id: activeId,
+              metadata: { createTime: '2026-11-27T07:00:00Z', projectId },
+              annotations: { title: 'Active Session' },
+              state: { runState: 'RUN_STATE_IDLE', updateTime: '2026-11-27T08:00:00Z' },
+            },
+            {
+              id: olderId,
+              metadata: { createTime: '2026-11-24T08:00:00Z', projectId },
+              annotations: { title: 'Older Session Without Trajectory' },
+              state: { runState: 'RUN_STATE_IDLE', updateTime: '2026-11-24T12:00:00Z' },
+            },
+          ],
+        }
+      }
+      return {}
+    },
+  })
+  t.after(() => runtime.stop())
+  await runtime.start()
+  await node.ready
+
+  const until = async fn => {
+    for (let i = 0; i < 100 && !fn(); i++) await delay(25)
+    assert.ok(fn())
+  }
+  await until(() => node.last('runtime.sessions'))
+  const first = new Map(node.last('runtime.sessions').sessions.map(s => [s.session_id, s]))
+  assert.equal(first.get('desktop-agy-' + activeId)?.cwd, '/Users/tester/business-meta')
+  assert.equal(first.get('desktop-agy-' + olderId)?.cwd, '/Users/tester/business-meta')
+  assert.equal(first.get('desktop-agy-' + olderId)?.space_name, 'business-meta')
+
+  // A transient GetAllCascadeTrajectories failure must not wipe either session's cwd to "".
+  failTrajs = true
+  const beforeCount = node.all('runtime.sessions').length
+  await runtime.pushNow()
+  await until(() => node.all('runtime.sessions').length > beforeCount)
+  const second = new Map(node.last('runtime.sessions').sessions.map(s => [s.session_id, s]))
+  assert.equal(second.get('desktop-agy-' + activeId)?.cwd, '/Users/tester/business-meta')
+  assert.equal(second.get('desktop-agy-' + olderId)?.cwd, '/Users/tester/business-meta')
+})

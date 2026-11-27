@@ -148,7 +148,8 @@ type Node struct {
 	// projectGlobs counts globProjects calls, each a read of every projects directory: one per row looked up again
 	// was a few hundred a list on a computer with many parked sessions, past the half minute a found path is trusted for.
 	projectGlobs atomic.Int64
-	listPush     listPush // the list pushes sends ask for, one build at a time (notifySessionsSoon)
+	listPush       listPush       // the list pushes sends ask for, one build at a time (notifySessionsSoon)
+	runtimePublish runtimePublish // coalesced async publishes from runtime.sessions (publishSessionsSoon)
 	watches      map[string]*watch
 	// pumping: the shared watch pump runs (session_watch.go watchPump); it stops when watches is empty.
 	pumping bool

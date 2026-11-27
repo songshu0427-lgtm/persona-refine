@@ -376,7 +376,7 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 		if json.Unmarshal(params, &p) == nil {
 			h.setLaunchers(cleanLaunchers(p.Launchers))
 			if rh.autoCompanions && n != nil && n.peer != nil {
-				_ = n.peer.Notify("launchers.changed", map[string]any{})
+				h.enqueueHubNotify(n.peer, "launchers.changed", map[string]any{})
 			}
 		}
 		return
@@ -422,7 +422,9 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 		rewatch, driven := rh.reg.setSessions(h, list)
 		for _, id := range driven { // started for the hub by another runtime: its cards go to the phone first here too
 			if h.peer != nil {
-				_ = h.peer.Notify("runtime.driven", map[string]any{"session_id": id})
+				go func(peer *rpc.Peer, id string) {
+					_ = peer.Notify("runtime.driven", map[string]any{"session_id": id})
+				}(h.peer, id)
 			}
 		}
 		if n == nil {
@@ -438,7 +440,7 @@ func (rh *RuntimeHost) event(h *runtimeConn, event string, params json.RawMessag
 				}
 			}()
 		}
-		n.publish(n.sessionList(context.Background(), false))
+		n.publishSessionsSoon()
 		return
 	}
 	if n != nil {

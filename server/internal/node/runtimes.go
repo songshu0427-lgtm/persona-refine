@@ -149,6 +149,78 @@ type runtimeConn struct {
 	// a system that does not tell). A runtime running the assistant vouches for its descendants' MCP servers
 	// (mcpAssistantOf).
 	pid int
+
+	// hubQ forwards one-way runtime events (session.items, session.delta, interaction.cancel, launchers.changed)
+	// to the hub in FIFO order off the runtime socket read loop, so hub backpressure cannot stall RPC replies.
+	hubQMu      sync.Mutex
+	hubQ        []hubNotice
+	hubQRunning bool
+}
+
+type hubNotice struct {
+	peer   *rpc.Peer
+	event  string
+	params any
+}
+
+const maxRuntimeHubQueue = 512
+
+func (h *runtimeConn) enqueueHubNotify(peer *rpc.Peer, event string, params any) {
+	if peer == nil {
+		return
+	}
+	select {
+	case <-peer.Done():
+		return
+	default:
+	}
+	h.hubQMu.Lock()
+	// Coalesce back-to-back session.delta for the same peer, and bound memory if the hub link stalls.
+	if n := len(h.hubQ); n > 0 && event == "session.delta" && h.hubQ[n-1].event == "session.delta" && h.hubQ[n-1].peer == peer {
+		h.hubQ[n-1].params = params
+	} else {
+		if len(h.hubQ) >= maxRuntimeHubQueue {
+			// Drop the oldest non-critical delta if possible, otherwise the oldest entry.
+			dropIdx := 0
+			for i, item := range h.hubQ {
+				if item.event == "session.delta" {
+					dropIdx = i
+					break
+				}
+			}
+			copy(h.hubQ[dropIdx:], h.hubQ[dropIdx+1:])
+			h.hubQ[len(h.hubQ)-1] = hubNotice{}
+			h.hubQ = h.hubQ[:len(h.hubQ)-1]
+		}
+		h.hubQ = append(h.hubQ, hubNotice{peer: peer, event: event, params: params})
+	}
+	if h.hubQRunning {
+		h.hubQMu.Unlock()
+		return
+	}
+	h.hubQRunning = true
+	h.hubQMu.Unlock()
+	go func() {
+		for {
+			h.hubQMu.Lock()
+			if len(h.hubQ) == 0 {
+				h.hubQRunning = false
+				h.hubQMu.Unlock()
+				return
+			}
+			item := h.hubQ[0]
+			copy(h.hubQ, h.hubQ[1:])
+			h.hubQ[len(h.hubQ)-1] = hubNotice{}
+			h.hubQ = h.hubQ[:len(h.hubQ)-1]
+			h.hubQMu.Unlock()
+			select {
+			case <-item.peer.Done():
+				continue
+			default:
+			}
+			_ = item.peer.Notify(item.event, item.params)
+		}
+	}()
 }
 
 // isDaemon: the node dialed it (a daemon in daemons.json), it did not connect to the socket.
