@@ -222,3 +222,112 @@ test('desktop pins idle parent past recent() cutoff while its subagent is workin
   assert.ok(ids.includes('desktop-agy-' + PARENT), 'old parent must stay pinned while subagent works')
   assert.ok(ids.includes('desktop-agy-' + SUB_A))
 })
+
+test('desktop folds Antigravity Side Questions under parent with sideQuestionTitles, hides orphans, and promotes once listed in ListConversations', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'desktop-agy-sideq-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+  const now = new Date().toISOString()
+  const SIDE_Q = '66666666-6666-4666-8666-666666666666'
+  const ORPHAN_Q = '77777777-7777-4777-8777-777777777777'
+  let promoted = false
+
+  const node = await startFakeNode(t)
+  const runtime = createDesktopRuntime({
+    dir,
+    socketPath: node.path,
+    workingPollMs: 0,
+    usageWindowsEveryMs: 0,
+    discover: async () => ({ httpPort: 55555, csrfToken: 'tok' }),
+    conversationCall: async (_, method) => {
+      if (method !== 'ListConversations') return {}
+      const conversations = [
+        {
+          id: PARENT,
+          metadata: { createTime: now, projectId: 'f378dd9b-b625-46cd-af38-fb23b0669d7a' },
+          annotations: { title: 'Top1000 逐站模板代码评审' },
+          state: { summary: '看一下这个对话，然后这有top1000的范围', runState: 'RUN_STATE_IDLE', updateTime: now },
+        },
+      ]
+      if (promoted) {
+        conversations.push({
+          id: SIDE_Q,
+          metadata: { createTime: now, projectId: 'f378dd9b-b625-46cd-af38-fb23b0669d7a' },
+          annotations: { title: 'Top1000 基线与 N21 问题总结' },
+          state: { summary: 'Top1000 基线与 N21 问题总结', runState: 'RUN_STATE_IDLE', updateTime: now },
+        })
+      }
+      return { conversations }
+    },
+    call: async (_, method) => {
+      if (method !== 'GetAllCascadeTrajectories') return {}
+      return {
+        trajectorySummaries: {
+          [PARENT]: {
+            summary: 'Top1000 逐站模板代码评审',
+            workspaces: [{ workspaceFolderAbsoluteUri: 'file:///code/business-meta' }],
+            createdTime: now,
+            lastModifiedTime: now,
+            stepCount: 10,
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            annotations: {
+              title: 'Top1000 逐站模板代码评审',
+              sideQuestionCascadeIds: [SIDE_Q],
+              sideQuestionTitles: { [SIDE_Q]: 'Top1000 基线与 N21 问题总结' },
+            },
+          },
+          [SIDE_Q]: {
+            summary: '看一下这个对话，然后这有top1000的范围',
+            workspaces: [{ workspaceFolderAbsoluteUri: 'file:///code/business-meta' }],
+            createdTime: now,
+            lastModifiedTime: now,
+            stepCount: 12,
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            trajectoryType: promoted ? 'CORTEX_TRAJECTORY_TYPE_CASCADE' : 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION',
+          },
+          [ORPHAN_Q]: {
+            summary: 'Orphan side question',
+            workspaces: [{ workspaceFolderAbsoluteUri: 'file:///code/business-meta' }],
+            createdTime: now,
+            lastModifiedTime: now,
+            stepCount: 5,
+            status: 'CASCADE_RUN_STATUS_IDLE',
+            trajectoryType: 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION',
+          },
+        },
+      }
+    },
+  })
+  t.after(() => runtime.stop())
+  await runtime.start()
+  await node.ready
+
+  const until = async fn => {
+    for (let i = 0; i < 100 && !fn(); i++) await delay(25)
+    assert.ok(fn())
+  }
+  await until(() => node.last('runtime.sessions'))
+  const first = new Map(node.last('runtime.sessions').sessions.map(s => [s.session_id, s]))
+
+  // Side Question must fold under PARENT with its real title, NOT appear as a standalone session.
+  const sideRow = first.get('desktop-agy-' + SIDE_Q)
+  assert.ok(sideRow)
+  assert.equal(sideRow.is_subagent, true)
+  assert.equal(sideRow.parent_session_id, 'desktop-agy-' + PARENT)
+  assert.equal(sideRow.root_session_id, 'desktop-agy-' + PARENT)
+  assert.equal(sideRow.title, 'Top1000 基线与 N21 问题总结')
+  // Orphan Side Question with no listed parent must be hidden.
+  assert.equal(first.has('desktop-agy-' + ORPHAN_Q), false)
+
+  // Once promoted ("Continue as a New Conversation"), it appears in ListConversations and becomes top-level.
+  promoted = true
+  const before = node.all('runtime.sessions').length
+  await runtime.pushNow()
+  await until(() => node.all('runtime.sessions').length > before)
+  const second = new Map(node.last('runtime.sessions').sessions.map(s => [s.session_id, s]))
+  const promotedRow = second.get('desktop-agy-' + SIDE_Q)
+  assert.ok(promotedRow)
+  assert.equal(promotedRow.is_subagent, undefined)
+  assert.equal(promotedRow.parent_session_id, undefined)
+  assert.equal(promotedRow.title, 'Top1000 基线与 N21 问题总结')
+})

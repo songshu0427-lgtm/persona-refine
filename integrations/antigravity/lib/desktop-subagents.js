@@ -9,6 +9,7 @@ const FIRST_LINE_BYTES = 16 * 1024
 const MAX_MSG_BYTES = 256 * 1024
 const PROMPT_KEY_LEN = 80
 const TITLE_MAX = 60
+const SIDE_QUESTION_TYPE = 'CORTEX_TRAJECTORY_TYPE_SIDE_QUESTION'
 
 function validParent(candidate, selfKey) {
   if (typeof candidate !== 'string') return ''
@@ -112,7 +113,10 @@ function readParentFromTranscript(brainDir, key) {
 }
 
 function inspectChild(dir, key, summary, cache) {
-  const nativeParent = validParent(summary?.parentCascadeId || summary?.parentConversationId, key)
+  const nativeParent = validParent(
+    summary?.parentCascadeId || summary?.parentConversationId || summary?.trajectoryMetadata?.parentConversationId,
+    key,
+  )
   const cached = cache.get(key)
   if (cached?.settled) {
     if (!cached.parentKey && nativeParent) return { parentKey: nativeParent, prompt: '', settled: true }
@@ -222,15 +226,36 @@ export function createSubagentCaches() {
 }
 
 /**
- * Enrich Antigravity Desktop session rows with subagent parent/root links, resolved role titles,
+ * Enrich Antigravity Desktop session rows with subagent / side-question parent/root links, resolved titles,
  * ancestor pinning (so active parents are never dropped by recent() limits), and parent background tasks.
  */
-export function selectDesktopSessions({ dir, prefix, label, allSummaries, rows, recent, caches }) {
+export function selectDesktopSessions({ dir, prefix, label, allSummaries, listedConvIds = null, rows, recent, caches }) {
+  const sideQuestions = new Map()
+  for (const [parentKey, summary] of Object.entries(allSummaries || {})) {
+    if (!UUID_RE.test(parentKey)) continue
+    const ids = summary?.annotations?.sideQuestionCascadeIds
+    const titles = summary?.annotations?.sideQuestionTitles
+    if (!Array.isArray(ids)) continue
+    for (const rawChild of ids) {
+      const childKey = validParent(rawChild, parentKey)
+      if (!childKey || sideQuestions.has(childKey)) continue
+      const title = typeof titles?.[childKey] === 'string' ? titles[childKey].trim() : ''
+      sideQuestions.set(childKey, { parentKey, title })
+    }
+  }
+
   const rowByKey = new Map()
+  const activeRows = []
   for (const row of rows) {
     const key = row.session_id.slice(prefix.length)
+    const summary = allSummaries[key]
+    const promoted = listedConvIds instanceof Set && listedConvIds.has(key)
+    const isSideQuestion = !promoted && summary?.trajectoryType === SIDE_QUESTION_TYPE
+    const side = !promoted ? sideQuestions.get(key) : undefined
+    if (isSideQuestion && !side) continue // orphaned side question with no listed parent: never promote to standalone
     rowByKey.set(key, row)
-    const created = allSummaries[key]?.createdTime
+    activeRows.push(row)
+    const created = summary?.createdTime
     if (created) row.started_at = created
   }
   for (const key of caches.children.keys()) {
@@ -241,9 +266,27 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, rows, 
   }
 
   const childMeta = new Map()
-  for (const [key] of rowByKey) {
-    const info = inspectChild(dir, key, allSummaries[key], caches.children)
+  const filteredRows = []
+  for (const row of activeRows) {
+    const key = row.session_id.slice(prefix.length)
+    const summary = allSummaries[key]
+    const promoted = listedConvIds instanceof Set && listedConvIds.has(key)
+    const side = !promoted ? sideQuestions.get(key) : undefined
+    if (side) {
+      if (!rowByKey.has(side.parentKey)) {
+        if (summary?.trajectoryType === SIDE_QUESTION_TYPE) {
+          rowByKey.delete(key)
+          continue
+        }
+      } else {
+        childMeta.set(key, { parentKey: side.parentKey, prompt: '', sideTitle: side.title, isSideQuestion: true })
+        filteredRows.push(row)
+        continue
+      }
+    }
+    const info = inspectChild(dir, key, summary, caches.children)
     if (info.parentKey) childMeta.set(key, info)
+    filteredRows.push(row)
   }
 
   const rootKeyOf = key => {
@@ -269,15 +312,20 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, rows, 
       row.space_id = anchor.space_id
       row.space_name = anchor.space_name || basename(anchor.cwd)
     }
-    if (!allSummaries[key]?.summary) {
-      const resolved = resolveSubagentTitle(key, info, dir, caches.parentRoles)
+    if (info.isSideQuestion) {
+      if (info.sideTitle) row.title = info.sideTitle
+    } else if (!allSummaries[key]?.summary) {
+      const nativeRole = typeof allSummaries[key]?.trajectoryMetadata?.subagentSpec?.role === 'string'
+        ? allSummaries[key].trajectoryMetadata.subagentSpec.role.trim()
+        : ''
+      const resolved = nativeRole || resolveSubagentTitle(key, info, dir, caches.parentRoles)
       if (resolved) row.title = resolved
       else row.title = label
     }
   }
 
   const pinnedIds = new Set()
-  for (const row of rows) {
+  for (const row of filteredRows) {
     if (row.status !== 'working') continue
     pinnedIds.add(row.session_id)
     let cur = row.parent_session_id ? row.parent_session_id.slice(prefix.length) : ''
@@ -291,7 +339,7 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, rows, 
     }
   }
 
-  const kept = recent(rows, { days: 14, max: 80, pinned: row => pinnedIds.has(row.session_id) })
+  const kept = recent(filteredRows, { days: 14, max: 80, pinned: row => pinnedIds.has(row.session_id) })
   const keptById = new Map(kept.map(r => [r.session_id, r]))
 
   // Ensure every kept subagent's listed ancestors stay present so the Hub can fold them cleanly.

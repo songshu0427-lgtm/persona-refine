@@ -532,6 +532,7 @@ export function createDesktopRuntime({
         if (!Object.hasOwn(trajs, id)) stepModels.delete(id)
       }
       const byId = new Map()
+      const listedConvIds = convs !== null ? new Set() : null
       const excludedIds = new Set(archivedIds)
       if (convs !== null) {
         for (const conv of convs) {
@@ -542,6 +543,7 @@ export function createDesktopRuntime({
             continue
           }
           byId.set(id, conv)
+          listedConvIds.add(id)
         }
       }
       for (const key of Object.keys(trajs)) {
@@ -615,7 +617,7 @@ export function createDesktopRuntime({
       else stopWorkingPoll()
 
       const kept = selectDesktopSessions({
-        dir, prefix, label: displayName, allSummaries: trajs, rows, recent: (list, opts) => rt.recent(list, opts), caches: subagentCaches,
+        dir, prefix, label: displayName, allSummaries: trajs, listedConvIds, rows, recent: (list, opts) => rt.recent(list, opts), caches: subagentCaches,
       })
       await Promise.all(kept.map(async row => {
         const meta = bySession.get(row.session_id)
