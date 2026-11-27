@@ -147,7 +147,22 @@ describe("the shell's session links", () => {
     expect(host.textContent).toContain(`Task ${TWIN_A} (0)`);
   });
 
-  it("opens a child session's /s link as its parent's chat, which is asked for the child's card", async () => {
+  it("opens a listed child session's /s link directly as its own chat", async () => {
+    await open("/s/mac/kid1");
+    expect(location.pathname).toBe("/s/mac/kid1");
+    expect(drawn.chatSid).toBe("kid1");
+  });
+
+  it("keeps an unlisted child open as itself even after its folded row arrives", async () => {
+    await open("/s/mac/kid2");
+    expect(drawn.chatSid).toBe("kid2");
+    act(() => upsertSession(row("kid2", { folded_under: "s2", parent_session_id: "s2" })));
+    await flush();
+    expect(location.pathname).toBe("/s/mac/kid2");
+    expect(drawn.chatSid).toBe("kid2");
+  });
+
+  it("still opens a Claude @subagent link on its parent's chat and asks for the subagent card", async () => {
     let asked: string | undefined;
     function Probe() {
       asked = useSubagentLink("mac", "s1");
@@ -155,22 +170,12 @@ describe("the shell's session links", () => {
     }
     const probe = createRoot(document.createElement("div"));
     act(() => probe.render(<Probe />));
-    await open("/s/mac/kid1");
+    await open("/s/mac/s1@agent-1");
     expect(location.pathname).toBe("/s/mac/s1");
     expect(drawn.chatSid).toBe("s1");
-    expect(asked).toBe("child:kid1");
+    expect(asked).toBe("agent-1");
     act(() => doneSubagentLink("mac", "s1"));
     act(() => probe.unmount());
-  });
-
-  it("an unlisted child opens as itself until its row says whose it is", async () => {
-    await open("/s/mac/kid2");
-    expect(drawn.chatSid).toBe("kid2");
-    act(() => upsertSession(row("kid2", { folded_under: "s2", parent_session_id: "s2" })));
-    await flush();
-    expect(location.pathname).toBe("/s/mac/s2");
-    expect(drawn.chatSid).toBe("s2");
-    act(() => doneSubagentLink("mac", "s2"));
   });
 
   it("opens a worker's /s and /t links as its lead's page, which is asked to show the worker in its Team panel", async () => {

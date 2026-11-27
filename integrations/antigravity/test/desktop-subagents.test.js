@@ -309,12 +309,13 @@ test('desktop folds Antigravity Side Questions under parent with sideQuestionTit
   await until(() => node.last('runtime.sessions'))
   const first = new Map(node.last('runtime.sessions').sessions.map(s => [s.session_id, s]))
 
-  // Side Question must fold under PARENT with its real title, NOT appear as a standalone session.
+  // Side Question must link as a side session (parent_agent_id) under PARENT with its real title, NOT standalone or subagent card.
   const sideRow = first.get('desktop-agy-' + SIDE_Q)
   assert.ok(sideRow)
-  assert.equal(sideRow.is_subagent, true)
-  assert.equal(sideRow.parent_session_id, 'desktop-agy-' + PARENT)
-  assert.equal(sideRow.root_session_id, 'desktop-agy-' + PARENT)
+  assert.equal(sideRow.parent_agent_id, 'desktop-agy-' + PARENT)
+  assert.equal(sideRow.is_subagent, undefined)
+  assert.equal(sideRow.parent_session_id, undefined)
+  assert.equal(sideRow.root_session_id, undefined)
   assert.equal(sideRow.title, 'Top1000 基线与 N21 问题总结')
   // Orphan Side Question with no listed parent must be hidden.
   assert.equal(first.has('desktop-agy-' + ORPHAN_Q), false)
@@ -327,6 +328,7 @@ test('desktop folds Antigravity Side Questions under parent with sideQuestionTit
   const second = new Map(node.last('runtime.sessions').sessions.map(s => [s.session_id, s]))
   const promotedRow = second.get('desktop-agy-' + SIDE_Q)
   assert.ok(promotedRow)
+  assert.equal(promotedRow.parent_agent_id, undefined)
   assert.equal(promotedRow.is_subagent, undefined)
   assert.equal(promotedRow.parent_session_id, undefined)
   assert.equal(promotedRow.title, 'Top1000 基线与 N21 问题总结')

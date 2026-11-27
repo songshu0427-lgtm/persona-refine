@@ -15,7 +15,7 @@ import { stripBase } from "./lib/base";
 import { useSessionPanels } from "./lib/panel-memory";
 import { paneRoute, resolveTab, tabOfSessionLink, tabPagePane } from "./lib/herdr-tree";
 import { askTeamWorker, isWorker } from "./lib/team";
-import { foldsUnder, isSide, sideFoldOn } from "./lib/side-fold";
+import { isSide, sideFoldOn } from "./lib/side-fold";
 import { askSide } from "./lib/side-panel";
 import { resolveSessionLink, sessionLinkRoute, type SessionLink } from "./lib/session-link";
 import { engineSwitchHome } from "./lib/engine-switch";
@@ -295,10 +295,8 @@ function pageTarget(s: State, route: Route): PageTarget | undefined {
   // a side session's (#7944): its parent's page, the side in its Side sessions panel
   const side = sideTarget(rows, route.mid, row, inWorkView(route));
   if (side) return side;
-  // a child session's (#5120): its parent's chat, which shows the child's card; known once its row is (a listed one, or
-  // the lookup of an unlisted chat), the session itself until then
-  const parent = row ? foldsUnder(row) : undefined;
-  if (parent && parent !== route.sid) return { link: undefined, to: routePath(withWorkView({ name: "session", mid: route.mid, sid: parent }, inWorkView(route))), mid: route.mid, sid: undefined, parent };
+  // Listed subagent / child sessions shown under their parent in the sidebar open directly as their own full chat
+  // so clicking a child row never bounces back to a parent page whose history may be pages past its card.
   // an earlier session of a conversation that moved between Claude Code and Codex (#5054): the conversation's own row,
   // whose chat reads that session's stretch in its place
   const home = engineSwitchHome(rows, route.sid);

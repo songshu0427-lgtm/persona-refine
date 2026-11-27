@@ -303,9 +303,6 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, listed
     const row = rowByKey.get(key)
     const rootKey = rootKeyOf(key)
     if (!row || !rootKey) continue
-    row.is_subagent = true
-    row.parent_session_id = prefix + info.parentKey
-    row.root_session_id = prefix + rootKey
     const anchor = rowByKey.get(info.parentKey) || rowByKey.get(rootKey)
     if (!row.cwd && anchor?.cwd) {
       row.cwd = anchor.cwd
@@ -313,8 +310,14 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, listed
       row.space_name = anchor.space_name || basename(anchor.cwd)
     }
     if (info.isSideQuestion) {
+      row.parent_agent_id = prefix + info.parentKey
       if (info.sideTitle) row.title = info.sideTitle
-    } else if (!allSummaries[key]?.summary) {
+      continue
+    }
+    row.is_subagent = true
+    row.parent_session_id = prefix + info.parentKey
+    row.root_session_id = prefix + rootKey
+    if (!allSummaries[key]?.summary) {
       const nativeRole = typeof allSummaries[key]?.trajectoryMetadata?.subagentSpec?.role === 'string'
         ? allSummaries[key].trajectoryMetadata.subagentSpec.role.trim()
         : ''
@@ -324,27 +327,32 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, listed
     }
   }
 
+  const parentKeyOf = row => {
+    const parentId = row.parent_session_id || row.parent_agent_id
+    return parentId ? parentId.slice(prefix.length) : ''
+  }
+
   const pinnedIds = new Set()
   for (const row of filteredRows) {
     if (row.status !== 'working') continue
     pinnedIds.add(row.session_id)
-    let cur = row.parent_session_id ? row.parent_session_id.slice(prefix.length) : ''
+    let cur = parentKeyOf(row)
     const seen = new Set([row.session_id.slice(prefix.length)])
     while (cur && !seen.has(cur)) {
       seen.add(cur)
       const parentRow = rowByKey.get(cur)
       if (!parentRow) break
       pinnedIds.add(parentRow.session_id)
-      cur = parentRow.parent_session_id ? parentRow.parent_session_id.slice(prefix.length) : ''
+      cur = parentKeyOf(parentRow)
     }
   }
 
   const kept = recent(filteredRows, { days: 14, max: 80, pinned: row => pinnedIds.has(row.session_id) })
   const keptById = new Map(kept.map(r => [r.session_id, r]))
 
-  // Ensure every kept subagent's listed ancestors stay present so the Hub can fold them cleanly.
+  // Ensure every kept subagent / side-question's listed ancestors stay present so the Hub can fold them cleanly.
   for (const row of [...kept]) {
-    let cur = row.parent_session_id ? row.parent_session_id.slice(prefix.length) : ''
+    let cur = parentKeyOf(row)
     const seen = new Set([row.session_id.slice(prefix.length)])
     while (cur && !seen.has(cur)) {
       seen.add(cur)
@@ -354,7 +362,7 @@ export function selectDesktopSessions({ dir, prefix, label, allSummaries, listed
         kept.push(parentRow)
         keptById.set(parentRow.session_id, parentRow)
       }
-      cur = parentRow.parent_session_id ? parentRow.parent_session_id.slice(prefix.length) : ''
+      cur = parentKeyOf(parentRow)
     }
   }
 
