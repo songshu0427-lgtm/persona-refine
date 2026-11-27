@@ -43,16 +43,17 @@ const fullChanged = () => fullListeners.forEach((listener) => listener());
 const getFullSnapshot = () => fullSnapshot;
 let fullCache: ReturnType<typeof createFullCache> | undefined;
 
-function createFullCache(owner: string) {
+function createFullCache(owner: string, agentsOnly: boolean) {
   let stopped = false, consumers = 0, pending = false, dirty = false, urgent = false;
   let nextReadAt = 0;
   let controller: AbortController | undefined;
-  const complete = new CompleteSessions();
+  const complete = new CompleteSessions({ agentsOnly });
   let retry: ReturnType<typeof setTimeout> | undefined;
   let trailing: ReturnType<typeof setTimeout> | undefined;
   let expiry: ReturnType<typeof setTimeout> | undefined;
   const valid = () => !stopped && getState().loaded && credentialOwner() === owner
-    && getState().features.includes(SESSIONS_LIST_FEATURE);
+    && getState().features.includes(SESSIONS_LIST_FEATURE)
+    && supportsPagedAgents(getState().features) === agentsOnly;
   const read = async (immediate = false) => {
     if (!valid()) return;
     if (!consumers || pending) { dirty = true; urgent ||= immediate; return; }
@@ -119,6 +120,7 @@ function createFullCache(owner: string) {
   off.push(subscribe(() => { if (!valid()) dispose(); }));
   return {
     owner,
+    agentsOnly,
     retain() {
       consumers++;
       clearTimeout(expiry);
@@ -168,16 +170,17 @@ export function useFullAgentSessions(on = true): FullAgentSessions {
 function useCompleteAgentSessions(on: boolean): FullAgentSessions {
   const by = useStore((s) => s.sessions);
   const bounded = useStore((s) => s.features.includes(SESSIONS_LIST_FEATURE));
+  const agentsOnly = useStore((s) => supportsPagedAgents(s.features));
   const loaded = useStore((s) => s.loaded);
   const snapshot = useSyncExternalStore(subscribeFull, getFullSnapshot, getFullSnapshot);
   const owner = on ? credentialOwner() : "";
-  const full = fullCache?.owner === owner ? snapshot : EMPTY_FULL_LIST;
+  const full = fullCache?.owner === owner && fullCache.agentsOnly === agentsOnly ? snapshot : EMPTY_FULL_LIST;
   useEffect(() => {
     if (!on || !bounded || !loaded) return;
-    if (fullCache && fullCache.owner !== owner) fullCache.dispose();
-    fullCache ??= createFullCache(owner);
+    if (fullCache && (fullCache.owner !== owner || fullCache.agentsOnly !== agentsOnly)) fullCache.dispose();
+    fullCache ??= createFullCache(owner, agentsOnly);
     return fullCache.retain();
-  }, [on, bounded, loaded, owner, snapshot.epoch]);
+  }, [on, bounded, agentsOnly, loaded, owner, snapshot.epoch]);
   return useMemo(() => {
     // `on` false: the caller has no use for the list now and asks the hub for nothing
     if (!on) return EMPTY_FULL_LIST;

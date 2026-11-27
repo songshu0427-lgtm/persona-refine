@@ -24,10 +24,20 @@ export interface CompleteRead {
   changed: boolean;
 }
 
+export interface CompleteSessionsOptions {
+  /** Omit assistant and health-space conversations server-side (`sessions_agents_only`), halving baseline pages. */
+  agentsOnly?: boolean;
+}
+
 export class CompleteSessions {
   private checkpoint?: string;
   private rows = new Map<string, Session>();
   private list: Session[] = [];
+  private readonly agentsOnly: boolean;
+
+  constructor(options: CompleteSessionsOptions = {}) {
+    this.agentsOnly = Boolean(options.agentsOnly);
+  }
 
   /** The revision this copy is complete through; a hint carrying it brings nothing new. */
   holds(revision: unknown): boolean {
@@ -48,7 +58,12 @@ export class CompleteSessions {
   }
 
   private page(params: Record<string, string>, signal?: AbortSignal) {
-    const query = new URLSearchParams({ summary: "0", limit: String(COMPLETE_PAGE_LIMIT), ...params });
+    const query = new URLSearchParams({
+      summary: "0",
+      limit: String(COMPLETE_PAGE_LIMIT),
+      ...(this.agentsOnly ? { agents_only: "1" } : {}),
+      ...params,
+    });
     return api<Partial<ListPage<Session>>>(`/sessions?${query}`, { signal });
   }
 

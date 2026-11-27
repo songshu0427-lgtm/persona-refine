@@ -72,4 +72,14 @@ describe("CompleteSessions", () => {
     await list.read();
     expect(query(api.mock.calls[1])).toEqual({ summary: "0", limit: "200" });
   });
+
+  it("adds agents_only=1 to baseline and delta queries when enabled", async () => {
+    const list = new CompleteSessions({ agentsOnly: true });
+    api.mockResolvedValueOnce(page([row("m", "a")], "r1"))
+      .mockResolvedValueOnce(page([row("m", "a", "updated")], "r2"));
+    await list.read();
+    expect(query(api.mock.calls[0])).toEqual({ summary: "0", limit: "200", agents_only: "1" });
+    await list.read();
+    expect(query(api.mock.calls[1])).toEqual({ summary: "0", limit: "200", agents_only: "1", since: "r1" });
+  });
 });

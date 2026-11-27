@@ -659,7 +659,13 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
     const own = new Set(ownIds);
     return sidebarMachines.filter((m) => own.has(m.id));
   }, [ownIds, sidebarMachines]);
-  const { sessions: every, unfolded, loaded, error: listError } = useFullAgentSessions();
+  const { sessions: fullSessions, unfolded: fullUnfolded, loaded: fullLoaded, error: listError } = useFullAgentSessions();
+  // Show bounded summary rows as soon as runtimeSessions answers (often before refresh() finishes and full pagination
+  // completes) so Agents renders immediately on refresh instead of sitting on "Loading…".
+  const summaryAgents = useAgentSessions();
+  const every = fullLoaded ? fullSessions : summaryAgents;
+  const unfolded = fullLoaded ? fullUnfolded : summaryAgents;
+  const loaded = fullLoaded || summaryAgents.length > 0;
   const agents = useMemo(() => every.filter(isSidebarAgent), [every]);
   const all = useScoped(agents);
   const unfoldedScoped = useScoped(unfolded);
@@ -738,10 +744,10 @@ function LegacyAgentsBlock({ reg, hover, activeKey, go, onNewAgent, onNavigate, 
   const seeded = useRef(false);
   useEffect(() => {
     // a filter saved in this browser starts from what it matches once the list has loaded
-    if (!loaded || seeded.current) return;
+    if (!fullLoaded || seeded.current) return;
     seeded.current = true;
     setKept(matchingKeys(live, filter, mutes));
-  }, [loaded, live, filter, mutes]);
+  }, [fullLoaded, live, filter, mutes]);
   const filtered = filter !== "all" || dimActive;
   const { needs, unread, working, bg_waiting, feishu, terminal } = useMemo(() => filterCounts(live, mutes), [live, mutes]);
   // A session can change its text or timestamp without changing any filter's count.
