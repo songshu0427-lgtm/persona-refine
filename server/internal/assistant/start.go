@@ -73,6 +73,9 @@ func (s *Service) claudeMD(ctx context.Context, here string, larkCLI bool) strin
 		d.Machines = append(d.Machines, prompts.AssistantMachine{Name: m.Name, ID: m.ID, Local: local, SSHHost: m.SSHHost,
 			AgentsOnly: !local && !(d.OnHub && m.Kind == "ssh")})
 	}
+	if s.routerMode() {
+		return prompts.RenderAssistantRouterMD(d)
+	}
 	return prompts.RenderAssistantClaudeMD(d)
 }
 

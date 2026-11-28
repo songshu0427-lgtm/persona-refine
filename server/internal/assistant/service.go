@@ -103,6 +103,9 @@ type Service struct {
 	heard ownerHeard
 	// humanSent: the messages a person's own app sent, as the hub vouched (secret_handoff.go).
 	humanSent humanSends
+	// router holds Collie-style Router mode agent-completion watches (router_mode.go).
+	router         routerBook
+	routerOverride *bool
 
 	hub   Hub
 	store func() Store
@@ -949,6 +952,7 @@ func (s *Service) SessionsChanged(ctx context.Context, d DeviceSessions) {
 	s.followStarts(ctx, d)              // the app's starts, for launcher health (launcher_health_starts.go)
 	s.directionTreeSessions(d)          // an Agent of the direction tree may have moved (direction_tree.go)
 	s.agentNamesChanged(d)
+	s.routerSessionsChanged(d)
 }
 
 func randomHex(n int) string {

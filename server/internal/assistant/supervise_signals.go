@@ -234,6 +234,9 @@ func digestWait(now, last time.Time, pending []superviseSignal, p superviseTimin
 // signal records g for the supervisor, unless the same stretch of state was told already, and sees that the message
 // goes out when it is due.
 func (s *Service) signal(g superviseSignal) {
+	if s.routerMode() {
+		return
+	}
 	if g.level() == supervisionInfo {
 		return // Progress is already recorded on the task card; it never wakes the assistant.
 	}

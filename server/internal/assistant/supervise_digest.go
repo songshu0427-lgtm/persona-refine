@@ -26,6 +26,9 @@ const superviseTool = "supervise"
 // conversation that dispatched its task (routeTo). A signal that no longer holds (answered, done, reviewed meanwhile) is
 // dropped.
 func (s *Service) sendDigest(ctx context.Context) {
+	if s.routerMode() {
+		return
+	}
 	b := &s.supervise
 	b.dedupMu.Lock()
 	defer b.dedupMu.Unlock()

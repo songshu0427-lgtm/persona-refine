@@ -78,6 +78,8 @@ func UrgentRuleBuiltinIn(id, language string) string {
 
 func RenderAssistantClaudeMD(d AssistantClaudeMD) string { return render("assistant/claude_md", d) }
 
+func RenderAssistantRouterMD(d AssistantClaudeMD) string { return render("assistant/router_md", d) }
+
 // RenderSupervisionInstructions is identical for every authorized supervisor and event.
 func RenderSupervisionInstructions() string { return render("assistant/supervision_instructions", nil) }
 

@@ -29,6 +29,9 @@ func (s *Service) runtimeWithoutSupervisionPolicy(ctx context.Context, machine, 
 }
 
 func (s *Service) supervisionInstructions(ctx context.Context, machine, id string) (string, error) {
+	if s.routerMode() {
+		return "", nil
+	}
 	cfg := s.settings(ctx)
 	if id == "" || s.isWorkMachine(machine) {
 		return "", nil
@@ -79,6 +82,10 @@ func (s *Service) supervisionInstructions(ctx context.Context, machine, id strin
 }
 
 func (s *Service) putSupervisionInstructions(ctx context.Context, machine, id string, p map[string]any) error {
+	if s.routerMode() {
+		p["supervision_instructions"] = ""
+		return nil
+	}
 	// Always overwrite caller input, including empty roles, so demotion clears the node's
 	// process fingerprint instead of retaining an earlier conversation's policy.
 	text, err := s.supervisionInstructions(ctx, machine, id)

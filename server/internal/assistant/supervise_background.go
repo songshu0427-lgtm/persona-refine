@@ -54,6 +54,9 @@ func mainSupervisesOwnTasksOf(cfg Settings) bool {
 
 // backgroundOn: the background supervisor is on with settings cfg (assistant.main_supervises_own_tasks is explicitly off).
 func (s *Service) backgroundOn(cfg Settings) bool {
+	if s.routerMode() {
+		return false
+	}
 	return !s.noBackground && !mainSupervisesOwnTasksOf(cfg)
 }
 

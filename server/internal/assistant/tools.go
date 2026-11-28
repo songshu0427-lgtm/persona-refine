@@ -44,6 +44,9 @@ var toolNames = []string{"ask_user", "notify_user", "supervision_finish", "sched
 // Tools are the assistant's tools (assistant.tools).
 func (s *Service) Tools(ctx context.Context) []proto.Tool {
 	tools := toolsNamed(toolNames)
+	if s.routerMode() {
+		tools = routerFilterTools(tools)
+	}
 	if s.urgentOn(ctx) {
 		tools = append(tools, toolsNamed([]string{"urgent_call"})...)
 	}
@@ -66,6 +69,9 @@ func (s *Service) Tool(ctx context.Context, call ToolCall) proto.ToolResult {
 		return proto.TextResult(err.Error(), true)
 	}
 	call.Name = compat.Tool(call.Name)
+	if s.routerMode() && routerExcludedTools[call.Name] {
+		return proto.TextResult("Router mode is active: todos, plan cards, and task review are disabled. Use agent_start or agent_send directly.", true)
+	}
 	if res, refused := s.inboxModelRefusal(ctx, call.MachineID, call.SessionID, "", call.Name); refused {
 		return res
 	}
@@ -345,6 +351,9 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		}
 		_ = json.Unmarshal(args, &a)
 		a.Task = givenTask(a.RawTask)
+		if s.routerMode() {
+			a.Task = nil
+		}
 		am, c, err := s.findAgent(ctx, a.Machine, a.SessionID)
 		if err != nil {
 			return "", err
@@ -430,7 +439,11 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		sending, _ := params["text"].(string)
 		// A resume goes through the user's Resume's node call, the text as its first message (agent_resume.go).
 		if resume != "" {
-			return s.resumeAndSend(ctx, self, am, c, params, resume, a.Text, handed.said(), task)
+			out, err := s.resumeAndSend(ctx, self, am, c, params, resume, a.Text, handed.said(), task)
+			if err == nil && s.routerMode() {
+				s.routerWatchAgent(ctx, self, am.ID, am.Name, c.SessionID, agentLabel(c), c.UpdatedAt, true)
+			}
+			return out, err
 		}
 		if c.Status != proto.StatusOffline {
 			// A running agent takes it at once. A send of more for an accepted task holds a turn of the agent that
@@ -461,9 +474,15 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 				}
 				return "", task.sendFailed(ctx, s, err)
 			}
+			if s.routerMode() {
+				s.routerWatchAgent(ctx, self, am.ID, am.Name, c.SessionID, agentLabel(c), c.UpdatedAt, c.Status == proto.StatusWorking)
+			}
 			if sent.Queued {
 				return fmt.Sprintf("Queued for %s on %s: it is in the middle of a turn and reads the message once what it is doing now ends.",
 					agentLabel(c), am.Name) + handed.said() + task.sent(ctx, s, a.Text), nil
+			}
+			if s.routerMode() {
+				return fmt.Sprintf("Sent to %s on %s (watching for completion; you will be notified automatically).", agentLabel(c), am.Name) + handed.said(), nil
 			}
 			return fmt.Sprintf("Sent to %s on %s.", agentLabel(c), am.Name) + handed.said() + task.sent(ctx, s, a.Text), nil
 		}
@@ -480,6 +499,9 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 		note.sent(sctx, err)
 		if err != nil {
 			return "", task.sendFailed(sctx, s, err)
+		}
+		if s.routerMode() {
+			s.routerWatchAgent(ctx, self, am.ID, am.Name, c.SessionID, agentLabel(c), c.UpdatedAt, true)
 		}
 		return fmt.Sprintf("Resumed %s on %s (same session, directory and launcher) and sent.", agentLabel(c), am.Name) + handed.said() + task.sent(sctx, s, a.Text), nil
 	case "agent_switch": // moves a running agent to another launcher and goes on with it (agent_switch.go, #5973)
@@ -776,6 +798,10 @@ func (s *Service) runTool(ctx context.Context, machine, self, name string, args 
 			note += " Note: " + said + "." // the engine ran another of the same kind, its default model, a lower effort (#8140)
 		}
 		s.inboxAgentStarted(ctx, self, am.ID, res.Session.SessionID, a.Prompt) // an inbox event's conversation: its chain
+		if s.routerMode() {
+			s.routerWatchAgent(ctx, self, am.ID, am.Name, res.Session.SessionID, routerAgentLabel(res.Session, a.Cwd), res.Session.UpdatedAt, true)
+			return fmt.Sprintf("Started on %s in %s: session %s (watching for completion; you will be notified automatically).%s", am.Name, a.Cwd, res.Session.SessionID, note), nil
+		}
 		if told, ok := s.quietAgentTask(ctx, self, am, a.Cwd, a.Prompt, params["tab_name"], res.Session.SessionID); ok {
 			return fmt.Sprintf("Started on %s in %s: session %s, a task of this conversation (its card is in the conversation; "+
 				"%s).%s", am.Name, a.Cwd, res.Session.SessionID, told, note), nil

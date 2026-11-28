@@ -37,12 +37,14 @@ func (s *Service) Context(ctx context.Context, p ContextParams) ContextResult {
 		Main: s.isMain(ctx, p.SessionID), Leader: s.isLeader(ctx, p.SessionID), Background: background}
 	switch {
 	case c.Main:
-		cfg := s.settings(ctx)
-		c.BackgroundStarted = s.announceBackground(ctx) // until a message carrying it is delivered: its tasks are followed up in the background now (supervise_background.go)
-		names := s.leaderNames(ctx, cfg.Leaders)
-		for _, id := range cfg.Leaders {
-			if id != "" && id != cfg.Main {
-				c.Directions = append(c.Directions, prompts.ContextDirection{ID: id, Name: names[id]})
+		if !s.routerMode() {
+			cfg := s.settings(ctx)
+			c.BackgroundStarted = s.announceBackground(ctx) // until a message carrying it is delivered: its tasks are followed up in the background now (supervise_background.go)
+			names := s.leaderNames(ctx, cfg.Leaders)
+			for _, id := range cfg.Leaders {
+				if id != "" && id != cfg.Main {
+					c.Directions = append(c.Directions, prompts.ContextDirection{ID: id, Name: names[id]})
+				}
 			}
 		}
 	case c.Leader:
@@ -113,6 +115,9 @@ func (s *Service) contextSnapshot(ctx context.Context, scope string, background 
 	out.Now = time.Now().In(s.location(ctx))
 	out.ModelProfile = s.modelProfileContext(ctx)
 	out = scopeSnapshot(out, scope)
+	if s.routerMode() {
+		out = routerSnapshot(out)
+	}
 	if background {
 		out = backgroundSnapshot(out)
 	}
