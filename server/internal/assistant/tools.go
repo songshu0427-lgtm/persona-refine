@@ -70,7 +70,7 @@ func (s *Service) Tool(ctx context.Context, call ToolCall) proto.ToolResult {
 	}
 	call.Name = compat.Tool(call.Name)
 	if s.routerMode() && routerExcludedTools[call.Name] {
-		return proto.TextResult("Router mode is active: todos, plan cards, and task review are disabled. Use agent_start or agent_send directly.", true)
+		return proto.TextResult("Router mode is active: plan cards, task supervision, and review state machines are disabled. Use agent_start or agent_send directly (and use todo_* only for standalone personal todos).", true)
 	}
 	if res, refused := s.inboxModelRefusal(ctx, call.MachineID, call.SessionID, "", call.Name); refused {
 		return res

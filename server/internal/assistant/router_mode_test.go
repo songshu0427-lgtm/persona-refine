@@ -28,32 +28,32 @@ func TestRouterModeToolsPromptAndSupervisionDisabled(t *testing.T) {
 	s, _ := newQuietService(t)
 	enableRouterModeForTest(t, s)
 
-	// 1. Excluded heavy todo/plan/review/supervision tools are absent, core dispatch tools remain.
+	// 1. Heavy plan/review/supervision tools are absent, while core dispatch and standalone personal todo tools remain.
 	tools := s.Tools(ctx)
 	have := map[string]bool{}
 	for _, tl := range tools {
 		have[tl.Name] = true
 	}
-	for _, want := range []string{"agents_list", "agent_read", "agent_send", "agent_start", "agent_interrupt", "ask_user", "notify_user", "schedule_followup", "kb_search"} {
+	for _, want := range []string{"agents_list", "agent_read", "agent_send", "agent_start", "agent_interrupt", "todo_list", "todo_create", "todo_complete", "ask_user", "notify_user", "schedule_followup", "kb_search"} {
 		if !have[want] {
 			t.Fatalf("router mode missing essential tool %q", want)
 		}
 	}
-	for _, forbidden := range []string{"task_plan", "task_review", "task_scope", "todo_create", "todo_list", "agent_supervise", "supervision_finish", "concern_report", "direction_name"} {
+	for _, forbidden := range []string{"task_plan", "task_review", "task_scope", "agent_supervise", "supervision_finish", "concern_report", "direction_name", "leader_progress"} {
 		if have[forbidden] {
 			t.Fatalf("router mode exposed excluded tool %q", forbidden)
 		}
 	}
 
-	// 2. Direct calls to excluded tools (e.g. from resumed chat memory) are refused cleanly.
-	for _, name := range []string{"task_plan", "todo_create", "task_review"} {
+	// 2. Direct calls to excluded plan/review tools (e.g. from resumed chat memory) are refused cleanly.
+	for _, name := range []string{"task_plan", "task_review", "agent_supervise"} {
 		res := s.Tool(ctx, ToolCall{MachineID: "server", SessionID: "conv1", Name: name, Arguments: json.RawMessage(`{}`)})
 		if !res.IsError || !strings.Contains(res.Content[0].Text, "Router mode") {
 			t.Fatalf("Tool(%q) = %+v, want router-mode refusal", name, res)
 		}
 	}
 
-	// 3. Compact Router prompt (< 5 KB) replaces monolithic CLAUDE.md and omits task_plan/todo_create workflows.
+	// 3. Compact Router prompt (< 5 KB) replaces monolithic CLAUDE.md and omits task_plan/task_review workflows.
 	md := s.claudeMD(ctx, "server", false)
 	if len(md) > 5000 {
 		t.Fatalf("router prompt too large: %d bytes", len(md))
@@ -61,8 +61,8 @@ func TestRouterModeToolsPromptAndSupervisionDisabled(t *testing.T) {
 	if !strings.Contains(md, "Persona Router") || !strings.Contains(md, "agent_send") {
 		t.Fatalf("router prompt missing core identity/dispatch rules: %q", md)
 	}
-	if strings.Contains(md, "task_plan") || strings.Contains(md, "todo_create") {
-		t.Fatalf("router prompt still mentions task_plan or todo_create")
+	if strings.Contains(md, "task_plan") || strings.Contains(md, "task_review") {
+		t.Fatalf("router prompt still mentions task_plan or task_review")
 	}
 
 	// 4. Supervision policy and background supervisor are disabled.
@@ -97,14 +97,14 @@ func TestRouterSnapshotStripsTodosPlansAndApprovals(t *testing.T) {
 		FollowingTotal:   1,
 	}
 	out := routerSnapshot(in)
-	if len(out.Machines) != 1 || len(out.Working) != 1 {
-		t.Fatalf("routerSnapshot dropped live machines/agents: %+v", out)
+	if len(out.Machines) != 1 || len(out.Working) != 1 || len(out.OpenTodos) != 1 || out.OpenTodosTotal != 5 || !out.OpenTodosLoaded {
+		t.Fatalf("routerSnapshot dropped live machines/agents or personal todos: %+v", out)
 	}
-	if len(out.Tasks) != 0 || len(out.OpenTodos) != 0 || out.OpenTodosTotal != 0 || out.OpenTodosLoaded ||
+	if len(out.Tasks) != 0 ||
 		len(out.Plans) != 0 || out.PlansTotal != 0 || len(out.Asked) != 0 ||
 		len(out.Unaccepted) != 0 || out.UnacceptedTotal != 0 || len(out.Approvals) != 0 ||
 		out.FollowingEnabled || len(out.Following) != 0 || out.FollowingTotal != 0 {
-		t.Fatalf("routerSnapshot retained todo/plan/review state: %+v", out)
+		t.Fatalf("routerSnapshot retained task/plan/review state: %+v", out)
 	}
 }
 

@@ -25,33 +25,28 @@ var routerNoticeDelay = 3 * time.Second
 // routerWatchTTL bounds how long a single agent dispatch watch stays active without completing.
 var routerWatchTTL = 6 * time.Hour
 
-// routerExcludedTools are the heavy todo, plan-card, task-review, direction, and supervision tools hidden in Router mode.
+// routerExcludedTools are the heavy plan-card, task-review, direction, and supervision tools hidden in Router mode.
+// Personal todo tools (todo_list/get/create/update/complete/reopen/delete) intentionally remain available for
+// standalone human todos (e.g., Feishu scanning), strictly decoupled from agent_send/agent_start execution.
 var routerExcludedTools = map[string]bool{
-	"supervision_finish":         true,
-	"agent_supervise":            true,
-	"ask_escalate":               true,
-	"task_plan":                  true,
-	"task_plan_withdraw":         true,
-	"task_review":                true,
-	"task_scope":                 true,
-	"task_decided":               true,
-	"task_start_screen":          true,
-	"task_start_keys":            true,
-	"task_retry":                 true,
-	"todo_repositories_get":      true,
-	"todo_repositories_set":      true,
-	"todo_repository_links_set":  true,
-	"todo_repository_links_add":  true,
-	"todo_list":                  true,
-	"todo_get":                   true,
-	"todo_create":                true,
-	"todo_update":                true,
-	"todo_complete":              true,
-	"todo_reopen":                true,
-	"todo_delete":                true,
-	"concern_report":             true,
-	"direction_name":             true,
-	"leader_progress":            true,
+	"supervision_finish":        true,
+	"agent_supervise":           true,
+	"ask_escalate":              true,
+	"task_plan":                 true,
+	"task_plan_withdraw":        true,
+	"task_review":               true,
+	"task_scope":                true,
+	"task_decided":              true,
+	"task_start_screen":         true,
+	"task_start_keys":           true,
+	"task_retry":                true,
+	"todo_repositories_get":     true,
+	"todo_repositories_set":     true,
+	"todo_repository_links_set": true,
+	"todo_repository_links_add": true,
+	"concern_report":            true,
+	"direction_name":            true,
+	"leader_progress":           true,
 }
 
 type routerWatch struct {
@@ -92,11 +87,10 @@ func routerFilterTools(tools []proto.Tool) []proto.Tool {
 	return out
 }
 
-// routerSnapshot strips todo, plan-card, task-review, approval, and inbox-following sections from the live snapshot
-// so the Router main chat sees only time, machines, live agents, chats, calendar, and reminders.
+// routerSnapshot strips agent-task, plan-card, task-review, approval, and inbox-following sections from the live
+// snapshot while keeping personal OpenTodos, machines, live agents, chats, calendar, and reminders.
 func routerSnapshot(snap prompts.Snapshot) prompts.Snapshot {
 	snap.Tasks = nil
-	snap.OpenTodos, snap.OpenTodosTotal, snap.OpenTodosLoaded = nil, 0, false
 	snap.Plans, snap.PlansTotal = nil, 0
 	snap.Asked = nil
 	snap.Unaccepted, snap.UnacceptedTotal = nil, 0
@@ -298,7 +292,7 @@ func (s *Service) fireRouterWatch(key, state string) {
 		body.WriteString("\n\n最近对话摘录：\n")
 		body.WriteString(excerpt)
 	}
-	body.WriteString("\n\n请用不超过 3 行向用户总结核心结论，并在需要时给出 2–3 个明确下一步选项（如需更多细节可再调 `agent_read`）。不要建待办、不要出计划卡。")
+	body.WriteString("\n\n请用不超过 3 行向用户总结核心结论，并在需要时给出 2–3 个明确下一步选项（如需更多细节可再调 `agent_read`）。不要给这次派活建待办、不要出计划卡。")
 
 	msg := relayMsg{
 		From:      snapshot.sessionID,
