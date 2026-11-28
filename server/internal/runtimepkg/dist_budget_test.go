@@ -11,10 +11,11 @@ import (
 // plugin's session model/effort overrides, mid-turn owner input queueing, owner turn interrupts, bypass preview pre-start,
 // and remote permission bridge (173,207 B on 2026-11-20), plus the Antigravity Desktop bridge, model switching,
 // image support, subagent hierarchy folding, ConversationService lifecycle (#16012), incremental transcript
-// caching (#12250), Desktop quota windows, and projectId/cached cwd fallback (192,031 B on 2026-11-27, with ~2,000 B of headroom).
+// caching (#12250), Desktop quota windows, projectId/cached cwd fallback, and runtime supervision_policy
+// (#11220, policy.js) (195,477 B on 2026-11-28, with ~1,500 B of headroom).
 // Raise it only for code a runtime needs, never to embed the packages raw again.
 func TestDistBudget(t *testing.T) {
-	const budget = 194_000
+	const budget = 197_000
 	_, out := generateIntegrations(t)
 	entries, err := os.ReadDir(out)
 	if err != nil {
